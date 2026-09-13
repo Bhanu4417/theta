@@ -1,7 +1,7 @@
 //! Overlay surfaces: palette, dialogs, searches, viewer, diff.
 
 use crate::app::App;
-use crate::theme::{pal, self};
+use crate::theme::{pal, self, P_SYMBOL};
 use crate::ui::conversation::truncate;
 use ratatui::layout::Rect;
 use ratatui::style::{Style};
@@ -213,8 +213,10 @@ pub fn render_new_session(f: &mut ratatui::Frame, app: &App, area: Rect) {
         let ago = rel_time(sess.updated_ms);
         let title = truncate(
             &if sess.title.is_empty() { "untitled".to_string() } else { sess.title.clone() },
-            w.saturating_sub(16).max(8),
+            w.saturating_sub(30).max(8),
         );
+        let dir = theme::abbreviate_path(&sess.directory);
+        let dir = truncate(&dir, 22);
         let mut spans = vec![
             Span::styled("    ".to_string(), Style::default()),
             Span::styled(
@@ -224,6 +226,10 @@ pub fn render_new_session(f: &mut ratatui::Frame, app: &App, area: Rect) {
             Span::styled(
                 title,
                 if is_sel { theme::bold(pal().fg) } else { theme::fg(pal().fg_soft) },
+            ),
+            Span::styled(
+                if dir.is_empty() { String::new() } else { format!("  {dir}") },
+                theme::mute(),
             ),
             Span::styled(
                 format!("  {ago}"),
@@ -319,6 +325,214 @@ pub fn render_confirm_quit(f: &mut ratatui::Frame, app: &App, area: Rect) {
         )),
         Line::from(Span::styled("  y quit · Esc stay", theme::dim())),
     ];
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+pub fn render_busy_choice(
+    f: &mut ratatui::Frame,
+    app: &App,
+    screen: Rect,
+    anchor: Option<Rect>,
+) {
+    let prompt = app
+        .focused()
+        .and_then(|s| s.pending_send.clone())
+        .unwrap_or_default();
+    let w = 58u16.min(screen.width.saturating_sub(2)).max(24);
+    let h = 8u16;
+    let rect = match anchor {
+        Some(r) => {
+            let x = r.x.min(screen.right().saturating_sub(w));
+            let y = r.y.saturating_sub(h).max(screen.y + 1);
+            Rect {
+                x,
+                y,
+                width: w.min(screen.width.saturating_sub(x)),
+                height: h,
+            }
+        }
+        None => centered_rect_w(w, h, screen),
+    };
+    if rect.width < 20 || rect.height < 5 {
+        return;
+    }
+    let inner = surface(
+        f,
+        rect,
+        title_line(vec![Span::styled(
+            "agent is busy",
+            theme::bold(pal().yellow),
+        )]),
+    );
+    if inner.height == 0 || inner.width < 16 {
+        return;
+    }
+    let iw = inner.width as usize;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let prompt_flat = prompt.replace('\n', " ");
+    lines.push(Line::from(vec![
+        Span::styled(format!("{} ", P_SYMBOL), theme::bold(pal().cyan)),
+        Span::styled(
+            truncate(&prompt_flat, iw.saturating_sub(4)),
+            theme::fg(pal().fg_soft),
+        ),
+    ]));
+    lines.push(Line::from(""));
+    let opts = ["Queue until the agent finishes", "Send in a new workspace (fork)"];
+    for (i, label) in opts.iter().enumerate() {
+        let sel = i == app.busy_choice.min(1);
+        let mut sp = vec![
+            Span::styled(
+                if sel { "▸ " } else { "  " }.to_string(),
+                if sel { theme::bold(pal().cyan) } else { theme::mute() },
+            ),
+            Span::styled(
+                (*label).to_string(),
+                if sel { theme::bold(pal().fg) } else { theme::fg(pal().fg_soft) },
+            ),
+        ];
+        if sel {
+            for s in &mut sp {
+                s.style = s.style.bg(pal().selection);
+            }
+        }
+        lines.push(Line::from(sp));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "↑/↓ choose · Enter confirm · Esc back to input",
+        theme::mute(),
+    )));
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+pub fn render_question(
+    f: &mut ratatui::Frame,
+    app: &App,
+    screen: Rect,
+    anchor: Option<Rect>,
+) {
+    let Some(pq) = app.focused().and_then(|s| s.pending_question.as_ref()) else {
+        return;
+    };
+    let Some(q) = pq.current() else { return };
+    let n_opts = q.options.len();
+    let w = 64u16.min(screen.width.saturating_sub(2)).max(28);
+    let h = (n_opts + 7)
+        .min(screen.height.saturating_sub(2) as usize)
+        .max(5) as u16;
+    let rect = match anchor {
+        Some(r) => {
+            let x = r.x.min(screen.right().saturating_sub(w));
+            let y = r.y.saturating_sub(h).max(screen.y + 1);
+            Rect {
+                x,
+                y,
+                width: w.min(screen.width.saturating_sub(x)),
+                height: h,
+            }
+        }
+        None => centered_rect_w(w, h, screen),
+    };
+    if rect.width < 24 || rect.height < 5 {
+        return;
+    }
+    let inner = surface(
+        f,
+        rect,
+        title_line(vec![Span::styled(
+            "agent asks",
+            theme::bold(pal().purple),
+        )]),
+    );
+    if inner.height == 0 || inner.width < 16 {
+        return;
+    }
+    let iw = inner.width as usize;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    if pq.questions.len() > 1 {
+        lines.push(Line::from(Span::styled(
+            format!("Question {}/{}", pq.qi + 1, pq.questions.len()),
+            theme::dim(),
+        )));
+    }
+    if !q.header.trim().is_empty() {
+        lines.push(Line::from(Span::styled(
+            truncate(&q.header, iw),
+            theme::bold(pal().fg),
+        )));
+    }
+    for chunk in crate::ui::conversation::wrap_spans(
+        &[Span::styled(q.question.clone(), theme::fg(pal().fg_soft))],
+        iw,
+    ) {
+        lines.push(Line::from(chunk));
+    }
+    lines.push(Line::from(""));
+
+    let sel = pq.selected.get(pq.qi).copied().unwrap_or(0);
+    for (i, o) in q.options.iter().enumerate() {
+        let is_sel = i == sel;
+        let checked = pq
+            .chosen
+            .get(pq.qi)
+            .and_then(|v| v.get(i))
+            .copied()
+            .unwrap_or(false);
+        let mark = if q.multiple {
+            if checked { "[x] " } else { "[ ] " }
+        } else if is_sel {
+            "(•) "
+        } else {
+            "( ) "
+        };
+        let mut spans = vec![
+            Span::styled(mark.to_string(), theme::fg(pal().cyan)),
+            Span::styled(
+                truncate(&o.label, iw.saturating_sub(6)),
+                if is_sel { theme::bold(pal().fg) } else { theme::fg(pal().fg) },
+            ),
+        ];
+        if !o.description.trim().is_empty() {
+            spans.push(Span::styled(
+                format!("  {}", truncate(&o.description, iw.saturating_sub(30).max(8))),
+                theme::dim(),
+            ));
+        }
+        if is_sel {
+            for s in &mut spans {
+                s.style = s.style.bg(pal().selection);
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+
+    if q.custom {
+        lines.push(Line::from(vec![
+            Span::styled("custom: ".to_string(), theme::dim()),
+            Span::styled(
+                truncate(&pq.custom, iw.saturating_sub(9)),
+                theme::fg(pal().yellow),
+            ),
+            Span::styled("▏".to_string(), theme::fg(pal().cyan)),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    let hint = if q.custom {
+        "Type a custom answer · Enter confirm · Esc reject"
+    } else if q.multiple {
+        "↑/↓ move · Space toggle · Enter confirm · Esc reject"
+    } else {
+        "↑/↓ move · Enter confirm · Esc reject"
+    };
+    lines.push(Line::from(Span::styled(hint, theme::mute())));
+
+    while lines.len() < inner.height as usize {
+        lines.push(Line::from(""));
+    }
+    lines.truncate(inner.height as usize);
     f.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -641,6 +855,91 @@ pub fn render_agent_picker(
     }
 }
 
+pub fn render_agy_model_picker(
+    f: &mut ratatui::Frame,
+    app: &App,
+    screen: Rect,
+    anchor: Option<Rect>,
+) {
+    let models = &app.agy_models;
+    let visible = models.len().min(8).max(1);
+    let h = (visible + 1) as u16;
+    let rect = match anchor {
+        Some(r) => Rect {
+            x: r.x,
+            y: r.y.saturating_sub(h).max(screen.y + 1),
+            width: r.width.min(52),
+            height: h,
+        },
+        None => centered_rect(40, h, screen),
+    };
+    if rect.width < 12 || rect.height < 2 {
+        return;
+    }
+    let bg = Style::default().bg(pal().bg_float);
+    let w = rect.width as usize;
+    let mut head = vec![
+        Span::styled("  ".to_string(), bg),
+        Span::styled(format!("{} ", P_SYMBOL), theme::bold(pal().cyan)).patch(bg),
+        Span::styled(
+            if models.is_empty() {
+                "loading agy models…".to_string()
+            } else {
+                "agy models".to_string()
+            },
+            theme::bold(pal().fg),
+        )
+        .patch(bg),
+    ];
+    let used: usize = head.iter().map(|x| x.content.chars().count()).sum();
+    if used < w {
+        head.push(Span::styled(" ".repeat(w - used), bg));
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(head)),
+        Rect { x: rect.x, y: rect.y, width: rect.width, height: 1 },
+    );
+    let sel = app.agy_ui.selected.min(models.len().saturating_sub(1));
+    let offset = window_offset(sel, models.len(), visible as usize);
+    for (row, i) in (offset..models.len()).take(visible as usize).enumerate() {
+        let Some((name, desc)) = models.get(i) else { continue };
+        let is_sel = i == sel;
+        let is_current = *name == app.cfg.agy_model;
+        let mark = if is_current { "● " } else { "  " };
+        let mut sp = vec![
+            Span::styled("    ".to_string(), bg),
+            Span::styled(mark.to_string(), theme::fg(pal().green)).patch(bg),
+            Span::styled(
+                truncate(name, 26),
+                if is_sel { theme::bold(pal().fg) } else { theme::fg(pal().cyan) },
+            )
+            .patch(bg),
+            Span::styled(
+                format!("  {}", truncate(desc, w - 34)),
+                if is_sel { theme::fg(pal().fg) } else { theme::fg(pal().fg_soft) },
+            )
+            .patch(bg),
+        ];
+        if is_sel {
+            for x in &mut sp {
+                x.style = x.style.bg(pal().selection);
+            }
+        }
+        let used: usize = sp.iter().map(|x| x.content.chars().count()).sum();
+        if used < w {
+            sp.push(Span::styled(" ".repeat(w - used), bg));
+        }
+        f.render_widget(
+            Paragraph::new(Line::from(sp)),
+            Rect { x: rect.x, y: rect.y + 1 + row as u16, width: rect.width, height: 1 },
+        );
+    }
+    if !models.is_empty() {
+        let cx = rect.x + 4;
+        f.set_cursor_position((cx, rect.y));
+    }
+}
+
 pub fn render_session_list(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let order = app.grid.order();
     let h = (order.len().min(12) + 4) as u16 + 1;
@@ -673,6 +972,7 @@ pub fn render_session_list(f: &mut ratatui::Frame, app: &App, area: Rect) {
             crate::session::SessStatus::Error(_) => "✗",
             crate::session::SessStatus::Retrying(_) => "↻",
             crate::session::SessStatus::Permission => "!",
+            crate::session::SessStatus::Question => "?",
         };
         let glyph_color = match &sess.status {
             crate::session::SessStatus::Working | crate::session::SessStatus::Thinking => {
@@ -716,12 +1016,13 @@ pub fn render_session_list(f: &mut ratatui::Frame, app: &App, area: Rect) {
 
 pub fn render_resume_picker(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let n = app.resume_picker.items.len().min(14);
-    let rect = centered_rect(42, (n + 4) as u16, area);
+    let rect = centered_rect(64, (n + 4) as u16, area);
     let inner = surface(
         f,
         rect,
         title_line(vec![
             Span::styled("  Resume Session", theme::bold(pal().fg)),
+            Span::styled("   all projects", theme::mute()),
         ]),
     );
     if inner.width < 16 || inner.height == 0 {
@@ -736,7 +1037,7 @@ pub fn render_resume_picker(f: &mut ratatui::Frame, app: &App, area: Rect) {
         )));
     } else if app.resume_picker.items.is_empty() {
         lines.push(Line::from(Span::styled(
-            "  no previous sessions for this directory",
+            "  no previous sessions",
             theme::dim(),
         )));
     }
@@ -750,8 +1051,10 @@ pub fn render_resume_picker(f: &mut ratatui::Frame, app: &App, area: Rect) {
         let ago = rel_time(sess.updated_ms);
         let title = truncate(
             &if sess.title.is_empty() { "untitled".to_string() } else { sess.title.clone() },
-            w.saturating_sub(12).max(8),
+            w.saturating_sub(30).max(8),
         );
+        let dir = theme::abbreviate_path(&sess.directory);
+        let dir = truncate(&dir, 24);
         let mut spans = vec![
             Span::styled("  ".to_string(), Style::default()),
             Span::styled(
@@ -761,6 +1064,10 @@ pub fn render_resume_picker(f: &mut ratatui::Frame, app: &App, area: Rect) {
             Span::styled(
                 title,
                 if is_sel { theme::bold(pal().fg) } else { theme::fg(pal().fg_soft) },
+            ),
+            Span::styled(
+                if dir.is_empty() { String::new() } else { format!("  {dir}") },
+                theme::mute(),
             ),
             Span::styled(
                 format!("  {ago}"),

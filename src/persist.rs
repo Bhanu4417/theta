@@ -29,6 +29,9 @@ pub struct Workspace {
     pub maximized: Option<usize>,
     #[serde(default)]
     pub scheme: Option<String>,
+    /// Directories Theta has opened — used to list sessions across projects.
+    #[serde(default)]
+    pub known_dirs: Vec<String>,
 }
 
 pub fn state_path() -> Option<PathBuf> {

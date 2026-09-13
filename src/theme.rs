@@ -277,6 +277,22 @@ pub fn rgb_tuple(c: (u8, u8, u8)) -> Color {
     Color::Rgb(c.0, c.1, c.2)
 }
 
+fn to_rgb(c: Color) -> (u8, u8, u8) {
+    match c {
+        Color::Rgb(r, g, b) => (r, g, b),
+        _ => (0, 0, 0),
+    }
+}
+
+/// Linear blend: `t` of `a` mixed over `b` (0 = all b, 1 = all a).
+pub fn blend(a: Color, b: Color, t: f32) -> Color {
+    let (ar, ag, ab) = to_rgb(a);
+    let (br, bg, bb) = to_rgb(b);
+    let t = t.clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| (x as f32 * t + y as f32 * (1.0 - t)).round() as u8;
+    Color::Rgb(mix(ar, br), mix(ag, bg), mix(ab, bb))
+}
+
 /// Style helpers reading the active palette.
 pub fn fg(c: Color) -> Style {
     Style::default().fg(c)

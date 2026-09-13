@@ -259,8 +259,12 @@ pub fn build_cache(sess: &SessionState, width: u16, tick: u64) -> Cache {
                     }
                     lines.push(Line::from(spans));
 
-                    if expanded {
-                        for l in tool_detail_lines(t, w) {
+                    // Edit/write tools show their diff inline (like the
+                    // OpenCode TUI); expanding reveals the full detail.
+                    let show_detail = expanded || has_diff;
+                    if show_detail {
+                        let cap = if expanded { 80 } else { 24 };
+                        for l in tool_detail_lines(t, w, cap) {
                             lines.push(l);
                         }
                     }
@@ -328,27 +332,24 @@ pub fn build_cache(sess: &SessionState, width: u16, tick: u64) -> Cache {
     }
 }
 
-fn tool_detail_lines(t: &crate::opencode::ToolInfo, w: usize) -> Vec<Line<'static>> {
+fn tool_detail_lines(t: &crate::opencode::ToolInfo, w: usize, cap: usize) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     let indent = "    ";
     let inner = w.saturating_sub(6).max(8);
 
     if let Some(diff) = t.diff() {
-        let lines = crate::highlight::diff_lines(&diff);
-        let total = lines.len();
-        let cap = 60.min(total);
-        for l in lines.into_iter().take(cap) {
-            let mut spans = vec![Span::styled(indent.to_string(), Style::default())];
-            spans.extend(l.spans);
-            out.push(Line::from(spans));
-        }
+        let file = t.file_path().unwrap_or_default();
+        // OpenCode-style: split when the pane is wide, unified otherwise.
+        let mut rows = crate::highlight::diff_view(&diff, &file, w, w >= 110);
+        let total = rows.len();
         if total > cap {
-            out.push(Line::from(Span::styled(
-                format!("{indent}… {} more diff lines", total - cap),
+            rows.truncate(cap);
+            rows.push(Line::from(Span::styled(
+                format!("{indent}… {} more diff lines (Enter to expand)", total - cap),
                 theme::dim(),
             )));
         }
-        return out;
+        return rows;
     }
 
     if let Some(err) = &t.error {
@@ -362,7 +363,7 @@ fn tool_detail_lines(t: &crate::opencode::ToolInfo, w: usize) -> Vec<Line<'stati
     if let Some(output) = &t.output {
         let body = unwrap_tool_output(output);
         let raw: Vec<&str> = body.lines().collect();
-        let cap = 40;
+        let cap = cap.min(40);
         let skipped = raw.len().saturating_sub(cap);
         if skipped > 0 {
             out.push(Line::from(Span::styled(
@@ -680,8 +681,24 @@ fn regroup(chars: &[Ch]) -> Vec<Span<'static>> {
     spans
 }
 
+/// A text selection in cache-line coordinates. `c0` applies to row `r0`,
+/// `c1` to row `r1`; rows in between are fully selected.
+#[derive(Debug, Clone, Copy)]
+pub struct SelRange {
+    pub r0: usize,
+    pub c0: usize,
+    pub r1: usize,
+    pub c1: usize,
+}
+
 /// Render the transcript into `area`, honoring scroll + stick-to-bottom.
-pub fn render(f: &mut ratatui::Frame, area: ratatui::layout::Rect, sess: &SessionState, cache: &Cache) {
+pub fn render(
+    f: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    sess: &SessionState,
+    cache: &Cache,
+    sel: Option<SelRange>,
+) {
     if area.width < 4 || area.height == 0 {
         return;
     }
@@ -696,7 +713,56 @@ pub fn render(f: &mut ratatui::Frame, area: ratatui::layout::Rect, sess: &Sessio
         sess.scroll.min(max_off)
     };
     let end = (offset + h).min(total);
-    let slice: Vec<Line<'static>> = cache.lines[offset..end].to_vec();
+    let slice: Vec<Line<'static>> = match sel {
+        Some(sel) => cache.lines[offset..end]
+            .iter()
+            .enumerate()
+            .map(|(i, line)| {
+                let abs = offset + i;
+                if abs < sel.r0 || abs > sel.r1 {
+                    line.clone()
+                } else {
+                    let c0 = if abs == sel.r0 { sel.c0 } else { 0 };
+                    let c1 = if abs == sel.r1 { sel.c1 } else { usize::MAX };
+                    patch_range(line, c0, c1, pal().selection)
+                }
+            })
+            .collect(),
+        None => cache.lines[offset..end].to_vec(),
+    };
     let para = Paragraph::new(ratatui::text::Text::from(slice));
     f.render_widget(para, area);
+}
+
+/// Apply a selection background to the `[c0, c1)` char range of a line,
+/// splitting spans as needed.
+fn patch_range(line: &Line<'static>, c0: usize, c1: usize, bg: Color) -> Line<'static> {
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut idx = 0usize;
+    for span in &line.spans {
+        let chars: Vec<char> = span.content.chars().collect();
+        let len = chars.len();
+        let s = idx;
+        let e = idx + len;
+        idx = e;
+        if e <= c0 || s >= c1 || len == 0 {
+            out.push(span.clone());
+            continue;
+        }
+        let local0 = c0.saturating_sub(s).min(len);
+        let local1 = (c1.saturating_sub(s)).min(len).max(local0);
+        if local0 > 0 {
+            out.push(Span::styled(chars[..local0].iter().collect::<String>(), span.style));
+        }
+        if local1 > local0 {
+            out.push(Span::styled(
+                chars[local0..local1].iter().collect::<String>(),
+                span.style.bg(bg),
+            ));
+        }
+        if local1 < len {
+            out.push(Span::styled(chars[local1..].iter().collect::<String>(), span.style));
+        }
+    }
+    Line::from(out)
 }

@@ -17,6 +17,9 @@ pub struct Config {
     /// sessions until changed.
     #[serde(default)]
     pub last_model: Option<(String, String)>,
+    /// Model used for agy CLI prompts (gemini-3.8-flash-medium etc).
+    #[serde(default = "default_agy_model")]
+    pub agy_model: String,
     /// Active theme name (see src/theme.rs THEMES). Defaults to Theta Night
     /// (Tokyo Night); only a user change rewrites it.
     #[serde(default = "default_theme")]
@@ -90,6 +93,10 @@ fn default_theme() -> String {
     "theta-night".to_string()
 }
 
+fn default_agy_model() -> String {
+    "gemini-3.8-flash-medium".to_string()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -98,6 +105,7 @@ impl Default for Config {
             behavior: Behavior::default(),
             keys: HashMap::new(),
             theme: "theta-night".into(),
+            agy_model: "gemini-3.8-flash-medium".into(),
             last_model: None,
         }
     }

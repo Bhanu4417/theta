@@ -19,7 +19,8 @@ struct ServerHandle {
     #[allow(dead_code)]
     base: String,
     client: Client,
-    /// Kept alive so `kill_on_drop` fires only when Theta exits.
+    /// Handle to the spawned process. Kept alive so `kill_on_drop` stops the
+    /// server when Theta exits (normal quit calls `shutdown_all` first).
     #[allow(dead_code)]
     child: Option<tokio::process::Child>,
 }
@@ -28,6 +29,8 @@ struct ServerHandle {
 struct Inner {
     servers: HashMap<PathBuf, ServerHandle>,
     providers_fetched: HashSet<PathBuf>,
+    /// Directories whose pending questions/permissions were already fetched.
+    presence_fetched: HashSet<PathBuf>,
     /// Serializes server spawn per directory (prevents double-spawn races).
     spawn_locks: HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>,
 }
@@ -47,6 +50,10 @@ impl ManagerRef {
 
     async fn ensure_server(&self, dir: &Path) -> Result<(String, Client)> {
         let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        if !dir.is_dir() {
+            crate::tlog!("SERVER dir missing: {}", dir.display());
+            anyhow::bail!("directory does not exist: {}", dir.display());
+        }
         {
             let inner = self.inner.lock().await;
             if let Some(h) = inner.servers.get(&dir) {
@@ -153,6 +160,10 @@ impl Manager {
         }
     }
 
+    pub fn tx(&self) -> tokio::sync::mpsc::UnboundedSender<AppEvent> {
+        self.ref_.tx.clone()
+    }
+
     pub fn next_req(&self) -> ReqId {
         self.req_seq.fetch_add(1, Ordering::Relaxed)
     }
@@ -219,8 +230,17 @@ impl Manager {
                 });
             }
 
-            let mut inner = m.inner.lock().await;
-            if inner.providers_fetched.insert(dir_c.clone()) {
+            // Fetch supporting metadata once per directory, and only hold the
+            // inner lock for the set updates — never across network calls, so
+            // concurrent sessions cannot serialize behind each other.
+            let (do_providers, do_presence) = {
+                let mut inner = m.inner.lock().await;
+                (
+                    inner.providers_fetched.insert(dir_c.clone()),
+                    inner.presence_fetched.insert(dir_c.clone()),
+                )
+            };
+            if do_providers {
                 if let Ok((providers, default)) = client.providers().await {
                     m.emit(AppEvent::ProvidersListed {
                         dir: dir_c.clone(),
@@ -241,6 +261,26 @@ impl Manager {
                     });
                 }
             }
+            // Re-surface anything the agent is waiting on (a refresh restores
+            // these instead of losing them).
+            if do_presence {
+                if let Ok(questions) = client.questions().await {
+                    if !questions.is_empty() {
+                        m.emit(AppEvent::QuestionsListed {
+                            dir: dir_c.clone(),
+                            questions,
+                        });
+                    }
+                }
+                if let Ok(permissions) = client.permissions().await {
+                    if !permissions.is_empty() {
+                        m.emit(AppEvent::PermissionsListed {
+                            dir: dir_c.clone(),
+                            permissions,
+                        });
+                    }
+                }
+            }
             let _ = model;
         });
     }
@@ -258,11 +298,35 @@ impl Manager {
             let Ok((_, client)) = m.ensure_server(&dir).await else {
                 return;
             };
-            if let Err(e) = client
+            crate::tlog!(
+                "PROMPT dir={} session={} model={:?} agent={:?} text={}",
+                dir.display(),
+                oc_sid,
+                model,
+                agent,
+                crate::logging::snippet(&text, 2000)
+            );
+            match client
                 .prompt_async(&oc_sid, &text, model.as_ref(), agent.as_deref())
                 .await
             {
-                m.emit(AppEvent::SendFailed { dir, oc_sid, error: e.to_string() });
+                Ok(()) => crate::tlog!("PROMPT ok session={oc_sid}"),
+                Err(e) if model.is_some() => {
+                    // A bad/unavailable model shouldn't swallow the prompt —
+                    // retry on the server default so every provider works.
+                    crate::tlog!("PROMPT retry without model session={oc_sid}: {e}");
+                    match client.prompt_async(&oc_sid, &text, None, agent.as_deref()).await {
+                        Ok(()) => crate::tlog!("PROMPT ok (default model) session={oc_sid}"),
+                        Err(e) => {
+                            crate::tlog!("PROMPT failed session={oc_sid}: {e}");
+                            m.emit(AppEvent::SendFailed { dir, oc_sid, error: e.to_string() });
+                        }
+                    }
+                }
+                Err(e) => {
+                    crate::tlog!("PROMPT failed session={oc_sid}: {e}");
+                    m.emit(AppEvent::SendFailed { dir, oc_sid, error: e.to_string() });
+                }
             }
         });
     }
@@ -356,6 +420,69 @@ impl Manager {
         });
     }
 
+    /// Fork a session without interrupting the source. `at` pins the copy to
+    /// the last stable message so an in-progress turn isn't inherited.
+    pub fn fork_session(
+        &self,
+        dir: PathBuf,
+        oc_sid: String,
+        source: u32,
+        at: Option<String>,
+    ) {
+        let m = self.ref_.clone();
+        tokio::spawn(async move {
+            let dir_c = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+            let Ok((_, client)) = m.ensure_server(&dir_c).await else {
+                return;
+            };
+            match client.fork(&oc_sid, at.as_deref()).await {
+                Ok(new) => {
+                    m.emit(AppEvent::OcForked {
+                        dir: dir_c,
+                        session: new,
+                        source,
+                    });
+                }
+                Err(e) => {
+                    m.emit(AppEvent::OpResult {
+                        ok: false,
+                        message: format!("fork failed: {e}"),
+                    });
+                }
+            }
+        });
+    }
+
+    /// Answer a pending agent question.
+    pub fn reply_question(&self, dir: PathBuf, id: String, answers: Vec<Vec<String>>) {
+        let m = self.ref_.clone();
+        tokio::spawn(async move {
+            let Ok((_, client)) = m.ensure_server(&dir).await else {
+                return;
+            };
+            let ok = client.reply_question(&id, answers).await.is_ok();
+            m.emit(AppEvent::OpResult {
+                ok,
+                message: if ok { "answer sent".into() } else { "answer failed".into() },
+            });
+        });
+    }
+
+    /// Reject a pending agent question.
+    pub fn reject_question(&self, dir: PathBuf, id: String) {
+        let m = self.ref_.clone();
+        tokio::spawn(async move {
+            let Ok((_, client)) = m.ensure_server(&dir).await else {
+                return;
+            };
+            let ok = client.reject_question(&id).await.is_ok();
+            m.emit(AppEvent::OpResult {
+                ok,
+                message: if ok { "question rejected".into() } else { "reject failed".into() },
+            });
+        });
+    }
+
     pub fn refresh_providers(&self, dir: PathBuf) {
         let m = self.ref_.clone();
         tokio::spawn(async move {
@@ -380,7 +507,7 @@ impl Manager {
             if let Ok((_, client)) = m.ensure_server(&dir_c).await {
                 if let Ok(mut sessions) = client.list_sessions().await {
                     sessions.sort_by_key(|s| -s_time_updated(s));
-                    m.emit(AppEvent::ServerSessionsListed { req, sessions });
+                    m.emit(AppEvent::ServerSessionsListed { req, dir: dir_c, sessions });
                 }
             }
         });
@@ -543,6 +670,10 @@ async fn resolve_binary(configured: &str) -> String {
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
         .collect();
+    // Use the SAME binary the shell/`opencode` CLI resolves to (first on
+    // PATH), so Theta and the user's terminal agree on the version. Skip
+    // shell wrappers (mise/asdf shims) — they can hang or mutate state when
+    // spawned from a TUI.
     let is_script = |p: &str| -> bool {
         std::fs::File::open(p)
             .and_then(|mut f| {
@@ -580,11 +711,16 @@ async fn spawn_server(cfg: &Config, dir: &Path) -> Result<(String, Option<tokio:
     if candidate.health().await.is_ok() {
         if let Ok(server_dir) = candidate.path_info().await {
             if same_dir(&server_dir, dir) {
+                crate::tlog!("SERVER reuse port={port} dir={}", dir.display());
                 return Ok((candidate.base, None));
             }
         }
     }
 
+    crate::tlog!(
+        "SERVER spawn binary={binary} port={port} dir={}",
+        dir.display()
+    );
     let mut cmd = tokio::process::Command::new(&binary);
     cmd.args(["serve", "--port", &port.to_string(), "--hostname", "127.0.0.1"])
         .current_dir(dir)
@@ -611,7 +747,7 @@ async fn spawn_server(cfg: &Config, dir: &Path) -> Result<(String, Option<tokio:
         } else if std::time::Instant::now() > deadline {
             anyhow::bail!("could not spawn opencode serve on port {port} and no server answered");
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -662,6 +798,12 @@ async fn pump_once(
                 }
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
                     if let Some(ev) = OcEvent::parse(v) {
+                        crate::tlog!(
+                            "SSE dir={} type={} {}",
+                            dir.display(),
+                            ev.typ,
+                            crate::logging::snippet(data, 800)
+                        );
                         let _ = tx.send(AppEvent::OcEvent {
                             dir: dir.to_path_buf(),
                             ev,

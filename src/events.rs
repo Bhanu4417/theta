@@ -2,6 +2,7 @@
 
 use crate::opencode::{
     AgentInfo, CustomCommand, GrepMatch, Message, ModelEntry, ModelRef, OcSession,
+    PermissionRequest, QuestionRequest,
 };
 use std::path::PathBuf;
 
@@ -74,6 +75,7 @@ pub enum AppEvent {
 
     ServerSessionsListed {
         req: ReqId,
+        dir: PathBuf,
         sessions: Vec<OcSession>,
     },
 
@@ -81,6 +83,41 @@ pub enum AppEvent {
     SessionsPreloaded {
         dir: PathBuf,
         sessions: Vec<OcSession>,
+    },
+
+    /// Completed output of an agy CLI run.
+    AgyDone {
+        session: u32,
+        ok: bool,
+        output: String,
+        model: String,
+    },
+    /// Available models from the agy CLI.
+    AgyModels { models: Vec<(String, String)> },
+    /// A session was forked; the new one shares the history.
+    OcForked {
+        dir: PathBuf,
+        session: OcSession,
+        source: u32,
+    },
+    /// Pending agent questions fetched when (re)connecting.
+    QuestionsListed {
+        dir: PathBuf,
+        questions: Vec<QuestionRequest>,
+    },
+    /// Pending permission requests fetched when (re)connecting.
+    PermissionsListed {
+        dir: PathBuf,
+        permissions: Vec<PermissionRequest>,
+    },
+    /// Progress of a `/push` (commit + push) run.
+    PushProgress { session: u32, text: String },
+    /// A `/push` finished; `ok=false` carries the error message.
+    PushDone {
+        session: u32,
+        ok: bool,
+        message: String,
+        repo: Option<String>,
     },
 }
 

@@ -146,3 +146,55 @@ pub async fn workspace_diff(dir: &Path) -> Result<String> {
     }
     Ok(diff)
 }
+
+/// `owner/repo` parsed from the `origin` remote URL, if any.
+pub async fn remote_repo(dir: &Path) -> Option<String> {
+    let url = run(dir, &["remote", "get-url", "origin"]).await.ok()?;
+    Some(parse_repo(url.trim()))
+}
+
+fn parse_repo(url: &str) -> String {
+    let s = url.trim().trim_end_matches(".git");
+    if let Some(rest) = s.strip_prefix("git@") {
+        if let Some((_host, path)) = rest.split_once(':') {
+            return path.to_string();
+        }
+    }
+    if let Some((_scheme, rest)) = s.split_once("://") {
+        if let Some((_host, path)) = rest.split_once('/') {
+            return path.to_string();
+        }
+    }
+    s.to_string()
+}
+
+/// A concise, zero-token commit subject derived from the staged file list.
+fn auto_message(staged: &str) -> String {
+    let files: Vec<&str> = staged.lines().filter(|l| !l.trim().is_empty()).collect();
+    match files.len() {
+        0 => "update".to_string(),
+        1 => format!("update {}", files[0]),
+        2 => format!("update {} and {}", files[0], files[1]),
+        n => format!("update {n} files"),
+    }
+}
+
+/// Stage everything, commit, and push. When `message` is empty a minimal
+/// subject is derived from the changed files. Returns `owner/repo`.
+pub async fn commit_and_push(dir: &Path, message: &str) -> Result<String> {
+    run(dir, &["add", "-A"]).await?;
+    let staged = run(dir, &["diff", "--cached", "--name-only"]).await?;
+    if staged.trim().is_empty() {
+        anyhow::bail!("nothing to commit");
+    }
+    let subject = if message.trim().is_empty() {
+        auto_message(&staged)
+    } else {
+        message.trim().to_string()
+    };
+    run(dir, &["commit", "-m", &subject]).await?;
+    if run(dir, &["push"]).await.is_err() {
+        run(dir, &["push", "-u", "origin", "HEAD"]).await?;
+    }
+    Ok(remote_repo(dir).await.unwrap_or_else(|| "remote".into()))
+}

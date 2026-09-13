@@ -1,6 +1,6 @@
 //! Per-session state: transcript, input buffer, status, scroll.
 
-use crate::opencode::{Message, ModelRef, Part, PartKind, Role, ToolInfo, ToolStatus};
+use crate::opencode::{Message, ModelRef, Part, PartKind, QuestionInfo, Role, ToolInfo, ToolStatus};
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -13,6 +13,7 @@ pub enum SessStatus {
     Retrying(String),
     Error(String),
     Permission,
+    Question,
 }
 
 impl SessStatus {
@@ -29,6 +30,87 @@ pub struct PendingPermission {
     pub id: String,
     pub kind: String,
     pub detail: String,
+}
+
+/// A question the agent is waiting on, plus the UI selection state.
+#[derive(Debug, Clone)]
+pub struct PendingQuestion {
+    pub id: String,
+    pub questions: Vec<QuestionInfo>,
+    /// Index of the question currently being answered.
+    pub qi: usize,
+    /// Highlighted option per question.
+    pub selected: Vec<usize>,
+    /// Toggled options per question (for multi-select).
+    pub chosen: Vec<Vec<bool>>,
+    /// Accumulated answers per question (labels).
+    pub answers: Vec<Vec<String>>,
+    /// Free-text answer for the current question when `custom` is allowed.
+    pub custom: String,
+}
+
+impl PendingQuestion {
+    pub fn new(id: String, questions: Vec<QuestionInfo>) -> Self {
+        let n = questions.len();
+        let selected = vec![0usize; n];
+        let chosen = questions
+            .iter()
+            .map(|q| vec![false; q.options.len()])
+            .collect();
+        let answers = vec![Vec::new(); n];
+        Self {
+            id,
+            questions,
+            qi: 0,
+            selected,
+            chosen,
+            answers,
+            custom: String::new(),
+        }
+    }
+
+    pub fn current(&self) -> Option<&QuestionInfo> {
+        self.questions.get(self.qi)
+    }
+
+    pub fn is_last(&self) -> bool {
+        self.qi + 1 >= self.questions.len()
+    }
+
+    /// Record the answer for the current question and advance. Returns true
+    /// once every question has been answered.
+    pub fn commit_current(&mut self) -> bool {
+        let Some(q) = self.questions.get(self.qi) else {
+            return true;
+        };
+        let answer: Vec<String> = if q.custom && !self.custom.trim().is_empty() {
+            vec![self.custom.trim().to_string()]
+        } else if q.multiple {
+            let picks = self.chosen.get(self.qi).cloned().unwrap_or_default();
+            q.options
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| picks.get(*i).copied().unwrap_or(false))
+                .map(|(_, o)| o.label.clone())
+                .collect()
+        } else {
+            let sel = self.selected.get(self.qi).copied().unwrap_or(0);
+            q.options
+                .get(sel)
+                .map(|o| vec![o.label.clone()])
+                .unwrap_or_default()
+        };
+        if let Some(a) = self.answers.get_mut(self.qi) {
+            *a = answer;
+        }
+        self.custom.clear();
+        if self.is_last() {
+            true
+        } else {
+            self.qi += 1;
+            false
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -98,7 +180,7 @@ impl InputState {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.buf.trim().is_empty()
+        self.buf.is_empty()
     }
 
     pub fn take(&mut self) -> String {
@@ -185,12 +267,25 @@ pub struct SessionState {
     pub model: Option<ModelRef>,
     /// Agent used for subsequent prompts (e.g. "build", "plan").
     pub agent: Option<String>,
+    /// When set, prompts route through the agy CLI with this model
+    /// (Gemini etc.) instead of the OpenCode provider.
+    pub agy_model: Option<String>,
     /// Selected row in the slash-command popup.
     pub slash_selected: usize,
     /// Share URL when the session is shared.
     pub share_url: Option<String>,
     /// Last submission (time, text) — guards double-Enter duplicates.
     pub last_send: Option<(std::time::Instant, String)>,
+    /// Prompt typed while the agent was busy — awaiting queue/fork choice.
+    pub pending_send: Option<String>,
+    /// Prompts queued while busy; sent in order when the agent idles.
+    pub queue: Vec<String>,
+    /// Set when Esc was pressed once while the agent is busy; a second Esc
+    /// within a short window interrupts. Cleared on tick.
+    pub interrupt_armed: Option<std::time::Instant>,
+    /// Short status shown in the workspace activity strip (e.g. a `/push`),
+    /// with the time it was set so it can expire.
+    pub activity: Option<(String, std::time::Instant)>,
     /// Cumulative assistant cost in USD (recomputed from the transcript).
     pub cost: f64,
     /// Prompt-side tokens of the latest assistant message (context size).
@@ -206,11 +301,15 @@ pub struct SessionState {
     /// Selected tool for Enter/expand interactions.
     pub tool_cursor: Option<ToolRef>,
     pub pending_perm: Option<PendingPermission>,
+    /// A question the agent is waiting on.
+    pub pending_question: Option<PendingQuestion>,
     pub last_error: Option<String>,
     /// Counter used to derive unique optimistic message ids.
     optimistic_seq: u64,
     /// Optimistic user messages not yet adopted by a real server message.
     unadopted_locals: u64,
+    /// Sequence counter for synthetic (agy) message ids.
+    synthetic_seq: u64,
     /// Invalidate the rendered-line cache.
     pub dirty: bool,
 }
@@ -223,10 +322,15 @@ impl SessionState {
             dir,
             oc_sid: None,
             model: None,
+            agy_model: None,
             agent: None,
             slash_selected: 0,
             share_url: None,
             last_send: None,
+            pending_send: None,
+            queue: Vec::new(),
+            interrupt_armed: None,
+            activity: None,
             cost: 0.0,
             ctx_tokens: 0,
             messages: Vec::new(),
@@ -237,9 +341,11 @@ impl SessionState {
             expanded: HashSet::new(),
             tool_cursor: None,
             pending_perm: None,
+            pending_question: None,
             last_error: None,
             optimistic_seq: 0,
             unadopted_locals: 0,
+            synthetic_seq: 0,
             dirty: true,
         }
     }
@@ -467,6 +573,11 @@ impl SessionState {
 
     pub fn is_expanded(&self, part_id: &str) -> bool {
         self.expanded.contains(part_id)
+    }
+
+    pub fn optimistic_seq(&mut self) -> u64 {
+        self.synthetic_seq += 1;
+        self.synthetic_seq
     }
 
     pub fn any_tool_running(&self) -> bool {

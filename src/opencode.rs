@@ -208,6 +208,52 @@ pub struct GrepMatch {
     pub text: String,
 }
 
+/// One selectable option in an agent question.
+#[derive(Debug, Clone)]
+pub struct QuestionOption {
+    pub label: String,
+    pub description: String,
+}
+
+/// A single question the agent asks (the `ask`/question tool).
+#[derive(Debug, Clone)]
+pub struct QuestionInfo {
+    pub question: String,
+    pub header: String,
+    pub options: Vec<QuestionOption>,
+    pub multiple: bool,
+    pub custom: bool,
+}
+
+/// A pending question request from the AI assistant.
+#[derive(Debug, Clone)]
+pub struct QuestionRequest {
+    pub id: String,
+    pub session_id: String,
+    pub questions: Vec<QuestionInfo>,
+}
+
+/// A pending permission request (the `permission.list` shape).
+#[derive(Debug, Clone)]
+pub struct PermissionRequest {
+    pub id: String,
+    pub session_id: String,
+    pub permission: String,
+    pub patterns: Vec<String>,
+    pub metadata: Value,
+}
+
+impl PermissionRequest {
+    pub fn detail(&self) -> String {
+        for key in ["command", "filePath", "file", "path", "url", "description"] {
+            if let Some(v) = self.metadata.get(key).and_then(|v| v.as_str()) {
+                return v.to_string();
+            }
+        }
+        self.patterns.first().cloned().unwrap_or_default()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Lenient JSON parsing helpers
 // ---------------------------------------------------------------------------
@@ -495,6 +541,79 @@ pub fn parse_grep(body: &Value) -> Vec<GrepMatch> {
         }
     }
     out
+}
+
+fn parse_question_info(v: &Value) -> Option<QuestionInfo> {
+    let question = s(v, "question")?;
+    let options = v
+        .get("options")
+        .and_then(|o| o.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|o| {
+                    Some(QuestionOption {
+                        label: s(o, "label")?,
+                        description: s(o, "description").unwrap_or_default(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(QuestionInfo {
+        question,
+        header: s(v, "header").unwrap_or_default(),
+        options,
+        multiple: v.get("multiple").and_then(|b| b.as_bool()).unwrap_or(false),
+        custom: v.get("custom").and_then(|b| b.as_bool()).unwrap_or(false),
+    })
+}
+
+pub fn parse_question_request(v: &Value) -> Option<QuestionRequest> {
+    let id = s(v, "id")?;
+    let questions = v
+        .get("questions")
+        .and_then(|q| q.as_array())
+        .map(|arr| arr.iter().filter_map(parse_question_info).collect())
+        .unwrap_or_default();
+    Some(QuestionRequest {
+        id,
+        session_id: s(v, "sessionID").unwrap_or_default(),
+        questions,
+    })
+}
+
+pub fn parse_questions(body: &Value) -> Vec<QuestionRequest> {
+    body.as_array()
+        .map(|a| a.iter().filter_map(parse_question_request).collect())
+        .unwrap_or_default()
+}
+
+pub fn parse_permission_requests(body: &Value) -> Vec<PermissionRequest> {
+    body.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| {
+                    let id = s(v, "id")?;
+                    let patterns = v
+                        .get("patterns")
+                        .and_then(|p| p.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    Some(PermissionRequest {
+                        id,
+                        session_id: s(v, "sessionID").unwrap_or_default(),
+                        permission: s(v, "permission").unwrap_or_else(|| "permission".into()),
+                        patterns,
+                        metadata: v.get("metadata").cloned().unwrap_or(json!({})),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -851,6 +970,74 @@ impl Client {
             .and_then(|sh| sh.get("url"))
             .and_then(|u| u.as_str())
             .map(|s| s.to_string()))
+    }
+
+    /// Fork a session. When `at` is given, the new session copies history up
+    /// to (and including) that message, so it never inherits an in-progress
+    /// turn from the source.
+    pub async fn fork(&self, sid: &str, at: Option<&str>) -> Result<OcSession> {
+        let body = match at {
+            Some(id) => json!({ "messageID": id }),
+            None => json!({}),
+        };
+        let v: Value = self
+            .http
+            .post(format!("{}/session/{sid}/fork", self.base))
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        parse_session(&v).ok_or_else(|| anyhow!("bad fork response"))
+    }
+
+    /// All pending questions across sessions on this server.
+    pub async fn questions(&self) -> Result<Vec<QuestionRequest>> {
+        let v: Value = self
+            .http
+            .get(format!("{}/question", self.base))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(parse_questions(&v))
+    }
+
+    /// Answer a question request (answers in order, each a list of labels).
+    pub async fn reply_question(&self, id: &str, answers: Vec<Vec<String>>) -> Result<()> {
+        let resp = self
+            .http
+            .post(format!("{}/question/{id}/reply", self.base))
+            .json(&json!({ "answers": answers }))
+            .send()
+            .await?;
+        resp.error_for_status()?;
+        Ok(())
+    }
+
+    pub async fn reject_question(&self, id: &str) -> Result<()> {
+        let resp = self
+            .http
+            .post(format!("{}/question/{id}/reject", self.base))
+            .send()
+            .await?;
+        resp.error_for_status()?;
+        Ok(())
+    }
+
+    /// All pending permission requests across sessions on this server.
+    pub async fn permissions(&self) -> Result<Vec<PermissionRequest>> {
+        let v: Value = self
+            .http
+            .get(format!("{}/permission", self.base))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(parse_permission_requests(&v))
     }
 
     pub async fn unshare(&self, sid: &str) -> Result<()> {

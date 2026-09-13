@@ -87,7 +87,30 @@ pub fn render(f: &mut ratatui::Frame, app: &mut App, area: Rect, sid: u32, focus
         empty_hint(f, conv_area, &pseudo);
     } else if let (Some(s), Some(cache)) = (app.session(sid), app.conv_cache.get(&sid)) {
         if conv_area.height > 0 {
-            conversation::render(f, conv_area, s, cache);
+            let sel = app.select.as_ref().filter(|sel| sel.sid == sid).and_then(|sel| {
+                let h = conv_area.height as usize;
+                if h == 0 {
+                    return None;
+                }
+                let total = cache.lines.len();
+                let max_off = total.saturating_sub(h);
+                let offset = if s.stick_bottom { max_off } else { s.scroll.min(max_off) };
+                let to_abs = |p: crate::app::SelectPoint| -> (usize, usize) {
+                    let row = (p.row.saturating_sub(conv_area.y) as usize)
+                        .min(h.saturating_sub(1));
+                    let col = p.col.saturating_sub(conv_area.x) as usize;
+                    (offset + row, col)
+                };
+                let (ar, ac) = to_abs(sel.anchor);
+                let (hr, hc) = to_abs(sel.head);
+                let ((r0, c0), (r1, c1)) = if (ar, ac) <= (hr, hc) {
+                    ((ar, ac), (hr, hc))
+                } else {
+                    ((hr, hc), (ar, ac))
+                };
+                Some(conversation::SelRange { r0, c0, r1, c1 })
+            });
+            conversation::render(f, conv_area, s, cache, sel);
         }
     }
 
@@ -250,6 +273,7 @@ fn pane_title(sess: &SessionState, focused: bool, width: u16, tick: u64) -> Line
         SessStatus::Retrying(_) => ("↻".to_string(), theme::fg(pal().yellow)),
         SessStatus::Error(_) => ("✗".to_string(), theme::fg(pal().red)),
         SessStatus::Permission => ("!".to_string(), theme::fg(pal().yellow)),
+        SessStatus::Question => ("?".to_string(), theme::fg(pal().purple)),
     };
     let name_style = if focused {
         theme::bold(pal().fg)
@@ -260,8 +284,6 @@ fn pane_title(sess: &SessionState, focused: bool, width: u16, tick: u64) -> Line
     let name = conversation::truncate(&sess.name, max_name);
 
     let left = vec![
-        Span::styled(" ".to_string(), Style::default()),
-        Span::styled(crate::theme::P_SYMBOL.to_string(), theme::fg(if sess.status.is_busy() { pal().cyan } else { pal().blue })),
         Span::styled(" ".to_string(), Style::default()),
         Span::styled(name, name_style),
     ];
@@ -275,23 +297,73 @@ fn pane_title(sess: &SessionState, focused: bool, width: u16, tick: u64) -> Line
     Line::from(spans)
 }
 
+/// Lay out the input buffer as a line-based, word-wrapped grid and report the
+/// cursor's visual row/column. Each `\n` produces a new line (including a
+/// trailing empty one), so Shift+Enter visibly moves the cursor down.
+fn input_layout(buf: &str, width: usize, cursor: usize) -> (Vec<Vec<Span<'static>>>, usize, usize) {
+    let width = width.max(4);
+    let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut crow = 0usize;
+    let mut ccol = 0usize;
+    let mut offset = 0usize;
+    let mut matched = false;
+    for line in buf.split('\n') {
+        let line_len = line.chars().count();
+        let wrapped = if line.is_empty() {
+            vec![Vec::new()]
+        } else {
+            conversation::wrap_spans(&[Span::raw(line.to_string())], width)
+        };
+        if !matched && cursor >= offset && cursor <= offset + line_len {
+            let start = rows.len();
+            let mut rem = cursor - offset;
+            let mut placed = false;
+            for (ri, r) in wrapped.iter().enumerate() {
+                let len: usize = r.iter().map(|s| s.content.chars().count()).sum();
+                if rem <= len {
+                    crow = start + ri;
+                    ccol = rem;
+                    placed = true;
+                    break;
+                }
+                rem -= len;
+            }
+            if !placed {
+                crow = start + wrapped.len().saturating_sub(1);
+                ccol = wrapped
+                    .last()
+                    .map(|r| r.iter().map(|s| s.content.chars().count()).sum())
+                    .unwrap_or(0);
+            }
+            matched = true;
+        }
+        rows.extend(wrapped);
+        offset += line_len + 1; // +1 for the newline
+    }
+    if !matched && !rows.is_empty() {
+        crow = rows.len() - 1;
+        ccol = rows.last().map(|r| r.iter().map(|s| s.content.chars().count()).sum()).unwrap_or(0);
+    }
+    (rows, crow, ccol)
+}
+
 pub fn input_height(sess: &SessionState, w: usize, total_h: usize) -> u16 {
-    // Box: input at top + blank + footer + bottom pad, min 4 rows.
-    let max = (total_h.saturating_sub(1)).max(4).min(9) as usize;
+    // Box: queued rows + input at top + blank + footer + bottom pad.
+    let max = (total_h.saturating_sub(1)).max(4).min(14) as usize;
     if sess.pending_perm.is_some() {
         return 4usize.min(max) as u16;
     }
+    let queue_rows = sess.queue.len().min(4);
     let text_rows = if sess.input.is_empty() {
         1
     } else {
-        conversation::wrap_spans(
-            &[Span::raw(sess.input.buf.clone())],
-            w.saturating_sub(4).max(8),
-        )
-        .len()
-        .min(6)
+        // Must match the wrap width used in `render_input`.
+        input_layout(&sess.input.buf, w.saturating_sub(5).max(8), 0)
+            .0
+            .len()
+            .min(8)
     };
-    ((text_rows + 3).min(max).max(4)) as u16
+    ((text_rows + queue_rows + 3).min(max).max(4)) as u16
 }
 
 fn render_input(
@@ -346,6 +418,12 @@ fn render_input(
     if sess.cost > 0.0 {
         right_parts.push(format!("${:.4}", sess.cost));
     }
+    if sess.interrupt_armed.is_some() {
+        right_parts.push("press Esc again to interrupt".into());
+    }
+    if !sess.queue.is_empty() {
+        right_parts.push(format!("{} queued", sess.queue.len()));
+    }
     if sess.pending_perm.is_some() {
         right_parts.push("a allow · A always · r reject".into());
     } else if sess.status.is_busy() {
@@ -382,10 +460,11 @@ fn render_input(
         Rect { x: area.x, y: footer_y, width: area.width, height: 1 },
     );
 
-    // Content rows: input at the top of the box, then blank before the footer.
+    // Content rows: a blank top pad (like OpenCode's `paddingTop`), the input,
+    // then a gap before the footer.
     let body = Rect {
         x: area.x + 1,
-        y: area.y,
+        y: area.y + 1,
         width: area.width.saturating_sub(1),
         height: area.height.saturating_sub(3),
     };
@@ -422,8 +501,22 @@ fn render_input(
         theme::mute()
     };
     let avail_w = body.width as usize - 2;
+    let body_w = body.width as usize;
 
+    // Queued prompts are pinned above the input, each labelled "— queued".
+    let queue_shown = sess.queue.len().min(body.height.saturating_sub(1) as usize);
+    let queue_h = queue_shown as u16;
     let mut lines: Vec<Line<'static>> = Vec::new();
+    for q in sess.queue.iter().take(queue_shown) {
+        lines.push(queued_line(q, body_w, bg));
+    }
+
+    let input_max = (body.height as usize).saturating_sub(queue_shown).max(1);
+    let input_start = lines.len();
+    // Cursor row/col within the wrapped input (set when the input is shown).
+    let mut cursor_row = 0usize;
+    let mut cursor_col = 0usize;
+    let mut rendered_start = 0usize;
     if sess.status == SessStatus::Connecting {
         lines.push(Line::from(vec![
             Span::styled(
@@ -439,34 +532,29 @@ fn render_input(
             Span::styled("Ask this agent…".to_string(), theme::dim()).patch(bg),
         ]));
     } else {
-        let buf = sess.input.buf.clone();
-        let cursor = sess.input.cursor;
-        let rows_wrapped = conversation::wrap_spans(
-            &[Span::styled(buf.clone(), theme::fg(pal().fg))],
-            avail_w,
-        );
-        let chars: Vec<char> = buf.chars().collect();
-        let before: String = chars[..cursor.min(chars.len())].iter().collect();
-        let cursor_row = conversation::wrap_spans(&[Span::raw(before)], avail_w)
-            .len()
-            .saturating_sub(1);
-        let max_rows = body.height as usize;
+        let (rows_wrapped, cr, cc) =
+            input_layout(&sess.input.buf, avail_w, sess.input.cursor);
+        cursor_row = cr;
+        cursor_col = cc;
+        let max_rows = input_max;
         let start = if cursor_row + 1 >= max_rows {
             cursor_row + 1 - max_rows
         } else {
             0
         };
+        rendered_start = start;
         for (i, row) in rows_wrapped.iter().enumerate().skip(start) {
-            if lines.len() >= max_rows {
+            if lines.len() >= input_start + max_rows {
                 break;
             }
-            let mark = if i == start || rows_wrapped.len() == 1 {
-                prompt_style
+            // Θ marks the first input line only; wrapped lines align under
+            // the text so the prompt glyph never repeats.
+            let (prefix, mark) = if i == 0 {
+                (format!("{} ", crate::theme::P_SYMBOL), prompt_style)
             } else {
-                theme::mute()
+                ("  ".to_string(), theme::mute())
             };
-            let mut spans: Vec<Span<'static>> =
-                vec![Span::styled(format!("{} ", crate::theme::P_SYMBOL), mark).patch(bg)];
+            let mut spans: Vec<Span<'static>> = vec![Span::styled(prefix, mark).patch(bg)];
             spans.extend(row.iter().cloned().map(|sp| sp.patch(bg)));
             lines.push(Line::from(spans));
         }
@@ -477,33 +565,32 @@ fn render_input(
     lines.truncate(body.height as usize);
     f.render_widget(Paragraph::new(lines), body);
 
-    if allow_cursor && !sess.input.is_empty() {
-        let chars: Vec<char> = sess.input.buf.chars().collect();
-        let before: String = chars[..sess.input.cursor.min(chars.len())].iter().collect();
-        let cursor_row = conversation::wrap_spans(&[Span::raw(before)], avail_w)
-            .len()
-            .saturating_sub(1);
-        let max_rows = body.height as usize;
-        let row_start = if cursor_row + 1 >= max_rows {
-            cursor_row + 1 - max_rows
-        } else {
-            0
-        };
-        let row_start_chars: usize = conversation::wrap_spans(
-            &[Span::raw(sess.input.buf.clone())],
-            avail_w,
-        )
-        .iter()
-        .take(cursor_row)
-        .map(|r| r.iter().map(|sp| sp.content.chars().count()).sum::<usize>())
-        .sum();
-        let col = sess.input.cursor.saturating_sub(row_start_chars);
-        let vis_row = cursor_row.min(row_start + max_rows - 1) - row_start;
-        let px = body.x + 2 + (col as u16).min(avail_w as u16);
-        let py = body.y + vis_row as u16;
+    // Keep the caret visible whenever the box is active — including when it
+    // is empty, so the focused input always reads as ready for typing.
+    if allow_cursor && sess.status != SessStatus::Connecting && sess.pending_perm.is_none() {
+        let vis_row = cursor_row.saturating_sub(rendered_start);
+        let px = body.x + 2 + (cursor_col as u16).min(avail_w as u16);
+        let py = body.y + queue_h + vis_row as u16;
         if px < body.x + body.width && py < body.y + body.height {
             f.set_cursor_position((px, py));
         }
     }
+}
+
+/// A queued prompt row: text on the left, a muted "— queued" label right.
+fn queued_line(text: &str, w: usize, bg: Style) -> Line<'static> {
+    let label = "— queued";
+    let label_w = label.chars().count();
+    let text_w = w.saturating_sub(label_w + 3).max(4);
+    let flat = text.replace('\n', " ");
+    let shown = conversation::truncate(&flat, text_w);
+    let used = shown.chars().count();
+    let gap = w.saturating_sub(1 + used + label_w);
+    Line::from(vec![
+        Span::styled(" ", bg),
+        Span::styled(shown, theme::fg(pal().fg_soft)).patch(bg),
+        Span::styled(" ".repeat(gap), bg),
+        Span::styled(label.to_string(), theme::fg(pal().yellow)).patch(bg),
+    ])
 }
 

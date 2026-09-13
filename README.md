@@ -43,7 +43,15 @@ cargo build --release && install -Dm755 target/release/theta ~/.local/bin/theta
 theta                  # restore last workspace (or show empty state)
 theta ~/projects/app   # open with the workspace rooted at DIR
 theta --no-restore     # skip workspace restore
+theta --log            # write a verbose debug log (any directory)
 ```
+
+`--log` writes a timestamped trace to
+`~/.local/share/theta/logs/theta-<epoch>.log` (absolute path, so it works from
+any directory) covering CLI args, per-directory server spawn/reuse, the exact
+prompt sent per session (model, agent, text), the raw OpenCode SSE stream, agy
+calls, model switches, and panics — enough to debug what was requested from
+which model and what came back. The path is printed on startup.
 
 Theta spawns one headless `opencode serve` process per project directory
 (reusing a healthy one if it is already there) and talks to it over its real
@@ -67,11 +75,27 @@ Type `/` in any session input for the command menu (filter by typing,
 | `/undo` / `/redo` | Revert / re-apply the last message |
 | `/share` / `/unshare` | Share the session and get a URL |
 | `/init [focus]` | Guided AGENTS.md setup (server command) |
+| `/refresh` | Reload the newest build in place (soft restart) |
+| `/push [message]` | Commit all changes and push the session's project |
 | `/help` · `/quit` | Keys · quit |
 
 Custom commands defined in the project's OpenCode config are fetched from the
 server and appear in the same menu automatically. The chosen model and agent
 are used for subsequent prompts in that session and shown in the status bar.
+
+`/refresh` saves the workspace, shuts the per-directory servers down cleanly,
+and re-executes the `theta` binary so a freshly built version takes over
+without quitting and reopening by hand. Pending agent questions (the `ask`
+tool) and permission requests are re-fetched when sessions reconnect, so
+nothing is lost across a refresh. Questions surface as a picker — navigate
+with `↑/↓`, toggle with `Space` (multi-select), confirm with `Enter`, reject
+with `Esc`.
+
+`/push` is available only in a session's input box (not the global command
+palette). It stages everything in that session's directory, commits with the
+given message (or a concise auto-generated subject when omitted), and pushes —
+with the commit status and a small monochrome "git push" animation shown in
+the status bar, then `pushed to owner/repo`.
 
 ## Keys
 
@@ -94,8 +118,14 @@ are used for subsequent prompts in that session and shown in the status bar.
 | `^F` | Search current conversation |
 | `^B` | Toggle file explorer panel |
 | `^C` | Interrupt the focused agent |
+| `Esc` `Esc` | Interrupt the focused agent (double-tap; hint by the cost) |
+| `Shift+Enter` | Newline in the prompt (also `Alt+Enter` / `Ctrl+J`) |
+| `↑` | Recall the previous prompt; select a tool entry when one is active |
 | `PgUp` / `PgDn` / wheel | Scroll transcript (`End` re-follows) |
-| `↑`/`↓`, `Enter` | Select a tool entry / expand–collapse it |
+| `↓`, `Enter` | Select a tool entry / expand–collapse it |
+| drag mouse | Select transcript text and copy it (OSC 52) |
+| `Alt+Y` | Copy the last reply |
+| `y` | Copy the selected tool's output |
 | `d` / `o` | Diff / open file of the selected tool |
 | `a` / `A` / `r` | Permission: allow once / always / reject |
 | `^Q` | Quit (confirms while agents are working) |

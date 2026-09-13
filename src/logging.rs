@@ -1,0 +1,105 @@
+//! Opt-in debug logging (`theta --log`).
+//!
+//! Writes a timestamped line per event to a file under the user's data dir,
+//! so it works from any working directory. Disabled by default and cheap to
+//! check, so instrumentation can stay in the hot paths.
+
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+static LOG: OnceLock<Mutex<File>> = OnceLock::new();
+
+/// Where `--log` writes by default: `<data>/theta/logs/theta-<epoch>.log`.
+pub fn default_path() -> PathBuf {
+    let base = dirs::data_dir().unwrap_or_else(std::env::temp_dir);
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    base.join("theta")
+        .join("logs")
+        .join(format!("theta-{secs}.log"))
+}
+
+pub fn init(path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = OpenOptions::new().create(true).append(true).open(path)?;
+    let _ = LOG.set(Mutex::new(file));
+    Ok(())
+}
+
+pub fn enabled() -> bool {
+    LOG.get().is_some()
+}
+
+fn stamp() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+    let ms = now.subsec_millis();
+    format!(
+        "{:02}:{:02}:{:02}.{:03}",
+        (secs / 3600) % 24,
+        (secs / 60) % 60,
+        secs % 60,
+        ms
+    )
+}
+
+pub fn write(line: &str) {
+    if let Some(m) = LOG.get() {
+        if let Ok(mut f) = m.lock() {
+            let _ = writeln!(f, "[{}] {}", stamp(), line);
+        }
+    }
+}
+
+/// One-line, newline-escaped excerpt for logs.
+pub fn snippet(s: &str, max: usize) -> String {
+    let total = s.chars().count();
+    let mut out: String = s.chars().take(max).collect();
+    if total > max {
+        out.push('…');
+    }
+    out.replace('\n', "\\n").replace('\r', "")
+}
+
+/// Log a line when `--log` is active (formats lazily).
+#[macro_export]
+macro_rules! tlog {
+    ($($arg:tt)*) => {
+        if $crate::logging::enabled() {
+            $crate::logging::write(&format!($($arg)*));
+        }
+    };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn writes_timestamped_lines() {
+        let path = std::env::temp_dir().join(format!("theta-log-test-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        init(&path).expect("init log");
+        assert!(enabled());
+        write("hello world");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("hello world"));
+        assert!(text.trim_start().starts_with('['));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn snippet_escapes_and_truncates() {
+        assert_eq!(snippet("a\nb", 10), "a\\nb");
+        assert_eq!(snippet("abcdef", 3), "abc…");
+    }
+}

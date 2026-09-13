@@ -2,7 +2,7 @@
 
 use crate::app::App;
 use crate::theme::{pal, self};
-use ratatui::style::Style;
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -20,7 +20,12 @@ pub fn render(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
 
     let n = app.sessions.len();
     let working = app.working_count();
-    let workspace_cost: f64 = app.sessions.iter().map(|s| s.cost).sum();
+    let active = app.active_count();
+    // A `/push` (or similar) status takes over the activity strip.
+    let activity = app
+        .sessions
+        .iter()
+        .find_map(|s| s.activity.as_ref().map(|(t, _)| t.clone()));
 
     let mut left: Vec<Span<'static>> = vec![Span::styled(" ".to_string(), bg)];
     if n > 0 {
@@ -29,24 +34,34 @@ pub fn render(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
             format!(" {n} session{}", if n == 1 { "" } else { "s" }),
             Style::default().bg(barbg).fg(pal().fg_soft),
         ));
-        if working > 0 {
+        if let Some(act) = activity {
             sep(&mut left);
             left.push(Span::styled(
-                format!("{working} working"),
-                Style::default().bg(barbg).fg(pal().cyan),
+                act,
+                Style::default().bg(barbg).fg(pal().yellow),
             ));
-        }
-        if workspace_cost > 0.0 {
-            sep(&mut left);
-            let cost = if workspace_cost >= 1.0 {
-                format!("${workspace_cost:.2}")
-            } else {
-                format!("${workspace_cost:.4}")
-            };
-            left.push(Span::styled(
-                cost,
-                Style::default().bg(barbg).fg(pal().orange),
+            left.push(Span::styled(" ", bg));
+            left.extend(push_anim(
+                app.started.elapsed().as_millis() as usize,
+                barbg,
             ));
+        } else {
+            if working > 0 {
+                sep(&mut left);
+                left.push(Span::styled(
+                    format!("{working} working"),
+                    Style::default().bg(barbg).fg(pal().cyan),
+                ));
+            }
+            // Slider animates as long as anything is going on in any workspace.
+            if active > 0 {
+                left.push(Span::styled(" ", bg));
+                left.extend(working_scanner(
+                    app.started.elapsed().as_millis() as usize,
+                    pal().cyan,
+                    barbg,
+                ));
+            }
         }
     }
 
@@ -69,9 +84,6 @@ pub fn render(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
     // Right cluster: dir · git · ctx · cost · model · hint
     let mut right: Vec<Span<'static>> = Vec::new();
     if let Some(s) = app.focused() {
-        let dir = theme::abbreviate_path(&s.dir.to_string_lossy());
-        right.push(Span::styled(dir, dim));
-        sep(&mut right);
         if let Some(git) = &app.git_display {
             if let Some(branch) = &git.branch {
                 right.push(Span::styled(branch.clone(), dim));
@@ -147,6 +159,171 @@ pub fn render(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
     spans.extend(right);
 
     f.render_widget(Paragraph::new(Line::from(spans)).style(bg), area);
+}
+
+/// Port of OpenCode's Knight-Rider working animation (`ui/spinner.ts`,
+/// `style: "blocks"`): an 8-cell scanner of `■`/`⬝` sweeping back and forth
+/// with a fading trail, advanced one 40ms frame at a time.
+const SCAN_WIDTH: usize = 8;
+const SCAN_HOLD_END: usize = 9;
+const SCAN_HOLD_START: usize = 30;
+const SCAN_TRAIL: usize = 6;
+const SCAN_MIN_ALPHA: f32 = 0.3;
+const SCAN_INACTIVE: f32 = 0.6;
+const SCAN_INTERVAL_MS: usize = 40;
+
+struct ScanState {
+    active: usize,
+    holding: bool,
+    hold_progress: usize,
+    hold_total: usize,
+    movement_progress: usize,
+    movement_total: usize,
+    forward: bool,
+}
+
+fn scan_state(frame: usize) -> ScanState {
+    let forward = SCAN_WIDTH;
+    let back = SCAN_WIDTH - 1;
+    if frame < forward {
+        ScanState {
+            active: frame,
+            holding: false,
+            hold_progress: 0,
+            hold_total: 0,
+            movement_progress: frame,
+            movement_total: forward,
+            forward: true,
+        }
+    } else if frame < forward + SCAN_HOLD_END {
+        ScanState {
+            active: SCAN_WIDTH - 1,
+            holding: true,
+            hold_progress: frame - forward,
+            hold_total: SCAN_HOLD_END,
+            movement_progress: 0,
+            movement_total: 0,
+            forward: true,
+        }
+    } else if frame < forward + SCAN_HOLD_END + back {
+        let bi = frame - forward - SCAN_HOLD_END;
+        ScanState {
+            active: SCAN_WIDTH - 2 - bi,
+            holding: false,
+            hold_progress: 0,
+            hold_total: 0,
+            movement_progress: bi,
+            movement_total: back,
+            forward: false,
+        }
+    } else {
+        ScanState {
+            active: 0,
+            holding: true,
+            hold_progress: frame - forward - SCAN_HOLD_END - back,
+            hold_total: SCAN_HOLD_START,
+            movement_progress: 0,
+            movement_total: 0,
+            forward: false,
+        }
+    }
+}
+
+fn trail_alpha(i: usize) -> f32 {
+    if i == 0 {
+        1.0
+    } else if i == 1 {
+        0.9
+    } else {
+        0.65f32.powi((i - 1) as i32)
+    }
+}
+
+fn brighten(color: ratatui::style::Color, factor: f32) -> ratatui::style::Color {
+    match color {
+        ratatui::style::Color::Rgb(r, g, b) => ratatui::style::Color::Rgb(
+            (r as f32 * factor).min(255.0).round() as u8,
+            (g as f32 * factor).min(255.0).round() as u8,
+            (b as f32 * factor).min(255.0).round() as u8,
+        ),
+        other => other,
+    }
+}
+
+fn working_scanner(
+    elapsed_ms: usize,
+    accent: ratatui::style::Color,
+    barbg: ratatui::style::Color,
+) -> Vec<Span<'static>> {
+    let total_frames = SCAN_WIDTH + SCAN_HOLD_END + (SCAN_WIDTH - 1) + SCAN_HOLD_START;
+    let frame = (elapsed_ms / SCAN_INTERVAL_MS) % total_frames;
+    let st = scan_state(frame);
+
+    let fade = if st.holding && st.hold_total > 0 {
+        let p = (st.hold_progress as f32 / st.hold_total as f32).min(1.0);
+        SCAN_MIN_ALPHA.max(1.0 - p * (1.0 - SCAN_MIN_ALPHA))
+    } else if !st.holding && st.movement_total > 0 {
+        let denom = st.movement_total.saturating_sub(1).max(1) as f32;
+        let p = (st.movement_progress as f32 / denom).min(1.0);
+        SCAN_MIN_ALPHA + p * (1.0 - SCAN_MIN_ALPHA)
+    } else {
+        1.0
+    };
+
+    let mut out = Vec::with_capacity(SCAN_WIDTH);
+    for ci in 0..SCAN_WIDTH {
+        let dd: i32 = if st.forward {
+            st.active as i32 - ci as i32
+        } else {
+            ci as i32 - st.active as i32
+        };
+        let index: i32 = if st.holding {
+            dd + st.hold_progress as i32
+        } else if dd > 0 && (dd as usize) < SCAN_TRAIL {
+            dd
+        } else if dd == 0 {
+            0
+        } else {
+            -1
+        };
+        let (ch, alpha) = if index >= 0 && (index as usize) < SCAN_TRAIL {
+            ("■", trail_alpha(index as usize))
+        } else {
+            ("⬝", SCAN_INACTIVE * fade)
+        };
+        let base = if index == 1 { brighten(accent, 1.15) } else { accent };
+        let color = crate::theme::blend(base, barbg, alpha.clamp(0.0, 1.0));
+        out.push(Span::styled(
+            ch.to_string(),
+            Style::default().fg(color).bg(barbg),
+        ));
+    }
+    out
+}
+
+/// Mono black-and-white "git push" animation: an up arrow followed by a
+/// shimmering two-tone block strip.
+fn push_anim(elapsed_ms: usize, barbg: ratatui::style::Color) -> Vec<Span<'static>> {
+    let n = 7usize;
+    let phase = (elapsed_ms / 90) % 2;
+    let mut out: Vec<Span<'static>> = Vec::with_capacity(n + 2);
+    out.push(Span::styled(
+        "↑",
+        Style::default()
+            .fg(Color::White)
+            .bg(barbg)
+            .add_modifier(Modifier::BOLD),
+    ));
+    out.push(Span::styled(" ", Style::default().bg(barbg)));
+    for i in 0..n {
+        let (ch, fg) = if (i + phase) % 2 == 0 {
+            ("■", Color::White)
+        } else {
+            ("□", Color::DarkGray)
+        };
+        out.push(Span::styled(ch, Style::default().fg(fg).bg(barbg)));
+    }
+    out
 }
 
 pub fn fmt_tokens(t: u64) -> String {
