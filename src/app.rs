@@ -1001,9 +1001,16 @@ impl App {
             }
         }
         if let Some(s) = self.session_mut(id) {
+            // Clear every blocking state so aborting always returns the pane
+            // to a usable input box.
             s.status = SessStatus::Idle;
             s.interrupt_armed = None;
+            s.pending_perm = None;
+            s.pending_question = None;
             s.dirty = true;
+        }
+        if self.overlay == Overlay::Question {
+            self.open_pending_question();
         }
         self.flash("interrupted");
     }
@@ -1536,15 +1543,38 @@ impl App {
         self.dirty = true;
     }
 
-    /// Warm the resume cache for a directory (called at boot).
+    /// Warm the resume cache for a directory (called at boot). Uses an
+    /// existing server with a directory override, so listing many folders
+    /// never spawns extra servers.
     pub fn preload_sessions(&mut self, dir: PathBuf) {
         let dir = dir.canonicalize().unwrap_or(dir);
         if !dir.is_dir() {
             return;
         }
         if !self.session_cache.contains_key(&dir) {
-            self.manager.preload_sessions(dir.clone());
+            let server = self.primary_server_dir();
+            self.manager.preload_dir(server, dir);
         }
+    }
+
+    /// Re-request the session list for every known directory through the
+    /// primary server. Results replace each directory's cache entry, so an
+    /// open picker updates live without flicker.
+    pub fn preload_known_dirs(&mut self) {
+        let dirs: Vec<PathBuf> = self.known_dirs.iter().cloned().collect();
+        let server = self.primary_server_dir();
+        for d in dirs {
+            if d.is_dir() {
+                self.manager.preload_dir(server.clone(), d);
+            }
+        }
+    }
+
+    /// The directory whose server we use to enumerate other folders.
+    fn primary_server_dir(&self) -> PathBuf {
+        self.focused()
+            .map(|s| s.dir.clone())
+            .unwrap_or_else(|| self.initial_dir.clone())
     }
 
     /// Remember a directory so its sessions stay visible across folders.
@@ -2230,6 +2260,18 @@ impl App {
             self.handle_diff_key(key);
             return;
         }
+
+        // Escape hatches that must work from ANY state (including a modal that
+        // is waiting on a reply) so the UI can never trap the user.
+        if ctrl && key.code == KeyCode::Char('c') {
+            self.interrupt(self.focus);
+            return;
+        }
+        if ctrl && key.code == KeyCode::Char('q') {
+            self.execute(Cmd::Quit).await;
+            return;
+        }
+
         if self.overlay != Overlay::None {
             self.handle_overlay_key(key).await;
             return;
@@ -2378,21 +2420,21 @@ impl App {
         }
 
         if has_perm {
+            // The input box is replaced by the permission prompt, so swallow
+            // everything else (no invisible typing) and let Esc reject.
             match key.code {
                 KeyCode::Char('a') => {
                     self.permission_reply(sid, "once");
-                    return;
                 }
                 KeyCode::Char('A') => {
                     self.permission_reply(sid, "always");
-                    return;
                 }
-                KeyCode::Char('r') => {
+                KeyCode::Char('r') | KeyCode::Esc => {
                     self.permission_reply(sid, "reject");
-                    return;
                 }
                 _ => {}
             }
+            return;
         }
 
         // Scrolling works regardless of input content.
@@ -2448,7 +2490,8 @@ impl App {
         if input_empty && tool_cursor.is_some() {
             // Interactions with the selected tool entry.
             match key.code {
-                KeyCode::Char('y') => {
+                // Ctrl+Y (not bare `y`, which must stay typable).
+                KeyCode::Char('y') if ctrl => {
                     let text = self
                         .session(sid)
                         .and_then(|s| s.tool_at(tool_cursor.unwrap()))
@@ -2591,8 +2634,8 @@ impl App {
 
         if input_empty {
             match key.code {
-                // Copy the last reply — Alt+Y so plain `y` can start a message.
-                KeyCode::Char('y') if alt => {
+                // Copy the last reply — Ctrl+Y so plain `y` can start a message.
+                KeyCode::Char('y') if ctrl => {
                     let text = self.focused().and_then(|s| {
                         s.messages
                             .iter()
@@ -2690,9 +2733,10 @@ impl App {
         };
         let canon = dir.canonicalize().unwrap_or_else(|_| dir.clone());
         self.remember_dir(&canon);
-        // Recent sessions across every project, not just this directory.
+        // Snapshot what we already have, then refresh every known folder.
         self.newdlg.recent = self.all_cached_sessions();
-        self.newdlg.recent_loaded = !self.newdlg.recent.is_empty();
+        self.newdlg.recent_loaded = true;
+        self.preload_known_dirs();
         let req = self.manager.next_req();
         self.newdlg.recent_req = Some(req);
         self.manager.list_server_sessions(req, dir.clone());
@@ -2707,10 +2751,10 @@ impl App {
             .unwrap_or_else(|| self.initial_dir.clone());
         self.remember_dir(&dir);
         self.resume_picker = ResumePickerState::default();
-        // Show every known session first; the per-directory fetch below fills
-        // in anything not cached yet.
+        // Show every known session first; the refresh below fills in the rest.
         self.resume_picker.items = self.all_cached_sessions();
-        self.resume_picker.loaded = !self.resume_picker.items.is_empty();
+        self.resume_picker.loaded = true;
+        self.preload_known_dirs();
         let req = self.manager.next_req();
         self.resume_picker.req = Some(req);
         self.manager.list_server_sessions(req, dir.clone());
@@ -4035,14 +4079,44 @@ impl App {
                 if let Some(FileReq::Viewer { line }) = self.pending_files.remove(&req) {
                     match content {
                         Some(text) => {
+                            // Never syntax-highlight an unbounded file on the
+                            // event loop — large generated/lock files would
+                            // freeze the whole UI for a long time.
+                            const MAX_VIEW_BYTES: usize = 256 * 1024;
+                            const MAX_VIEW_LINES: usize = 4000;
+                            let total_lines = text.lines().count();
+                            let truncated =
+                                text.len() > MAX_VIEW_BYTES || total_lines > MAX_VIEW_LINES;
+                            let display = if truncated {
+                                let mut end = text.len().min(MAX_VIEW_BYTES);
+                                while end > 0 && !text.is_char_boundary(end) {
+                                    end -= 1;
+                                }
+                                text[..end]
+                                    .lines()
+                                    .take(MAX_VIEW_LINES)
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            } else {
+                                text.clone()
+                            };
                             let guard = crate::highlight::get();
                             let hl = guard.as_ref().map(|(_, h)| h).expect("highlighter");
                             let mut lines = hl
-                                .highlight_file(&path, &text)
-                                .into_iter()
+                                .highlight_file(&path, &display)
                                 .into_iter()
                                 .map(Line::from)
                                 .collect::<Vec<_>>();
+                            if truncated {
+                                lines.push(Line::from(Span::styled(
+                                    format!(
+                                        "… truncated for display (first {} of {} lines)",
+                                        lines.len().min(MAX_VIEW_LINES),
+                                        total_lines
+                                    ),
+                                    theme::dim(),
+                                )));
+                            }
                             if let Some(d) = diff {
                                 lines.push(Line::from(""));
                                 lines.extend(crate::highlight::diff_lines(&d));

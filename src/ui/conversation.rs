@@ -92,6 +92,16 @@ pub fn build_cache(sess: &SessionState, width: u16, tick: u64) -> Cache {
         animating = true;
     }
     let last_user = sess.messages.iter().rposition(|m| m.role == Role::User);
+    // The message currently being generated — the only one allowed to show a
+    // live "thinking" timer. Historical turns replayed without an `end` must
+    // not animate (they used to show an ever-growing bogus timer).
+    let live_msg = if busy {
+        sess.messages
+            .iter()
+            .rposition(|m| m.role == Role::Assistant && m.completed.is_none())
+    } else {
+        None
+    };
 
     for (mi, msg) in sess.messages.iter().enumerate() {
         let mut rendered_any = false;
@@ -158,9 +168,10 @@ pub fn build_cache(sess: &SessionState, width: u16, tick: u64) -> Cache {
                     block_text.push('\n');
                 }
                 PartKind::Reasoning { text, running, start, end } => {
-                    // Collapsed thinking line: animated while running,
-                    // a quiet "thought for Xs" marker once done.
-                    if *running {
+                    // Collapsed thinking line: animated only for the message
+                    // currently being generated; historical reasoning replays
+                    // without a live turn so it can't show a bogus timer.
+                    if *running && live_msg == Some(mi) {
                         if !rendered_any {
                             start_block(BlockKind::Thinking, String::new(), &mut lines, &mut blocks);
                             rendered_any = true;
@@ -258,6 +269,25 @@ pub fn build_cache(sess: &SessionState, width: u16, tick: u64) -> Cache {
                         }
                     }
                     lines.push(Line::from(spans));
+
+                    // Long-running shell work (clones, installs, builds) gets a
+                    // live "…ing" label and an animated download bar beneath it.
+                    if matches!(t.status, ToolStatus::Pending | ToolStatus::Running)
+                        && t.tool == "bash"
+                    {
+                        let label = activity_label(t);
+                        let pct = t
+                            .output
+                            .as_deref()
+                            .and_then(parse_percent)
+                            .or_else(|| synth_progress(t, now_ms));
+                        lines.push(Line::from(vec![
+                            Span::styled("   ".to_string(), Style::default()),
+                            Span::styled(label, theme::fg(pal().fg_soft)),
+                            Span::styled("…".to_string(), theme::dim()),
+                        ]));
+                        lines.push(activity_bar_line(w, pct));
+                    }
 
                     // Edit/write tools show their diff inline (like the
                     // OpenCode TUI); expanding reveals the full detail.
@@ -387,6 +417,82 @@ fn tool_detail_lines(t: &crate::opencode::ToolInfo, w: usize, cap: usize) -> Vec
 }
 
 /// OpenCode's read tool returns an XML-ish envelope; show just the content.
+/// Human label for a running shell command (best-effort).
+fn activity_label(t: &crate::opencode::ToolInfo) -> String {
+    let cmd = t.input_str(&["command", "cmd"]).unwrap_or_default();
+    let c = cmd.to_lowercase();
+    if c.contains("git clone") {
+        "Cloning repository".into()
+    } else if c.contains("git pull") || c.contains("git fetch") {
+        "Fetching repository".into()
+    } else if c.contains("git push") {
+        "Pushing".into()
+    } else if c.contains("curl") || c.contains("wget") || c.contains("download") {
+        "Downloading".into()
+    } else if c.contains("install") || (c.contains("add") && c.contains("cargo")) {
+        "Installing packages".into()
+    } else if c.contains("build") || c.contains("make") || c.contains("cargo") {
+        "Building".into()
+    } else if c.contains("test") {
+        "Running tests".into()
+    } else {
+        match cmd.split_whitespace().next() {
+            Some(first) if !first.is_empty() => format!("Running {first}"),
+            _ => "Working".into(),
+        }
+    }
+}
+
+/// Best-effort current percentage from a streamed command output (git clone
+/// prints lines like `Receiving objects:  45% (123/456)`).
+fn parse_percent(s: &str) -> Option<u8> {
+    let mut last = None;
+    for tok in s.split(['\r', '\n']) {
+        if let Some(idx) = tok.rfind('%') {
+            let b = tok.as_bytes();
+            let mut j = idx;
+            while j > 0 && b[j - 1].is_ascii_digit() {
+                j -= 1;
+            }
+            if j < idx {
+                if let Ok(n) = tok[j..idx].parse::<u8>() {
+                    last = Some(n);
+                }
+            }
+        }
+    }
+    last
+}
+
+/// Fallback when the command gives no live percentage (git suppresses its own
+/// progress off a TTY): estimate from elapsed time, easing toward 95%.
+fn synth_progress(t: &crate::opencode::ToolInfo, now_ms: i64) -> Option<u8> {
+    if !matches!(t.status, ToolStatus::Pending | ToolStatus::Running) {
+        return None;
+    }
+    let start = t.start_ms?;
+    let elapsed = (now_ms - start).max(0) as f64 / 1000.0;
+    let p = (1.0 - (-elapsed / 8.0).exp()) * 95.0;
+    Some(p.round().clamp(0.0, 95.0) as u8)
+}
+
+/// A determinate progress bar: a dim track with the completed portion filled
+/// in the theme accent and the percentage shown at the end. Uses a half-height
+/// block so it stays a thin strip.
+fn activity_bar_line(w: usize, pct: Option<u8>) -> Line<'static> {
+    let bar_w = w.saturating_sub(4).clamp(8, 44);
+    let filled = pct.map(|p| (p as usize * bar_w + 50) / 100).unwrap_or(0);
+    let mut spans: Vec<Span<'static>> = vec![Span::styled("   ".to_string(), Style::default())];
+    for i in 0..bar_w {
+        let color = if i < filled { pal().cyan } else { pal().border };
+        spans.push(Span::styled("▄".to_string(), Style::default().fg(color)));
+    }
+    if let Some(p) = pct {
+        spans.push(Span::styled(format!("  {p}%"), theme::fg(pal().fg_soft)));
+    }
+    Line::from(spans)
+}
+
 fn unwrap_tool_output(output: &str) -> &str {
     let trimmed = output.trim_start();
     if trimmed.starts_with('<') {

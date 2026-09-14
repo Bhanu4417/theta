@@ -162,6 +162,8 @@ async fn run(
     if !args.no_restore && app.cfg.ui.restore {
         app.restore_workspace();
     }
+    // Pull session lists for every folder we know about (through one server).
+    app.preload_known_dirs();
     app.dirty = true;
 
     let mut events = EventStream::new().fuse();

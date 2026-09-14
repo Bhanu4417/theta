@@ -402,20 +402,23 @@ impl Manager {
         });
     }
 
-    /// Warm the server and pull the session list at boot so resume lists
-    /// open instantly.
-    pub fn preload_sessions(&self, dir: PathBuf) {
+    /// List a directory's sessions using an already-running server for
+    /// `server_dir`. OpenCode accepts a `directory` override, so one server
+    /// can enumerate every folder without spawning more.
+    pub fn preload_dir(&self, server_dir: PathBuf, target_dir: PathBuf) {
         let m = self.ref_.clone();
         tokio::spawn(async move {
-            let dir_c = dir.canonicalize().unwrap_or_else(|_| dir.clone());
-            if let Ok((_, client)) = m.ensure_server(&dir_c).await {
-                if let Ok(mut sessions) = client.list_sessions().await {
-                    sessions.sort_by_key(|s| -s.updated_ms.unwrap_or(0));
-                    m.emit(AppEvent::SessionsPreloaded {
-                        dir: dir_c,
-                        sessions,
-                    });
-                }
+            let sd = server_dir.canonicalize().unwrap_or(server_dir);
+            let td = target_dir.canonicalize().unwrap_or(target_dir);
+            let Ok((_, client)) = m.ensure_server(&sd).await else {
+                return;
+            };
+            if let Ok(mut sessions) = client.list_sessions_in(&td.to_string_lossy()).await {
+                sessions.sort_by_key(|s| -s.updated_ms.unwrap_or(0));
+                m.emit(AppEvent::SessionsPreloaded {
+                    dir: td,
+                    sessions,
+                });
             }
         });
     }

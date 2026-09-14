@@ -124,8 +124,7 @@ the status bar, then `pushed to owner/repo`.
 | `PgUp` / `PgDn` / wheel | Scroll transcript (`End` re-follows) |
 | `↓`, `Enter` | Select a tool entry / expand–collapse it |
 | drag mouse | Select transcript text and copy it (OSC 52) |
-| `Alt+Y` | Copy the last reply |
-| `y` | Copy the selected tool's output |
+| `Ctrl+Y` | Copy the last reply / selected tool output |
 | `d` / `o` | Diff / open file of the selected tool |
 | `a` / `A` / `r` | Permission: allow once / always / reject |
 | `^Q` | Quit (confirms while agents are working) |

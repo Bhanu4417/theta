@@ -142,6 +142,15 @@ impl Highlighter {
     }
 
     fn highlight_impl(&self, content: &str, path: &str, lang: &str) -> Vec<Vec<Span<'static>>> {
+        // Defensive cap: highlighting is synchronous, so a very large input
+        // would block the UI for a long time. Render such content plainly.
+        const MAX_HIGHLIGHT_BYTES: usize = 512 * 1024;
+        if content.len() > MAX_HIGHLIGHT_BYTES {
+            return content
+                .lines()
+                .map(|l| vec![Span::styled(l.to_string(), Style::default().fg(pal().fg))])
+                .collect();
+        }
         let syntax = self.syntax_for(path, lang);
         let mut hl = syntect::easy::HighlightLines::new(syntax, &self.theme);
         let mut out = Vec::new();

@@ -87,6 +87,8 @@ pub struct ToolInfo {
     pub output: Option<String>,
     pub error: Option<String>,
     pub metadata: Value,
+    /// Epoch millis when the tool started (for elapsed-time progress fallback).
+    pub start_ms: Option<i64>,
 }
 
 impl ToolInfo {
@@ -320,15 +322,28 @@ pub fn parse_part(v: &Value) -> Option<Part> {
                 "metadata": metadata,
                 "input": st.get("input").cloned().unwrap_or(json!({})),
             });
+            let metadata_value = merged_state.get("metadata").cloned().unwrap_or(json!({}));
+            // `state.output` only exists once the tool completes; while a
+            // command runs, OpenCode streams its output into `metadata.output`.
+            let output = s(&st, "output").or_else(|| {
+                metadata_value
+                    .get("output")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            });
             let info = ToolInfo {
                 tool: s(v, "tool").unwrap_or_else(|| "tool".into()),
                 call_id: s(v, "callID").unwrap_or_default(),
                 status,
                 title: s(&st, "title").filter(|t| !t.trim().is_empty()),
                 input: st.get("input").cloned().unwrap_or(json!({})),
-                output: s(&st, "output"),
+                output,
                 error: s(&st, "error"),
-                metadata: merged_state.get("metadata").cloned().unwrap_or(json!({})),
+                metadata: metadata_value,
+                start_ms: st
+                    .get("time")
+                    .and_then(|t| t.get("start"))
+                    .and_then(|x| x.as_i64().or_else(|| x.as_f64().map(|f| f as i64))),
             };
             let _ = merged_state; // input already parsed above
             PartKind::Tool(info)
@@ -709,6 +724,24 @@ impl Client {
         let v: Value = self
             .http
             .get(format!("{}/session", self.base))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(v.as_array()
+            .map(|a| a.iter().filter_map(parse_session).collect())
+            .unwrap_or_default())
+    }
+
+    /// List sessions for a specific directory using this server. OpenCode
+    /// scopes sessions per project, but accepts a `directory` override, so a
+    /// single server can enumerate every folder without starting more.
+    pub async fn list_sessions_in(&self, directory: &str) -> Result<Vec<OcSession>> {
+        let v: Value = self
+            .http
+            .get(format!("{}/session", self.base))
+            .query(&[("directory", directory)])
             .send()
             .await?
             .error_for_status()?

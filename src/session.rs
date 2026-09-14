@@ -598,3 +598,64 @@ impl SessionState {
             .unwrap_or(false)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_editing_and_cursor() {
+        let mut input = InputState::default();
+        input.insert("hello");
+        assert_eq!(input.text(), "hello");
+        assert_eq!(input.cursor, 5);
+        input.left();
+        input.left();
+        input.insert("X");
+        assert_eq!(input.text(), "helXlo");
+        assert_eq!(input.cursor, 4);
+        input.backspace();
+        assert_eq!(input.text(), "hello");
+        input.end();
+        input.delete();
+        assert_eq!(input.text(), "hello");
+        input.clear();
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn history_recalls_previous_prompts() {
+        let mut input = InputState::default();
+        input.push_history("first", 10);
+        input.push_history("second", 10);
+        input.hist_up();
+        assert_eq!(input.text(), "second");
+        input.hist_up();
+        assert_eq!(input.text(), "first");
+        input.hist_down();
+        assert_eq!(input.text(), "second");
+        input.hist_down();
+        assert!(input.is_empty(), "descending past the end restores the draft");
+    }
+
+    #[test]
+    fn optimistic_users_are_adopted_by_matching_text() {
+        let mut s = SessionState::new(1, "s".into(), PathBuf::from("."));
+        s.push_local_user("do the thing");
+        assert_eq!(s.messages.len(), 1);
+        assert!(s.messages[0].id.starts_with("local-"));
+        let real = Message {
+            id: "msg_1".into(),
+            role: Role::User,
+            error: None,
+            completed: None,
+            created: None,
+            cost: None,
+            tokens: None,
+            parts: Vec::new(),
+        };
+        assert!(s.adopt_by_text(&real, "do the thing"));
+        assert_eq!(s.messages.len(), 1, "adoption replaces, never duplicates");
+        assert_eq!(s.messages[0].id, "msg_1");
+    }
+}

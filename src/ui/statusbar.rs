@@ -148,6 +148,19 @@ pub fn render(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
     right.push(Span::styled("  ", bg));
     right.push(hint(crate::keys::Action::Quit));
     right.push(Span::styled("Quit", theme::mute()));
+    // Build stamp: after `/refresh` this time changes, confirming the newest
+    // binary took over.
+    let build_hash = option_env!("THETA_BUILD_HASH").unwrap_or("dev");
+    let build_time = option_env!("THETA_BUILD_TIME").unwrap_or("--:--:--");
+    right.push(Span::styled("  ", bg));
+    right.push(Span::styled(
+        format!("v{}", env!("CARGO_PKG_VERSION")),
+        theme::mute(),
+    ));
+    right.push(Span::styled(
+        format!(" {build_hash} {build_time}"),
+        Style::default().bg(barbg).fg(pal().fg_mute),
+    ));
     right.push(Span::styled(" ", bg));
 
     let left_len: usize = left.iter().map(|s| s.content.chars().count()).sum();

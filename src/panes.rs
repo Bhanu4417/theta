@@ -427,3 +427,33 @@ pub fn auto_cols(n: usize, w: u16, h: u16) -> usize {
     let ideal = (n as f32 * ratio.max(0.5)).sqrt() as usize;
     ideal.clamp(1, n)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_grid_keeps_order_and_covers_every_session() {
+        let grid = PaneGrid::auto(&[1, 2, 3, 4], 160, 40);
+        assert_eq!(grid.order(), vec![1, 2, 3, 4]);
+        let rects = grid.rects(Rect::new(0, 0, 160, 40)).expect("grid fits");
+        assert_eq!(rects.len(), 4);
+    }
+
+    #[test]
+    fn rows_scheme_is_one_pane_per_row() {
+        let grid = PaneGrid::build(&[7, 8, 9], Scheme::Rows, 160, 40);
+        assert_eq!(grid.rows.len(), 3);
+        assert_eq!(grid.len(), 3);
+    }
+
+    #[test]
+    fn insert_and_remove_session() {
+        let mut grid = PaneGrid::auto(&[1], 100, 30);
+        grid.insert_session(2, 100, 30);
+        assert!(grid.contains(1) && grid.contains(2));
+        grid.remove_session(1, 100, 30);
+        assert!(!grid.contains(1));
+        assert_eq!(grid.order(), vec![2]);
+    }
+}

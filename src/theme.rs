@@ -410,3 +410,27 @@ pub fn theta_mark_line(row: usize) -> Line<'static> {
 pub fn symbol_span() -> Span<'static> {
     Span::styled(P_SYMBOL.to_string(), Style::default().fg(pal().cyan))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blend_endpoints_and_midpoint() {
+        let a = Color::Rgb(0, 0, 0);
+        let b = Color::Rgb(100, 200, 40);
+        assert_eq!(blend(a, b, 0.0), b);
+        assert_eq!(blend(a, b, 1.0), a);
+        assert_eq!(blend(a, b, 0.5), Color::Rgb(50, 100, 20));
+    }
+
+    #[test]
+    fn themes_have_unique_names() {
+        let names = theme_names();
+        assert!(names.contains(&"theta-night"), "default theme present");
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), names.len(), "theme names must be unique");
+    }
+}

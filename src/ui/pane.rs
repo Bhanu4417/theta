@@ -348,10 +348,28 @@ fn input_layout(buf: &str, width: usize, cursor: usize) -> (Vec<Vec<Span<'static
 }
 
 pub fn input_height(sess: &SessionState, w: usize, total_h: usize) -> u16 {
-    // Box: queued rows + input at top + blank + footer + bottom pad.
-    let max = (total_h.saturating_sub(1)).max(4).min(14) as usize;
+    // Box: prompt/queued rows + input at top + blank + footer + bottom pad.
+    let max = (total_h.saturating_sub(1)).max(4).min(18) as usize;
+    // Interactive prompts need room for their options + hint; the old 4 rows
+    // left a single body line so the options were clipped off-screen.
+    if sess.pending_question.is_some() {
+        let opts = sess
+            .pending_question
+            .as_ref()
+            .and_then(|pq| pq.current())
+            .map(|q| q.options.len().min(6))
+            .unwrap_or(0);
+        let custom = sess
+            .pending_question
+            .as_ref()
+            .and_then(|pq| pq.current())
+            .map(|q| q.custom)
+            .unwrap_or(false) as usize;
+        // header + question + options + optional custom + hint
+        return ((opts + custom + 4 + 3).min(max).max(6)) as u16;
+    }
     if sess.pending_perm.is_some() {
-        return 4usize.min(max) as u16;
+        return 6usize.min(max).max(5) as u16;
     }
     let queue_rows = sess.queue.len().min(4);
     let text_rows = if sess.input.is_empty() {
@@ -472,25 +490,10 @@ fn render_input(
         return;
     }
 
-    if let Some(perm) = &sess.pending_perm {
-        let detail = conversation::truncate(
-            &format!("{} {}", perm.kind, perm.detail),
-            body.width as usize,
-        );
-        let l1 = Line::from(vec![
-            Span::styled(format!("{} ", crate::theme::P_SYMBOL), theme::bold(pal().yellow)).patch(bg),
-            Span::styled("Permission: ".to_string(), theme::bold(pal().yellow)).patch(bg),
-            Span::styled(detail, theme::fg(pal().fg)).patch(bg),
-        ]);
-        let l2 = Line::from(Span::styled(
-            "  [a] allow once   [A] always   [r] reject".to_string(),
-            theme::dim().patch(bg),
-        ));
-        let mut rows = vec![Line::from(Span::styled(" ".to_string(), bg)), l1, l2];
-        rows.truncate(body.height as usize);
-        while rows.len() < body.height as usize {
-            rows.push(Line::from(Span::styled(" ".to_string(), bg)));
-        }
+    // Permission requests and agent questions render right in the chatbox,
+    // like OpenCode's prompt — never a clipped floating box.
+    if sess.pending_perm.is_some() || sess.pending_question.is_some() {
+        let rows = prompt_rows(sess, body.width as usize, body.height as usize, bg);
         f.render_widget(Paragraph::new(rows), body);
         return;
     }
@@ -592,5 +595,165 @@ fn queued_line(text: &str, w: usize, bg: Style) -> Line<'static> {
         Span::styled(" ".repeat(gap), bg),
         Span::styled(label.to_string(), theme::fg(pal().yellow)).patch(bg),
     ])
+}
+
+/// Rows for a pending permission or agent question, rendered in the input
+/// body (the "chatbox") the way OpenCode presents prompts.
+fn prompt_rows(sess: &SessionState, w: usize, h: usize, bg: Style) -> Vec<Line<'static>> {
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let text_w = w.saturating_sub(2).max(8);
+
+    if let Some(perm) = &sess.pending_perm {
+        rows.push(Line::from(vec![
+            Span::styled("! ".to_string(), theme::bold(pal().yellow)).patch(bg),
+            Span::styled("Allow ".to_string(), theme::bold(pal().fg)).patch(bg),
+            Span::styled(perm.kind.clone(), theme::bold(pal().yellow)).patch(bg),
+        ]));
+        if !perm.detail.trim().is_empty() {
+            let detail = conversation::truncate(&perm.detail, text_w);
+            rows.push(Line::from(
+                Span::styled(format!("  {detail}"), theme::fg(pal().fg_soft)).patch(bg),
+            ));
+        }
+        rows.push(Line::from(vec![
+            Span::styled("  ".to_string(), bg),
+            Span::styled("[a]".to_string(), theme::bold(pal().green)).patch(bg),
+            Span::styled(" allow once   ".to_string(), theme::fg(pal().fg_soft)).patch(bg),
+            Span::styled("[A]".to_string(), theme::bold(pal().green)).patch(bg),
+            Span::styled(" always   ".to_string(), theme::fg(pal().fg_soft)).patch(bg),
+            Span::styled("[r]".to_string(), theme::bold(pal().red)).patch(bg),
+            Span::styled(" reject".to_string(), theme::fg(pal().fg_soft)).patch(bg),
+        ]));
+        while rows.len() < h {
+            rows.push(Line::from(Span::styled(" ".to_string(), bg)));
+        }
+        rows.truncate(h);
+        return rows;
+    }
+
+    let Some(pq) = &sess.pending_question else {
+        return rows;
+    };
+    let (header, question, multiple, custom, options) = match pq.current() {
+        Some(q) => (
+            q.header.clone(),
+            q.question.clone(),
+            q.multiple,
+            q.custom,
+            q.options.clone(),
+        ),
+        None => (String::new(), String::new(), false, false, Vec::new()),
+    };
+    let sel = pq.selected.get(pq.qi).copied().unwrap_or(0);
+
+    let mut head = vec![
+        Span::styled("? ".to_string(), theme::bold(pal().purple)).patch(bg),
+        Span::styled(
+            if header.trim().is_empty() {
+                "agent asks".to_string()
+            } else {
+                header
+            },
+            theme::bold(pal().fg),
+        )
+        .patch(bg),
+    ];
+    if pq.questions.len() > 1 {
+        head.push(
+            Span::styled(
+                format!("   ({}/{})", pq.qi + 1, pq.questions.len()),
+                theme::dim(),
+            )
+            .patch(bg),
+        );
+    }
+    rows.push(Line::from(head));
+
+    for chunk in conversation::wrap_spans(
+        &[Span::styled(question, theme::fg(pal().fg_soft))],
+        text_w,
+    ) {
+        let mut sp = vec![Span::styled("  ".to_string(), bg)];
+        sp.extend(chunk.into_iter().map(|s| s.patch(bg)));
+        rows.push(Line::from(sp));
+    }
+
+    // Leave one row for the hint.
+    let max_rows = h.saturating_sub(1);
+    for (i, o) in options.iter().enumerate() {
+        if rows.len() >= max_rows {
+            break;
+        }
+        let is_sel = i == sel;
+        let checked = pq
+            .chosen
+            .get(pq.qi)
+            .and_then(|v| v.get(i))
+            .copied()
+            .unwrap_or(false);
+        let mark = if multiple {
+            if checked { "[x] " } else { "[ ] " }
+        } else if is_sel {
+            "(•) "
+        } else {
+            "( ) "
+        };
+        let mut sp = vec![
+            Span::styled("  ".to_string(), bg),
+            Span::styled(mark.to_string(), theme::fg(pal().cyan)).patch(bg),
+            Span::styled(
+                conversation::truncate(&o.label, w.saturating_sub(8)),
+                if is_sel { theme::bold(pal().fg) } else { theme::fg(pal().fg) },
+            )
+            .patch(bg),
+        ];
+        if !o.description.trim().is_empty() {
+            sp.push(
+                Span::styled(
+                    format!(
+                        "  {}",
+                        conversation::truncate(&o.description, w.saturating_sub(30).max(8))
+                    ),
+                    theme::dim(),
+                )
+                .patch(bg),
+            );
+        }
+        if is_sel {
+            for s in &mut sp {
+                s.style = s.style.bg(pal().selection);
+            }
+        }
+        rows.push(Line::from(sp));
+    }
+
+    if custom && rows.len() < max_rows {
+        rows.push(Line::from(vec![
+            Span::styled("  custom: ".to_string(), theme::dim()).patch(bg),
+            Span::styled(
+                conversation::truncate(&pq.custom, w.saturating_sub(12)),
+                theme::fg(pal().yellow),
+            )
+            .patch(bg),
+            Span::styled("▏".to_string(), theme::fg(pal().cyan)).patch(bg),
+        ]));
+    }
+
+    if rows.len() < h {
+        let hint = if custom {
+            "type an answer · Enter confirm · Esc reject"
+        } else if multiple {
+            "↑/↓ move · Space toggle · Enter confirm · Esc reject"
+        } else {
+            "↑/↓ move · Enter confirm · Esc reject"
+        };
+        rows.push(Line::from(Span::styled(format!("  {hint}"), theme::dim()).patch(bg)));
+    }
+
+    while rows.len() < h {
+        rows.push(Line::from(Span::styled(" ".to_string(), bg)));
+    }
+    rows.truncate(h);
+    rows
 }
 
