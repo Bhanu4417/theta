@@ -2,7 +2,7 @@
 
 use crate::app::App;
 use crate::theme::{pal, self};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -22,10 +22,7 @@ pub fn render(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
     let working = app.working_count();
     let active = app.active_count();
     // A `/push` (or similar) status takes over the activity strip.
-    let activity = app
-        .sessions
-        .iter()
-        .find_map(|s| s.activity.as_ref().map(|(t, _)| t.clone()));
+    let activity = app.sessions.iter().find_map(|s| s.activity.as_ref());
 
     let mut left: Vec<Span<'static>> = vec![Span::styled(" ".to_string(), bg)];
     if n > 0 {
@@ -37,14 +34,20 @@ pub fn render(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
         if let Some(act) = activity {
             sep(&mut left);
             left.push(Span::styled(
-                act,
-                Style::default().bg(barbg).fg(pal().yellow),
+                act.text.clone(),
+                if act.done {
+                    Style::default().bg(barbg).fg(pal().green)
+                } else {
+                    Style::default().bg(barbg).fg(pal().fg_soft)
+                },
             ));
-            left.push(Span::styled(" ", bg));
-            left.extend(push_anim(
-                app.started.elapsed().as_millis() as usize,
-                barbg,
-            ));
+            if !act.done {
+                left.push(Span::styled(" ", bg));
+                left.extend(push_anim(
+                    act.started.elapsed().as_millis() as usize,
+                    barbg,
+                ));
+            }
         } else {
             if working > 0 {
                 sep(&mut left);
@@ -314,27 +317,21 @@ fn working_scanner(
     out
 }
 
-/// Mono black-and-white "git push" animation: an up arrow followed by a
-/// shimmering two-tone block strip.
+/// Mono black-and-white push bar: a thin, 8-cell half-block track (same look
+/// as the shell download bar) that fills left-to-right while pushing.
 fn push_anim(elapsed_ms: usize, barbg: ratatui::style::Color) -> Vec<Span<'static>> {
-    let n = 7usize;
-    let phase = (elapsed_ms / 90) % 2;
-    let mut out: Vec<Span<'static>> = Vec::with_capacity(n + 2);
-    out.push(Span::styled(
-        "↑",
-        Style::default()
-            .fg(Color::White)
-            .bg(barbg)
-            .add_modifier(Modifier::BOLD),
-    ));
-    out.push(Span::styled(" ", Style::default().bg(barbg)));
+    let n = 8usize;
+    let period = 1500usize;
+    let t = (elapsed_ms % period) as f32 / period as f32;
+    let eased = t * t * (3.0 - 2.0 * t);
+    let filled = (eased * n as f32).round() as usize;
+    let mut out: Vec<Span<'static>> = Vec::with_capacity(n);
     for i in 0..n {
-        let (ch, fg) = if (i + phase) % 2 == 0 {
-            ("■", Color::White)
-        } else {
-            ("□", Color::DarkGray)
-        };
-        out.push(Span::styled(ch, Style::default().fg(fg).bg(barbg)));
+        let fg = if i < filled { Color::White } else { Color::DarkGray };
+        out.push(Span::styled(
+            "▄".to_string(),
+            Style::default().fg(fg).bg(barbg),
+        ));
     }
     out
 }

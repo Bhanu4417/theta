@@ -250,6 +250,15 @@ impl InputState {
     }
 }
 
+/// A transient status line shown in the workspace activity strip (e.g. a
+/// `/push`), with the time it started so it can expire and whether it finished.
+#[derive(Debug, Clone)]
+pub struct Activity {
+    pub text: String,
+    pub started: std::time::Instant,
+    pub done: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ToolRef {
     /// Index into `messages`.
@@ -283,9 +292,8 @@ pub struct SessionState {
     /// Set when Esc was pressed once while the agent is busy; a second Esc
     /// within a short window interrupts. Cleared on tick.
     pub interrupt_armed: Option<std::time::Instant>,
-    /// Short status shown in the workspace activity strip (e.g. a `/push`),
-    /// with the time it was set so it can expire.
-    pub activity: Option<(String, std::time::Instant)>,
+    /// Short status shown in the workspace activity strip (e.g. a `/push`).
+    pub activity: Option<Activity>,
     /// Cumulative assistant cost in USD (recomputed from the transcript).
     pub cost: f64,
     /// Prompt-side tokens of the latest assistant message (context size).

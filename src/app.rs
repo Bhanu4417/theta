@@ -8,7 +8,7 @@ use crate::manager::Manager;
 use crate::opencode::{GrepMatch, Message, ModelEntry, ModelRef, OcSession, PartKind, Role, ToolStatus};
 use crate::panes::{Dir, PaneGrid};
 use crate::persist;
-use crate::session::{InputState, PendingPermission, PendingQuestion, SessionState, SessStatus};
+use crate::session::{Activity, InputState, PendingPermission, PendingQuestion, SessionState, SessStatus};
 use crate::theme::{pal, self};
 use crate::ui::conversation;
 use crossterm::event::{
@@ -913,7 +913,11 @@ impl App {
             format!("Git commit \"{statement}\"")
         };
         if let Some(s) = self.session_mut(id) {
-            s.activity = Some((label, Instant::now()));
+            s.activity = Some(Activity {
+                text: label,
+                started: Instant::now(),
+                done: false,
+            });
             s.dirty = true;
         }
         crate::tlog!(
@@ -3841,7 +3845,11 @@ impl App {
             }
             AppEvent::PushProgress { session, text } => {
                 if let Some(s) = self.session_mut(session) {
-                    s.activity = Some((text, Instant::now()));
+                    s.activity = Some(Activity {
+                        text,
+                        started: Instant::now(),
+                        done: false,
+                    });
                     s.dirty = true;
                 }
             }
@@ -3857,7 +3865,11 @@ impl App {
                     format!("push failed: {message}")
                 };
                 if let Some(s) = self.session_mut(session) {
-                    s.activity = Some((text.clone(), Instant::now()));
+                    s.activity = Some(Activity {
+                        text: text.clone(),
+                        started: Instant::now(),
+                        done: true,
+                    });
                     s.dirty = true;
                 }
                 self.flash(text);
@@ -4433,9 +4445,9 @@ impl App {
                     s.dirty = true;
                 }
             }
-            // Let a `/push` status linger, then clear it.
-            if let Some((_, at)) = &s.activity {
-                if at.elapsed() > Duration::from_secs(10) {
+            // Let a finished `/push` status linger briefly, then clear it.
+            if let Some(a) = &s.activity {
+                if a.done && a.started.elapsed() > Duration::from_secs(6) {
                     s.activity = None;
                     s.dirty = true;
                 }
