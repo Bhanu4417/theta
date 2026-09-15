@@ -179,9 +179,18 @@ fn auto_message(staged: &str) -> String {
     }
 }
 
+/// Result of a successful `/push`.
+#[derive(Debug, Clone)]
+pub struct PushOutcome {
+    /// `owner/repo` (or the remote string as-is).
+    pub repo: String,
+    /// The commit subject that was actually used.
+    pub subject: String,
+}
+
 /// Stage everything, commit, and push. When `message` is empty a minimal
-/// subject is derived from the changed files. Returns `owner/repo`.
-pub async fn commit_and_push(dir: &Path, message: &str) -> Result<String> {
+/// subject is derived from the changed files. Returns the repo and subject.
+pub async fn commit_and_push(dir: &Path, message: &str) -> Result<PushOutcome> {
     run(dir, &["add", "-A"]).await?;
     let staged = run(dir, &["diff", "--cached", "--name-only"]).await?;
     if staged.trim().is_empty() {
@@ -196,5 +205,8 @@ pub async fn commit_and_push(dir: &Path, message: &str) -> Result<String> {
     if run(dir, &["push"]).await.is_err() {
         run(dir, &["push", "-u", "origin", "HEAD"]).await?;
     }
-    Ok(remote_repo(dir).await.unwrap_or_else(|| "remote".into()))
+    Ok(PushOutcome {
+        repo: remote_repo(dir).await.unwrap_or_else(|| "remote".into()),
+        subject,
+    })
 }

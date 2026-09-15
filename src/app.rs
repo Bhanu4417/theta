@@ -1025,13 +1025,13 @@ impl App {
         };
         let statement = statement.trim().to_string();
         let label = if statement.is_empty() {
-            "Git commit".to_string()
+            "Git push".to_string()
         } else {
-            format!("Git commit \"{statement}\"")
+            format!("Git push \"{statement}\"")
         };
         if let Some(s) = self.session_mut(id) {
             s.activity = Some(Activity {
-                text: label,
+                text: label.clone(),
                 started: Instant::now(),
                 done: false,
             });
@@ -1042,13 +1042,12 @@ impl App {
             dir.display(),
             if statement.is_empty() { "<auto>" } else { &statement }
         );
-        self.flash("committing…");
         self.dirty = true;
         let tx = self.manager.tx();
         tokio::spawn(async move {
             let _ = tx.send(AppEvent::PushProgress {
                 session: id,
-                text: "Git add".into(),
+                text: label,
             });
             let started = Instant::now();
             let result = crate::git::commit_and_push(&dir, &statement).await;
@@ -1058,11 +1057,16 @@ impl App {
             if elapsed < Duration::from_millis(1100) {
                 tokio::time::sleep(Duration::from_millis(1100) - elapsed).await;
             }
+            let (ok, message, repo, subject) = match result {
+                Ok(o) => (true, String::new(), Some(o.repo), o.subject),
+                Err(e) => (false, e.to_string(), None, String::new()),
+            };
             let _ = tx.send(AppEvent::PushDone {
                 session: id,
-                ok: result.is_ok(),
-                message: result.as_ref().err().map(|e| e.to_string()).unwrap_or_default(),
-                repo: result.ok(),
+                ok,
+                message,
+                repo,
+                subject,
             });
         });
     }
@@ -4091,21 +4095,28 @@ impl App {
                 ok,
                 message,
                 repo,
+                subject,
             } => {
                 let text = if ok {
-                    format!("pushed to {}", repo.unwrap_or_else(|| "remote".into()))
+                    let repo = repo.unwrap_or_else(|| "remote".into());
+                    if subject.trim().is_empty() {
+                        format!("Git pushed {repo}")
+                    } else {
+                        format!("Git pushed \"{subject}\" {repo}")
+                    }
                 } else {
                     format!("push failed: {message}")
                 };
                 if let Some(s) = self.session_mut(session) {
                     s.activity = Some(Activity {
-                        text: text.clone(),
+                        text,
                         started: Instant::now(),
                         done: true,
                     });
                     s.dirty = true;
                 }
-                self.flash(text);
+                // No flash: the activity strip is the single place push status
+                // is shown, so it isn't duplicated in the status bar.
             }
             AppEvent::QuestionsListed { dir, questions } => {
                 for q in questions {

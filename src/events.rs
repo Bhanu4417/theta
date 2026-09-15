@@ -130,5 +130,6 @@ pub enum AppEvent {
         ok: bool,
         message: String,
         repo: Option<String>,
+        subject: String,
     },
 }

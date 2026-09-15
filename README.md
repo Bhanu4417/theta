@@ -97,7 +97,7 @@ with `Esc`.
 palette). It stages everything in that session's directory, commits with the
 given message (or a concise auto-generated subject when omitted), and pushes —
 with the commit status and a small monochrome "git push" animation shown in
-the status bar, then `pushed to owner/repo`.
+the status bar, then `Git pushed "commit subject" owner/repo`.
 
 ## Keys
 
