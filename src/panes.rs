@@ -281,6 +281,59 @@ impl PaneGrid {
         None
     }
 
+    /// Cyclic neighbour used only for keyboard focus. Horizontal moves follow
+    /// row-major session order; vertical moves follow column-major order. In
+    /// a regular grid this preserves the adjacent move, while repeated arrows
+    /// eventually reach every pane.
+    pub fn focus_step(&self, session: u32, dir: Dir) -> Option<u32> {
+        match dir {
+            Dir::Left | Dir::Right => {
+                let flat = self.order();
+                if flat.len() <= 1 {
+                    return None;
+                }
+                let pos = flat.iter().position(|s| *s == session)?;
+                Some(if dir == Dir::Right {
+                    flat[(pos + 1) % flat.len()]
+                } else {
+                    flat[(pos + flat.len() - 1) % flat.len()]
+                })
+            }
+            Dir::Up | Dir::Down => {
+                let max_cols = self
+                    .rows
+                    .iter()
+                    .map(|row| row.cells.len())
+                    .max()
+                    .unwrap_or(0);
+                let mut columns: Vec<Vec<u32>> = vec![Vec::new(); max_cols];
+                for row in &self.rows {
+                    for (col, cell) in row.cells.iter().enumerate() {
+                        columns[col].push(cell.session);
+                    }
+                }
+                let col_index = columns
+                    .iter()
+                    .position(|column| column.contains(&session))?;
+                let column = &columns[col_index];
+                let pos = column.iter().position(|s| *s == session)?;
+                Some(if dir == Dir::Down {
+                    if pos + 1 < column.len() {
+                        column[pos + 1]
+                    } else {
+                        columns[(col_index + 1) % columns.len()][0]
+                    }
+                } else if pos > 0 {
+                    column[pos - 1]
+                } else {
+                    let prev = &columns[(col_index + columns.len() - 1) % columns.len()];
+                    prev[prev.len() - 1]
+                })
+            }
+            Dir::Next | Dir::Prev => None,
+        }
+    }
+
     /// Neighbouring session in a direction (grid adjacency for
     /// Left/Right/Up/Down, z-order cycling for Next/Prev).
     pub fn neighbor(&self, session: u32, dir: Dir, rects: &[(u32, Rect)]) -> Option<u32> {
@@ -455,5 +508,70 @@ mod tests {
         grid.remove_session(1, 100, 30);
         assert!(!grid.contains(1));
         assert_eq!(grid.order(), vec![2]);
+    }
+
+    fn two_by_two_grid() -> PaneGrid {
+        PaneGrid {
+            rows: vec![
+                Row {
+                    weight: 1.0,
+                    cells: vec![
+                        Cell { weight: 1.0, session: 1 },
+                        Cell { weight: 1.0, session: 2 },
+                    ],
+                },
+                Row {
+                    weight: 1.0,
+                    cells: vec![
+                        Cell { weight: 1.0, session: 3 },
+                        Cell { weight: 1.0, session: 4 },
+                    ],
+                },
+            ],
+            scheme: Scheme::Auto,
+        }
+    }
+
+    #[test]
+    fn focus_step_cycles_horizontally_through_every_pane() {
+        let grid = two_by_two_grid();
+        assert_eq!(grid.focus_step(1, Dir::Right), Some(2));
+        assert_eq!(grid.focus_step(2, Dir::Right), Some(3));
+        assert_eq!(grid.focus_step(4, Dir::Right), Some(1));
+        assert_eq!(grid.focus_step(1, Dir::Left), Some(4));
+    }
+
+    #[test]
+    fn focus_step_cycles_vertically_through_every_pane() {
+        let grid = two_by_two_grid();
+        assert_eq!(grid.focus_step(1, Dir::Down), Some(3));
+        assert_eq!(grid.focus_step(3, Dir::Down), Some(2));
+        assert_eq!(grid.focus_step(2, Dir::Down), Some(4));
+        assert_eq!(grid.focus_step(4, Dir::Down), Some(1));
+        assert_eq!(grid.focus_step(1, Dir::Up), Some(4));
+        assert_eq!(grid.focus_step(4, Dir::Up), Some(2));
+    }
+
+    #[test]
+    fn focus_step_handles_ragged_rows() {
+        let grid = PaneGrid {
+            rows: vec![
+                Row {
+                    weight: 1.0,
+                    cells: vec![Cell { weight: 1.0, session: 1 }],
+                },
+                Row {
+                    weight: 1.0,
+                    cells: vec![
+                        Cell { weight: 1.0, session: 2 },
+                        Cell { weight: 1.0, session: 3 },
+                    ],
+                },
+            ],
+            scheme: Scheme::Auto,
+        };
+        assert_eq!(grid.focus_step(1, Dir::Right), Some(2));
+        assert_eq!(grid.focus_step(2, Dir::Down), Some(3));
+        assert_eq!(grid.focus_step(3, Dir::Down), Some(1));
     }
 }

@@ -3,7 +3,7 @@
 use crate::config::Config;
 use crate::events::{AppEvent, ReqId};
 use crate::git::{GitCache, GitInfo};
-use crate::harness::transcript::{Message, PartKind, Role, ToolStatus};
+use crate::harness::transcript::{Message, PartKind, Role};
 use crate::harness::{HarnessEvent, NotificationPolicy, Task, TaskStatus, TranscriptUpdate};
 use crate::keys::Action;
 use crate::manager::Manager;
@@ -1221,6 +1221,11 @@ impl App {
                 self.dirty = true;
                 return;
             }
+        }
+        if let Some(target) = self.grid.focus_step(cur_id, dir) {
+            self.focus = target;
+            self.dirty = true;
+            return;
         }
         if let Some(t) = self.grid.neighbor(cur_id, dir, rects) {
             self.focus = t;
