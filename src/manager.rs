@@ -3,8 +3,10 @@
 //! `AppEvent`s on the shared channel.
 
 use crate::config::Config;
-use crate::events::{AppEvent, OcEvent, ReqId};
+use crate::events::{AppEvent, ReqId};
 use crate::opencode::{Client, GrepMatch, ModelRef};
+use crate::providers::opencode::OpenCodeProvider;
+use crate::providers::{AgentProvider, ModelId, ProviderSession, SessionConfig};
 use anyhow::Result;
 use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
@@ -19,8 +21,9 @@ struct ServerHandle {
     #[allow(dead_code)]
     base: String,
     client: Client,
-    /// Handle to the spawned process. Kept alive so `kill_on_drop` stops the
-    /// server when Theta exits (normal quit calls `shutdown_all` first).
+    /// Handle to the spawned process. Not killed on drop: with `keep_alive`
+    /// (default) servers persist so the next launch reuses them; they are
+    /// stopped explicitly by `shutdown_all` when `keep_alive = false`.
     #[allow(dead_code)]
     child: Option<tokio::process::Child>,
 }
@@ -198,21 +201,35 @@ impl Manager {
                 base: _base,
             });
 
+            // Session lifecycle goes through the provider adapter so the
+            // manager never speaks OpenCode protocol directly.
+            let provider =
+                OpenCodeProvider::new(client.clone(), dir_c.to_string_lossy().to_string());
+            let config = SessionConfig {
+                directory: dir_c.to_string_lossy().to_string(),
+                title: name.clone(),
+            };
             let session = match oc_sid.as_deref() {
-                Some(sid) => match client.get_session(sid).await {
+                Some(sid) => match provider.resume_session(sid).await {
                     Ok(s) => s,
-                    Err(_) => match client.create_session(&name).await {
+                    Err(_) => match provider.create_session(config).await {
                         Ok(s) => s,
                         Err(e) => {
-                            m.emit(AppEvent::OcCreateFailed { req, error: e.to_string() });
+                            m.emit(AppEvent::OcCreateFailed {
+                                req,
+                                error: e.to_string(),
+                            });
                             return;
                         }
                     },
                 },
-                None => match client.create_session(&name).await {
+                None => match provider.create_session(config).await {
                     Ok(s) => s,
                     Err(e) => {
-                        m.emit(AppEvent::OcCreateFailed { req, error: e.to_string() });
+                        m.emit(AppEvent::OcCreateFailed {
+                            req,
+                            error: e.to_string(),
+                        });
                         return;
                     }
                 },
@@ -306,26 +323,29 @@ impl Manager {
                 agent,
                 crate::logging::snippet(&text, 2000)
             );
-            match client
-                .prompt_async(&oc_sid, &text, model.as_ref(), agent.as_deref())
+            let provider =
+                OpenCodeProvider::new(client.clone(), dir.to_string_lossy().to_string());
+            let session = ProviderSession {
+                provider: crate::providers::ProviderKind::OpenCode,
+                id: oc_sid.clone(),
+                directory: dir.to_string_lossy().to_string(),
+            };
+            let model_id = model.map(|m| ModelId {
+                provider: m.provider_id,
+                model: m.model_id,
+            });
+            match provider
+                .send_message(&session, &text, model_id, agent)
                 .await
             {
                 Ok(()) => crate::tlog!("PROMPT ok session={oc_sid}"),
-                Err(e) if model.is_some() => {
-                    // A bad/unavailable model shouldn't swallow the prompt —
-                    // retry on the server default so every provider works.
-                    crate::tlog!("PROMPT retry without model session={oc_sid}: {e}");
-                    match client.prompt_async(&oc_sid, &text, None, agent.as_deref()).await {
-                        Ok(()) => crate::tlog!("PROMPT ok (default model) session={oc_sid}"),
-                        Err(e) => {
-                            crate::tlog!("PROMPT failed session={oc_sid}: {e}");
-                            m.emit(AppEvent::SendFailed { dir, oc_sid, error: e.to_string() });
-                        }
-                    }
-                }
                 Err(e) => {
                     crate::tlog!("PROMPT failed session={oc_sid}: {e}");
-                    m.emit(AppEvent::SendFailed { dir, oc_sid, error: e.to_string() });
+                    m.emit(AppEvent::SendFailed {
+                        dir,
+                        oc_sid,
+                        error: e.to_string(),
+                    });
                 }
             }
         });
@@ -337,7 +357,14 @@ impl Manager {
             let Ok((_, client)) = m.ensure_server(&dir).await else {
                 return;
             };
-            if client.abort(&oc_sid).await.is_ok() {
+            let provider =
+                OpenCodeProvider::new(client, dir.to_string_lossy().to_string());
+            let session = ProviderSession {
+                provider: crate::providers::ProviderKind::OpenCode,
+                id: oc_sid.clone(),
+                directory: dir.to_string_lossy().to_string(),
+            };
+            if provider.interrupt(&session).await.is_ok() {
                 m.emit(AppEvent::Aborted { dir, oc_sid });
             }
         });
@@ -438,7 +465,14 @@ impl Manager {
             let Ok((_, client)) = m.ensure_server(&dir_c).await else {
                 return;
             };
-            match client.fork(&oc_sid, at.as_deref()).await {
+            let provider =
+                OpenCodeProvider::new(client, dir_c.to_string_lossy().to_string());
+            let session = ProviderSession {
+                provider: crate::providers::ProviderKind::OpenCode,
+                id: oc_sid.clone(),
+                directory: dir_c.to_string_lossy().to_string(),
+            };
+            match provider.fork(&session, at.as_deref()).await {
                 Ok(new) => {
                     m.emit(AppEvent::OcForked {
                         dir: dir_c,
@@ -447,9 +481,9 @@ impl Manager {
                     });
                 }
                 Err(e) => {
-                    m.emit(AppEvent::OpResult {
-                        ok: false,
-                        message: format!("fork failed: {e}"),
+                    m.emit(AppEvent::OcForkFailed {
+                        source,
+                        error: format!("fork failed: {e}"),
                     });
                 }
             }
@@ -730,7 +764,7 @@ async fn spawn_server(cfg: &Config, dir: &Path) -> Result<(String, Option<tokio:
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
+        .kill_on_drop(false);
     // Spawn may fail if something else just took the port; fall through to
     // the health loop, which also accepts a server started by someone else.
     let mut child = cmd.spawn().ok();
@@ -799,19 +833,14 @@ async fn pump_once(
                 if data.is_empty() {
                     continue;
                 }
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
-                    if let Some(ev) = OcEvent::parse(v) {
-                        crate::tlog!(
-                            "SSE dir={} type={} {}",
-                            dir.display(),
-                            ev.typ,
-                            crate::logging::snippet(data, 800)
-                        );
-                        let _ = tx.send(AppEvent::OcEvent {
-                            dir: dir.to_path_buf(),
-                            ev,
-                        });
-                    }
+                crate::tlog!("SSE dir={} {}", dir.display(), crate::logging::snippet(data, 800));
+                // All OpenCode protocol knowledge stays inside the adapter.
+                for routed in crate::providers::opencode::convert_native(data) {
+                    let _ = tx.send(AppEvent::Harness {
+                        dir: dir.to_path_buf(),
+                        oc_sid: routed.session_id.unwrap_or_default(),
+                        event: routed.event,
+                    });
                 }
             }
         }

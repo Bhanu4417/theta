@@ -35,6 +35,9 @@ pub struct OcConfig {
     pub port_base: u16,
     /// Milliseconds to wait for a spawned server to become healthy.
     pub startup_timeout_ms: u64,
+    /// Leave servers running on exit so the next launch reuses them and
+    /// connects near-instantly instead of paying the cold-start cost again.
+    pub keep_alive: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +68,7 @@ impl Default for OcConfig {
             binary: "opencode".into(),
             port_base: 4310,
             startup_timeout_ms: 90_000,
+            keep_alive: true,
         }
     }
 }

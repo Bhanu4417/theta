@@ -1,11 +1,13 @@
 //! Application state: sessions, panes, overlays, event routing, key handling.
 
 use crate::config::Config;
-use crate::events::{AppEvent, OcEvent, ReqId};
+use crate::events::{AppEvent, ReqId};
 use crate::git::{GitCache, GitInfo};
+use crate::harness::transcript::{Message, PartKind, Role, ToolStatus};
+use crate::harness::{HarnessEvent, NotificationPolicy, Task, TaskStatus, TranscriptUpdate};
 use crate::keys::Action;
 use crate::manager::Manager;
-use crate::opencode::{GrepMatch, Message, ModelEntry, ModelRef, OcSession, PartKind, Role, ToolStatus};
+use crate::opencode::{GrepMatch, ModelEntry, ModelRef, OcSession};
 use crate::panes::{Dir, PaneGrid};
 use crate::persist;
 use crate::session::{Activity, InputState, PendingPermission, PendingQuestion, SessionState, SessStatus};
@@ -71,6 +73,7 @@ pub enum SlashKind {
     Quit,
     Refresh,
     Push,
+    Fork,
     Custom(String),
 }
 
@@ -104,6 +107,7 @@ fn builtin_slash_items() -> Vec<SlashItem> {
         SlashItem { name: "quit".into(), args: "".into(), desc: "Quit Theta".into(), kind: SlashKind::Quit },
         SlashItem { name: "refresh".into(), args: "".into(), desc: "Reload the newest build in place".into(), kind: SlashKind::Refresh },
         SlashItem { name: "push".into(), args: "[message]".into(), desc: "Commit and push this project (session only)".into(), kind: SlashKind::Push },
+        SlashItem { name: "fork".into(), args: "".into(), desc: "Fork this session into a new pane (instant, session only)".into(), kind: SlashKind::Fork },
     ]
 }
 
@@ -380,11 +384,15 @@ pub struct App {
     pub maximized: Option<u32>,
     pub overlay: Overlay,
     pub next_session: u32,
+    /// Monotonic id source for harness tasks.
+    pub next_task: u64,
     pub manager: Manager,
     pub initial_dir: PathBuf,
     pub flash: Option<(String, Instant)>,
     /// Guards against a terminal emitting a newline twice per keypress.
     pub last_newline: Option<Instant>,
+    /// Harness-level notification debounce/grouping.
+    pub notifications: NotificationPolicy,
     pub tick: u64,
     /// Raw frame counter (fast); `tick` advances once per 3 frames.
     pub anim: u64,
@@ -431,8 +439,9 @@ pub struct App {
     pub known_dirs: BTreeSet<PathBuf>,
     /// (new theta session id, prompt) — sent once the forked pane connects.
     pub pending_fork: Vec<(u32, String)>,
-    /// (source theta session id, prompt) awaiting the fork to complete.
-    pub pending_fork_src: Option<(u32, String)>,
+    /// (source theta session id, placeholder theta session id) whose panes
+    /// were created instantly and are waiting for the provider fork to land.
+    pub fork_wait: Vec<(u32, u32)>,
     /// Models offered by the agy CLI (name, description).
     pub agy_models: Vec<(String, String)>,
     /// Agy model picker selection state.
@@ -460,10 +469,12 @@ impl App {
             maximized: None,
             overlay: Overlay::None,
             next_session: 1,
+            next_task: 1,
             manager,
             initial_dir,
             flash: None,
             last_newline: None,
+            notifications: NotificationPolicy::new(8000),
             tick: 0,
             anim: 0,
             dirty: true,
@@ -522,7 +533,7 @@ impl App {
             session_cache: HashMap::new(),
             known_dirs: BTreeSet::new(),
             pending_fork: Vec::new(),
-            pending_fork_src: None,
+            fork_wait: Vec::new(),
             agy_models: Vec::new(),
             agy_ui: crate::app::LayoutPickerState::default(),
             keymap_ui: KeymapUi::default(),
@@ -579,6 +590,18 @@ impl App {
         self.dirty = true;
     }
 
+    /// Open a harness task for a freshly submitted prompt. It is finished when
+    /// the harness sees the session idle/error/interrupted.
+    fn start_task(&mut self, id: u32, title: &str) {
+        let task_id = self.next_task;
+        self.next_task += 1;
+        if let Some(s) = self.session_mut(id) {
+            let mut t = Task::new(task_id, title, s.dir.clone(), s.session_id);
+            t.start();
+            s.task = Some(t);
+        }
+    }
+
     // -- session lifecycle ------------------------------------------------------
 
     pub fn create_session(&mut self, name: &str, dir: PathBuf, model: Option<ModelRef>) {
@@ -623,6 +646,12 @@ impl App {
         if let Some(s) = self.session(id) {
             if let (Some(oc_sid), true) = (s.oc_sid.clone(), s.status.is_busy()) {
                 self.manager.abort_session(s.dir.clone(), oc_sid);
+            }
+        }
+        // Cancel the harness task so it does not linger as running.
+        if let Some(s) = self.session_mut(id) {
+            if let Some(t) = s.task.as_mut() {
+                t.finish(TaskStatus::Cancelled);
             }
         }
         self.sessions.retain(|s| s.id != id);
@@ -769,6 +798,7 @@ impl App {
                 s.agy_model.clone(),
             )
         };
+        self.start_task(id, &text);
         if let Some(agy_model) = agy {
             self.spawn_agy_run(id, dir, text, agy_model);
         } else {
@@ -797,6 +827,7 @@ impl App {
                 s.agy_model.clone(),
             )
         };
+        self.start_task(id, text);
         if let Some(agy_model) = agy {
             // Gemini via the agy CLI — not the OpenCode provider.
             self.spawn_agy_run(id, dir, text.to_string(), agy_model);
@@ -840,7 +871,21 @@ impl App {
                 self.drain_queue(id);
             }
         } else {
-            self.fork_with_prompt(id, text);
+            // Respect provider capabilities: if native forking isn't offered,
+            // fall back to queueing rather than silently doing the wrong thing.
+            let can_fork = self
+                .session(id)
+                .map(|s| s.provider.capabilities().native_fork)
+                .unwrap_or(false);
+            if can_fork {
+                self.fork_with_prompt(id, text);
+            } else {
+                if let Some(s) = self.session_mut(id) {
+                    s.queue.push(text);
+                    s.dirty = true;
+                }
+                self.flash("provider can't fork — queued instead");
+            }
         }
         self.dirty = true;
     }
@@ -848,43 +893,121 @@ impl App {
     /// Fork `id` into a fresh pane sharing its history, then send `text`
     /// there once the fork connects. History is never modified.
     fn fork_with_prompt(&mut self, id: u32, text: String) {
-        let (dir, oc_sid, at) = {
-            let Some(s) = self.session(id) else { return };
-            match &s.oc_sid {
-                Some(oc) => (s.dir.clone(), oc.clone(), Self::fork_point(s)),
-                None => {
-                    // Not connected yet: queue on the current session instead.
-                    if let Some(sm) = self.session_mut(id) {
-                        sm.queue.push(text);
-                        sm.dirty = true;
-                    }
-                    self.flash("session still connecting — queued instead");
-                    return;
-                }
-            }
-        };
-        self.pending_fork_src = Some((id, text));
-        self.manager.fork_session(dir, oc_sid, id, at);
-        self.flash("forking workspace — prompt goes to the new one…");
+        self.begin_fork(id, Some(text));
     }
 
-    /// The message to fork at: the last completed assistant message. This
-    /// excludes any in-progress turn *and* the pending user prompt, so the new
-    /// workspace starts from a clean, settled state and the source session is
-    /// left untouched.
+    /// Fork the focused session at its last message with output. No prompt is
+    /// sent; the new pane simply opens with the history.
+    pub fn fork_active(&mut self) {
+        let id = self.focus;
+        self.begin_fork(id, None);
+    }
+
+    /// Create the forked pane immediately (seeded with the source transcript so
+    /// it renders instantly), then ask the provider to fork in the background.
+    fn begin_fork(&mut self, source: u32, text: Option<String>) {
+        let can_fork = self
+            .session(source)
+            .map(|s| s.provider.capabilities().native_fork)
+            .unwrap_or(false);
+        if !can_fork {
+            self.flash("provider can't fork this session");
+            return;
+        }
+        if self.fork_wait.iter().any(|(s, _)| *s == source) {
+            self.flash("a fork is already in progress…");
+            return;
+        }
+        let (dir, oc_sid, at, seed, model, agent, agy, base_name) = {
+            let Some(s) = self.session(source) else {
+                return;
+            };
+            let Some(oc) = s.oc_sid.clone() else {
+                self.flash("session is still connecting…");
+                return;
+            };
+            (
+                s.dir.clone(),
+                oc,
+                Self::fork_point(s),
+                s.messages.clone(),
+                s.model.clone(),
+                s.agent.clone(),
+                s.agy_model.clone(),
+                s.name.clone(),
+            )
+        };
+
+        let id = self.next_session;
+        self.next_session += 1;
+        let name = self.next_fork_name(&base_name);
+        let mut sess = SessionState::new(id, name.clone(), dir.clone());
+        sess.model = model;
+        sess.agent = agent;
+        sess.agy_model = agy;
+        // Seed with the source transcript so the pane is readable immediately;
+        // the provider's forked history replaces it once it arrives.
+        if !seed.is_empty() {
+            sess.messages = seed;
+            sess.recompute_metrics();
+            sess.stick_bottom = true;
+        }
+        sess.status = SessStatus::Connecting;
+        sess.dirty = true;
+        self.sessions.push(sess);
+        let area = self.pane_area();
+        self.grid.insert_session(id, area.width, area.height);
+        self.focus = id;
+        self.maximized = None;
+        if let Some(t) = text {
+            if !t.trim().is_empty() {
+                self.pending_fork.push((id, t));
+            }
+        }
+        self.fork_wait.push((source, id));
+        self.manager.fork_session(dir, oc_sid, source, at);
+        self.flash("forking…");
+        self.dirty = true;
+        self.save_workspace();
+    }
+
+    /// `base(fork#N)` numbering across all existing forks.
+    fn next_fork_name(&self, base: &str) -> String {
+        let base = match base.find("(fork#") {
+            Some(i) => base[..i].trim_end().to_string(),
+            None => base.to_string(),
+        };
+        let prefix = format!("{base}(fork#");
+        let mut max_fork = 0usize;
+        for s in &self.sessions {
+            if let Some(rest) = s.name.strip_prefix(&prefix) {
+                if let Some(n) = rest.strip_suffix(')').and_then(|n| n.parse::<usize>().ok()) {
+                    max_fork = max_fork.max(n);
+                }
+            }
+        }
+        format!("{base}(fork#{})", max_fork + 1)
+    }
+
+    /// The message to fork at: the last message with real output (assistant
+    /// text, reasoning, or tool output), so the fork carries the latest answer
+    /// and its output — including a resolved agent question. Turns that have
+    /// produced nothing yet are skipped.
     fn fork_point(s: &SessionState) -> Option<String> {
         for m in s.messages.iter().rev() {
-            if !m.id.starts_with("msg") || m.role != Role::Assistant {
+            if !m.id.starts_with("msg") {
                 continue;
             }
-            let running = m.parts.iter().any(|p| {
-                matches!(
-                    &p.kind,
-                    PartKind::Tool(t)
-                        if matches!(t.status, ToolStatus::Pending | ToolStatus::Running)
-                )
+            let has_output = m.parts.iter().any(|p| match &p.kind {
+                PartKind::Text { text, synthetic } => !synthetic && !text.trim().is_empty(),
+                PartKind::Reasoning { text, .. } => !text.trim().is_empty(),
+                PartKind::Tool(t) => {
+                    t.output.is_some()
+                        || matches!(t.status, ToolStatus::Completed | ToolStatus::Error)
+                }
+                _ => false,
             });
-            if m.completed.is_some() && !running {
+            if has_output {
                 return Some(m.id.clone());
             }
         }
@@ -933,7 +1056,14 @@ impl App {
                 session: id,
                 text: "Git add".into(),
             });
+            let started = Instant::now();
             let result = crate::git::commit_and_push(&dir, &statement).await;
+            // Keep the push animation on screen for a beat even when the
+            // operation is near-instant, so it doesn't flash by unseen.
+            let elapsed = started.elapsed();
+            if elapsed < Duration::from_millis(1100) {
+                tokio::time::sleep(Duration::from_millis(1100) - elapsed).await;
+            }
             let _ = tx.send(AppEvent::PushDone {
                 session: id,
                 ok: result.is_ok(),
@@ -1393,6 +1523,7 @@ impl App {
                     .as_ref()
                     .map(|m| (m.provider_id.clone(), m.model_id.clone())),
                 agent: s.agent.clone(),
+                provider: Some(s.provider.id().to_string()),
             })
             .collect();
         let idx = |sid: u32| self.sessions.iter().position(|s| s.id == sid).unwrap_or(0);
@@ -1427,10 +1558,28 @@ impl App {
         self.last_save = Instant::now();
         let snap = self.snapshot();
         let _ = persist::save(&snap);
+        // Display-only transcript cache so the next launch renders instantly.
+        let mut cache: HashMap<String, Vec<Message>> = HashMap::new();
+        for s in &self.sessions {
+            if let Some(key) = Self::transcript_key(s) {
+                if !s.messages.is_empty() {
+                    let start = s.messages.len().saturating_sub(persist::TRANSCRIPT_CACHE_LIMIT);
+                    cache.insert(key, s.messages[start..].to_vec());
+                }
+            }
+        }
+        let _ = persist::save_transcripts(&cache);
+    }
+
+    fn transcript_key(s: &SessionState) -> Option<String> {
+        s.oc_sid
+            .as_ref()
+            .map(|id| format!("{}|{}", s.dir.display(), id))
     }
 
     pub fn restore_workspace(&mut self) {
         let Some(ws) = persist::load() else { return };
+        let transcript_cache = persist::load_transcripts();
         // Restore the directory set even when no panes are open, and warm the
         // session cache for every one so lists span projects.
         for d in &ws.known_dirs {
@@ -1455,6 +1604,11 @@ impl App {
             self.remember_dir(&dir);
             self.preload_sessions(dir.clone());
             let mut sess = SessionState::new(id, saved.name.clone(), dir.clone());
+            sess.provider = saved
+                .provider
+                .as_deref()
+                .and_then(crate::providers::ProviderKind::from_id)
+                .unwrap_or_default();
             sess.oc_sid = saved.oc_sid.clone();
             sess.agent = saved.agent.clone();
             sess.model = saved
@@ -1465,6 +1619,17 @@ impl App {
                     model_id: m.clone(),
                 });
             sess.status = SessStatus::Connecting;
+            // Hydrate from the display cache so the pane is readable instantly;
+            // authoritative history replaces it when it arrives.
+            if let Some(oc) = &sess.oc_sid {
+                let key = format!("{}|{}", dir.display(), oc);
+                if let Some(msgs) = transcript_cache.get(&key) {
+                    sess.messages = msgs.clone();
+                    sess.recompute_metrics();
+                    sess.stick_bottom = true;
+                    sess.dirty = true;
+                }
+            }
             let model = sess.model.clone();
             self.sessions.push(sess);
             new_ids.push(id);
@@ -1986,6 +2151,7 @@ impl App {
             "agymodel" => self.open_agy_model_picker(),
             "refresh" => self.request_refresh(),
             "push" => self.start_push(sid, args),
+            "fork" => self.fork_active(),
             "theme" => self.open_theme_picker(),
             "help" => {
                 self.open_keymap();
@@ -3738,10 +3904,18 @@ impl App {
                 self.flash(error);
             }
             AppEvent::ServerDied { dir } => {
-                for s in self.sessions.iter_mut() {
-                    if s.dir == dir && s.oc_sid.is_some() {
-                        s.status = SessStatus::Error("opencode server exited".into());
-                    }
+                let targets: Vec<String> = self
+                    .sessions
+                    .iter()
+                    .filter(|s| s.dir == dir && s.oc_sid.is_some())
+                    .filter_map(|s| s.oc_sid.clone())
+                    .collect();
+                for oc in targets {
+                    self.handle_harness_event(
+                        dir.clone(),
+                        oc,
+                        HarnessEvent::ProviderDisconnected,
+                    );
                 }
             }
             AppEvent::OcCreated { req, session } => {
@@ -3786,7 +3960,9 @@ impl App {
                 }
                 self.flash(error);
             }
-            AppEvent::OcEvent { dir, ev } => self.route_oc_event(dir, ev),
+            AppEvent::Harness { dir, oc_sid, event } => {
+                self.handle_harness_event(dir, oc_sid, event)
+            }
             AppEvent::HistoryLoaded { dir, oc_sid, msgs } => {
                 if let Some(s) = self
                     .sessions
@@ -3804,15 +3980,8 @@ impl App {
                 self.flash(format!("history failed: {error}"));
             }
             AppEvent::SendFailed { dir, oc_sid, error } => {
-                if let Some(s) = self
-                    .sessions
-                    .iter_mut()
-                    .find(|s| s.dir == dir && s.oc_sid.as_deref() == Some(oc_sid.as_str()))
-                {
-                    s.last_error = Some(error.clone());
-                    s.status = SessStatus::Error(error.clone());
-                }
-                self.flash(error);
+                self.flash(error.clone());
+                self.handle_harness_event(dir, oc_sid, HarnessEvent::ProviderError(error));
             }
             AppEvent::Aborted { .. } => {}
             AppEvent::ProvidersListed {
@@ -3880,8 +4049,9 @@ impl App {
                         s.dir == dir && s.oc_sid.as_deref() == Some(q.session_id.as_str())
                     }) {
                         if self.sessions[idx].pending_question.is_none() {
+                            let prompt = crate::providers::opencode::question_prompt(&q);
                             self.sessions[idx].pending_question =
-                                Some(PendingQuestion::new(q.id, q.questions));
+                                Some(PendingQuestion::new(prompt.id, prompt.questions));
                             self.sessions[idx].status = SessStatus::Question;
                             self.sessions[idx].dirty = true;
                         }
@@ -3930,18 +4100,18 @@ impl App {
                 };
                 let header = format!("▌ agy · {}\n\n", model);
                 if let Some(s) = self.session_mut(id) {
-                    let msg = crate::opencode::Message {
+                    let msg = crate::harness::transcript::Message {
                         id: format!("agy-{}", s.optimistic_seq()),
-                        role: crate::opencode::Role::Assistant,
+                        role: crate::harness::transcript::Role::Assistant,
                         error: if ok { None } else { Some("agy failed".into()) },
                         completed: Some(1),
                         created: None,
                         cost: None,
                         tokens: None,
-                        parts: vec![crate::opencode::Part {
+                        parts: vec![crate::harness::transcript::Part {
                             id: format!("agy-{}-out", s.optimistic_seq()),
                             message_id: format!("agy-{}", s.optimistic_seq()),
-                            kind: crate::opencode::PartKind::Text {
+                            kind: crate::harness::transcript::PartKind::Text {
                                 text: format!("{header}{}", if ok { text.clone() } else { String::new() }),
                                 synthetic: false,
                             },
@@ -3962,69 +4132,53 @@ impl App {
                 let _ = &mut text;
             }
             AppEvent::OcForked { dir, session, source } => {
-                // New pane sharing the forked history; inherits the source's
-                // model/agent and carries the pending prompt.
-                let id = self.next_session;
-                self.next_session += 1;
+                // The pane was already created instantly in `begin_fork`; just
+                // wire the provider session id and connect to load history.
+                let Some(pos) = self.fork_wait.iter().position(|(s, _)| *s == source) else {
+                    return;
+                };
+                let new_id = self.fork_wait.remove(pos).1;
                 let dir_c = dir.canonicalize().unwrap_or_else(|_| dir.clone());
                 self.remember_dir(&dir_c);
-                self.preload_sessions(dir_c.clone());
-                let base = self
-                    .sessions
-                    .iter()
-                    .find(|s| s.id == source)
-                    .map(|s| s.name.clone())
-                    .unwrap_or_else(|| "session".into());
-                // Name forks `base(fork#N)`, numbering across all forks.
-                let base = match base.find("(fork#") {
-                    Some(i) => base[..i].trim_end().to_string(),
-                    None => base,
-                };
-                let prefix = format!("{base}(fork#");
-                let mut max_fork = 0usize;
-                for s in &self.sessions {
-                    if let Some(rest) = s.name.strip_prefix(&prefix) {
-                        if let Some(n) = rest
-                            .strip_suffix(')')
-                            .and_then(|n| n.parse::<usize>().ok())
-                        {
-                            max_fork = max_fork.max(n);
+                let (name, target_dir) = {
+                    let Some(s) = self.session_mut(new_id) else {
+                        return;
+                    };
+                    s.oc_sid = Some(session.id.clone());
+                    s.status = SessStatus::Connecting;
+                    let server_dir = PathBuf::from(&session.directory);
+                    if !session.directory.is_empty() && server_dir != s.dir {
+                        if let Ok(c) = server_dir.canonicalize() {
+                            s.dir = c;
                         }
                     }
-                }
-                let name = format!("{base}(fork#{})", max_fork + 1);
-                let (model, agent, agy_model) = self
-                    .sessions
-                    .iter()
-                    .find(|s| s.id == source)
-                    .map(|s| (s.model.clone(), s.agent.clone(), s.agy_model.clone()))
-                    .unwrap_or((None, None, None));
-                let mut sess = SessionState::new(id, name.clone(), dir_c.clone());
-                sess.oc_sid = Some(session.id.clone());
-                sess.model = model;
-                sess.agent = agent;
-                sess.agy_model = agy_model;
-                sess.status = SessStatus::Connecting;
-                if let Some((_, text)) = self.pending_fork_src.take() {
-                    self.pending_fork.push((id, text));
-                }
-                self.sessions.push(sess);
-                let area = self.pane_area();
-                self.grid.insert_session(id, area.width, area.height);
-                self.focus = id;
-                self.maximized = None;
+                    s.dirty = true;
+                    (s.name.clone(), s.dir.clone())
+                };
                 let req = self.manager.next_req();
-                self.pending_create.insert(id, req);
+                self.pending_create.insert(new_id, req);
                 self.manager.connect_session(
                     req,
-                    dir_c,
+                    target_dir,
                     name,
                     Some(session.id.clone()),
                     None,
                     self.cfg.behavior.history_limit,
                 );
+                self.focus = new_id;
                 self.dirty = true;
                 self.save_workspace();
+            }
+            AppEvent::OcForkFailed { source, error } => {
+                if let Some(pos) = self.fork_wait.iter().position(|(s, _)| *s == source) {
+                    let (_, new_id) = self.fork_wait.remove(pos);
+                    if let Some(s) = self.session_mut(new_id) {
+                        s.last_error = Some(error.clone());
+                        s.status = SessStatus::Error(error.clone());
+                        s.dirty = true;
+                    }
+                }
+                self.flash(error);
             }
             AppEvent::SessionsPreloaded { dir, sessions } => {
                 self.session_cache.insert(dir.clone(), sessions.clone());
@@ -4150,51 +4304,49 @@ impl App {
         }
     }
 
-    pub fn route_oc_event(&mut self, dir: PathBuf, ev: OcEvent) {
-        let Some(sid) = ev.session_id() else { return };
-        let Some(sess_idx) = self
-            .sessions
-            .iter()
-            .position(|s| s.oc_sid.as_deref() == Some(sid.as_str()) && s.dir == dir)
-        else {
+    /// Handle a provider-neutral event. Session lifecycle, status,
+    /// permissions and questions live here; the transcript stays on the raw
+    /// OpenCode event path until the model types are moved into the harness.
+    fn handle_harness_event(&mut self, dir: PathBuf, oc_sid: String, event: HarnessEvent) {
+        // Directory-scoped events that don't belong to a single session.
+        match event {
+            HarnessEvent::FilesChanged => {
+                self.explorer.dirty = true;
+                self.git_cache.invalidate(&dir);
+                self.dirty = true;
+                return;
+            }
+            HarnessEvent::BranchChanged => {
+                self.git_cache.invalidate(&dir);
+                self.dirty = true;
+                return;
+            }
+            _ => {}
+        }
+        if oc_sid.is_empty() {
+            return;
+        }
+        let Some(idx) = Self::route_session(&self.sessions, &dir, &oc_sid) else {
             return;
         };
-        let sess_id = self.sessions[sess_idx].id;
+        let sid = self.sessions[idx].id;
 
-        match ev.typ.as_str() {
-            "message.updated" => {
-                if let Some(info) = ev.properties.get("info") {
-                    if let Some(msg) = crate::opencode::parse_message(info) {
-                        let aborted = msg
-                            .error
-                            .as_ref()
-                            .map(|e| e.contains("Aborted"))
-                            .unwrap_or(false);
-                        let s = &mut self.sessions[sess_idx];
+        match event {
+            HarnessEvent::FilesChanged | HarnessEvent::BranchChanged => {}
+            HarnessEvent::Transcript(update) => {
+                let s = &mut self.sessions[idx];
+                match update {
+                    TranscriptUpdate::MessageMeta(msg) => {
                         s.upsert_message_meta(&msg);
                         if msg.role == Role::User {
-                            // message.updated carries no parts, so match by
-                            // FIFO against optimistic sends.
+                            // message.updated carries no parts; adopt by FIFO
+                            // against optimistic sends.
                             s.adopt_oldest(&msg);
                         }
-                        if let Some(err) = msg.error {
-                            if aborted {
-                                // User-initiated interrupt: not an error state.
-                                s.status = SessStatus::Idle;
-                            } else {
-                                s.last_error = Some(err.clone());
-                                s.status = SessStatus::Error(err);
-                            }
-                        }
-                        s.dirty = true;
                     }
-                }
-            }
-            "message.part.updated" => {
-                if let Some(pv) = ev.properties.get("part") {
-                    if let Some(part) = crate::opencode::parse_part(pv) {
+                    TranscriptUpdate::Part(part) => {
                         let msg_id = part.message_id.clone();
-                        let existing_role = self.sessions[sess_idx]
+                        let existing_role = s
                             .messages
                             .iter()
                             .find(|m| m.id == msg_id)
@@ -4209,168 +4361,84 @@ impl App {
                             tokens: None,
                             parts: vec![part.clone()],
                         };
-                        let s = &mut self.sessions[sess_idx];
-                        s.upsert_part(&meta, part.clone());
-                        match &part.kind {
-                            PartKind::Reasoning { running: true, .. } => {
-                                if s.status != SessStatus::Permission {
-                                    s.status = SessStatus::Thinking;
-                                }
-                            }
-                            PartKind::Tool(t)
-                                if matches!(
-                                    t.status,
-                                    ToolStatus::Pending | ToolStatus::Running
-                                ) =>
-                            {
-                                if s.status != SessStatus::Permission {
-                                    s.status = SessStatus::Working;
-                                }
-                            }
-                            _ => {}
-                        }
-                        s.dirty = true;
+                        s.upsert_part(&meta, part);
+                    }
+                    TranscriptUpdate::PartRemoved {
+                        message_id,
+                        part_id,
+                    } => {
+                        s.remove_part(&message_id, &part_id);
                     }
                 }
-            }
-            "message.part.removed" => {
-                let msg_id = ev
-                    .properties
-                    .get("messageID")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let part_id = ev
-                    .properties
-                    .get("partID")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                self.sessions[sess_idx].remove_part(&msg_id, &part_id);
-            }
-            "session.error" => {
-                let err = ev.properties.get("error");
-                let name = err
-                    .and_then(|e| e.get("name"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("error")
-                    .to_string();
-                if name.contains("Aborted") {
-                    // User-initiated interrupt.
-                    let s = &mut self.sessions[sess_idx];
-                    s.status = SessStatus::Idle;
-                    s.dirty = true;
-                    return;
-                }
-                let msg = err
-                    .and_then(|e| e.get("message"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .or_else(|| {
-                        err.and_then(|e| e.get("data"))
-                            .and_then(|d| d.get("message"))
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string())
-                    });
-                let text = match msg {
-                    Some(m) if !m.is_empty() => format!("{name}: {m}"),
-                    _ => name,
-                };
-                let s = &mut self.sessions[sess_idx];
-                s.last_error = Some(text.clone());
-                s.status = SessStatus::Error(text);
                 s.dirty = true;
             }
-            "session.idle" => {
-                let has_queue = !self.sessions[sess_idx].queue.is_empty();
-                let sid = self.sessions[sess_idx].id;
+            HarnessEvent::SessionIdle => {
+                let has_queue = !self.sessions[idx].queue.is_empty();
                 {
-                    let s = &mut self.sessions[sess_idx];
-                    if !matches!(s.status, SessStatus::Error(_) | SessStatus::Permission) {
+                    let s = &mut self.sessions[idx];
+                    if !matches!(
+                        s.status,
+                        SessStatus::Error(_) | SessStatus::Permission | SessStatus::Question
+                    ) {
                         s.status = SessStatus::Idle;
                     }
                     s.interrupt_armed = None;
                     s.dirty = true;
                 }
+                self.finish_task(idx, TaskStatus::Completed);
                 if has_queue {
                     self.drain_queue(sid);
                 }
             }
-            "session.status" => {
-                if let Some(st) = ev.properties.get("status") {
-                    let typ = st.get("type").and_then(|v| v.as_str()).unwrap_or("idle");
-                    let s = &mut self.sessions[sess_idx];
-                    match typ {
-                        "busy" => {
-                            if s.status != SessStatus::Permission {
-                                s.status = SessStatus::Working;
-                            }
-                        }
-                        "retry" => {
-                            let msg = st
-                                .get("message")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("retrying")
-                                .to_string();
-                            s.status = SessStatus::Retrying(msg);
-                        }
-                        _ => {
-                            if !matches!(s.status, SessStatus::Error(_) | SessStatus::Permission) {
-                                s.status = SessStatus::Idle;
-                            }
-                        }
-                    }
-                    s.dirty = true;
+            HarnessEvent::SessionWorking => {
+                let s = &mut self.sessions[idx];
+                if !matches!(s.status, SessStatus::Permission | SessStatus::Question) {
+                    s.status = SessStatus::Working;
                 }
+                s.dirty = true;
             }
-            "permission.asked" => {
-                let pid = ev
-                    .properties
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let kind = ev
-                    .properties
-                    .get("permission")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("permission")
-                    .to_string();
-                let mut details: Vec<String> = Vec::new();
-                if let Some(meta) = ev.properties.get("metadata") {
-                    for key in ["command", "filePath", "file", "path", "url", "description"] {
-                        if let Some(v) = meta.get(key).and_then(|v| v.as_str()) {
-                            details.push(v.to_string());
-                            break;
-                        }
-                    }
+            HarnessEvent::SessionThinking => {
+                let s = &mut self.sessions[idx];
+                if !matches!(s.status, SessStatus::Permission | SessStatus::Question) {
+                    s.status = SessStatus::Thinking;
                 }
-                if details.is_empty() {
-                    if let Some(pats) = ev.properties.get("patterns").and_then(|p| p.as_array()) {
-                        for p in pats.iter().take(2) {
-                            if let Some(ps) = p.as_str() {
-                                details.push(ps.to_string());
-                            }
-                        }
-                    }
+                s.dirty = true;
+            }
+            HarnessEvent::SessionRetrying(msg) => {
+                self.sessions[idx].status = SessStatus::Retrying(msg);
+                self.sessions[idx].dirty = true;
+            }
+            HarnessEvent::SessionError(msg) => {
+                let s = &mut self.sessions[idx];
+                s.last_error = Some(msg.clone());
+                s.status = SessStatus::Error(msg);
+                s.dirty = true;
+                self.finish_task(idx, TaskStatus::Failed);
+            }
+            HarnessEvent::SessionInterrupted => {
+                let s = &mut self.sessions[idx];
+                s.status = SessStatus::Idle;
+                s.interrupt_armed = None;
+                s.dirty = true;
+                self.finish_task(idx, TaskStatus::Interrupted);
+            }
+            HarnessEvent::PermissionAsked { id, kind, detail } => {
+                if let Some(t) = self.sessions[idx].task.as_mut() {
+                    t.wait();
                 }
-                let detail = details.join(" ");
                 let auto = self.cfg.behavior.auto_approve_permissions;
-                let (oc_sid, dir2) = {
-                    let s = &self.sessions[sess_idx];
-                    (s.oc_sid.clone(), s.dir.clone())
-                };
+                let dir = self.sessions[idx].dir.clone();
+                let oc = self.sessions[idx].oc_sid.clone();
                 if auto {
-                    if let Some(oc_sid) = oc_sid {
-                        self.manager
-                            .reply_permission(dir2, oc_sid, pid.clone(), "once".into());
+                    if let Some(oc) = oc {
+                        self.manager.reply_permission(dir, oc, id.clone(), "once".into());
                     }
                 }
-                let s = &mut self.sessions[sess_idx];
+                let s = &mut self.sessions[idx];
                 s.pending_perm = if auto {
                     None
                 } else {
-                    Some(PendingPermission { id: pid, kind, detail })
+                    Some(PendingPermission { id, kind, detail })
                 };
                 s.status = if auto {
                     SessStatus::Working
@@ -4379,30 +4447,29 @@ impl App {
                 };
                 s.dirty = true;
             }
-            "permission.replied" => {
-                let s = &mut self.sessions[sess_idx];
+            HarnessEvent::PermissionReplied => {
+                let s = &mut self.sessions[idx];
                 if s.pending_perm.is_some() {
                     s.pending_perm = None;
                     s.status = SessStatus::Working;
                     s.dirty = true;
                 }
             }
-            "question.asked" | "question.v2.asked" => {
-                if let Some(q) = crate::opencode::parse_question_request(&ev.properties) {
-                    let sid = self.sessions[sess_idx].id;
-                    self.sessions[sess_idx].pending_question =
-                        Some(PendingQuestion::new(q.id, q.questions));
-                    self.sessions[sess_idx].status = SessStatus::Question;
-                    self.sessions[sess_idx].dirty = true;
-                    if self.overlay == Overlay::None || self.overlay == Overlay::Question {
-                        self.focus = sid;
-                        self.overlay = Overlay::Question;
-                    }
+            HarnessEvent::QuestionAsked(prompt) => {
+                if let Some(t) = self.sessions[idx].task.as_mut() {
+                    t.wait();
+                }
+                self.sessions[idx].pending_question =
+                    Some(PendingQuestion::new(prompt.id, prompt.questions));
+                self.sessions[idx].status = SessStatus::Question;
+                self.sessions[idx].dirty = true;
+                if self.overlay == Overlay::None || self.overlay == Overlay::Question {
+                    self.focus = sid;
+                    self.overlay = Overlay::Question;
                 }
             }
-            "question.replied" | "question.rejected" | "question.v2.replied"
-            | "question.v2.rejected" => {
-                let s = &mut self.sessions[sess_idx];
+            HarnessEvent::QuestionReplied => {
+                let s = &mut self.sessions[idx];
                 s.pending_question = None;
                 if s.status == SessStatus::Question {
                     s.status = SessStatus::Working;
@@ -4410,16 +4477,63 @@ impl App {
                 s.dirty = true;
                 self.open_pending_question();
             }
-            "file.watcher.updated" | "file.edited" => {
-                self.explorer.dirty = true;
-                self.git_cache.invalidate(&dir);
+            HarnessEvent::AssistantFinished => {
+                // Notify (debounced) when the finishing session is unfocused.
+                if self.focus != sid {
+                    if self.notifications.should_notify() {
+                        let name = self.sessions[idx].name.clone();
+                        self.flash(format!("{name}: agent finished"));
+                    } else {
+                        crate::tlog!(
+                            "notification debounced ({} grouped)",
+                            self.notifications.suppressed()
+                        );
+                    }
+                }
             }
-            "vcs.branch.updated" => {
-                self.git_cache.invalidate(&dir);
+            HarnessEvent::ProviderError(msg) => {
+                let s = &mut self.sessions[idx];
+                s.last_error = Some(msg.clone());
+                s.status = SessStatus::Error(msg);
+                s.dirty = true;
             }
-            _ => {}
+            HarnessEvent::ProviderDisconnected => {
+                let s = &mut self.sessions[idx];
+                s.status = SessStatus::Error("provider disconnected".into());
+                s.dirty = true;
+            }
+            // Activity is derived from the transcript cache; unknown/provider
+            // specific events are intentionally ignored here.
+            HarnessEvent::ToolStarted { .. }
+            | HarnessEvent::ToolFinished { .. }
+            | HarnessEvent::ProviderSpecific { .. } => {}
         }
-        let _ = sess_id;
+    }
+
+    /// Find the Theta session a provider event belongs to, keyed by both the
+    /// working directory and the provider session id, so events never leak
+    /// between projects or panes.
+    fn route_session(sessions: &[SessionState], dir: &Path, oc_sid: &str) -> Option<usize> {
+        sessions
+            .iter()
+            .position(|s| s.dir == dir && s.oc_sid.as_deref() == Some(oc_sid))
+    }
+
+    fn finish_task(&mut self, idx: usize, status: TaskStatus) {
+        if let Some(t) = self.sessions[idx].task.as_mut() {
+            if t.finish(status) {
+                crate::tlog!(
+                    "TASK {} '{}' provider={} workspace={} session={} created={:?} -> {:?}",
+                    t.id,
+                    t.title,
+                    t.provider.label(),
+                    t.workspace.display(),
+                    t.session.get(),
+                    t.created,
+                    status
+                );
+            }
+        }
     }
 
     pub async fn on_tick(&mut self) {
@@ -4495,8 +4609,13 @@ impl App {
             self.save_workspace();
         }
 
-        // Keep animating while any workspace is active (so the slider runs).
-        if self.active_count() > 0 {
+        // Keep animating while any workspace is active (slider) or a push is
+        // in flight (its progress bar needs continuous redraws).
+        let pushing = self
+            .sessions
+            .iter()
+            .any(|s| s.activity.as_ref().map(|a| !a.done).unwrap_or(false));
+        if self.active_count() > 0 || pushing {
             self.dirty = true;
         }
     }
@@ -4566,5 +4685,112 @@ fn walk_tree(dir: &Path, depth: usize, expanded: &std::collections::HashSet<Stri
         if e.is_dir && expanded.contains(&e.path) {
             walk_tree(Path::new(&e.path), depth + 1, expanded, items);
         }
+    }
+}
+
+#[cfg(test)]
+mod harness_tests {
+    use super::*;
+    use crate::harness::transcript::{Message, Role};
+
+    fn msg(id: &str, role: Role, completed: Option<i64>) -> Message {
+        Message {
+            id: id.into(),
+            role,
+            error: None,
+            completed,
+            created: None,
+            cost: None,
+            tokens: None,
+            parts: Vec::new(),
+        }
+    }
+
+    fn text_msg(id: &str, role: Role, completed: Option<i64>, body: &str) -> Message {
+        let mut m = msg(id, role, completed);
+        m.parts.push(crate::harness::transcript::Part {
+            id: format!("{id}-p"),
+            message_id: id.into(),
+            kind: crate::harness::transcript::PartKind::Text {
+                text: body.into(),
+                synthetic: false,
+            },
+        });
+        m
+    }
+
+    #[test]
+    fn fork_point_uses_last_message_with_output() {
+        let mut s = SessionState::new(1, "x".into(), std::path::PathBuf::from("/tmp"));
+        s.messages.push(text_msg("msg_u1", Role::User, None, "hi"));
+        s.messages.push(text_msg("msg_a1", Role::Assistant, Some(10), "the answer"));
+        // trailing in-progress turn that has produced nothing yet
+        s.messages.push(msg("msg_a2", Role::Assistant, None));
+        assert_eq!(App::fork_point(&s).as_deref(), Some("msg_a1"));
+    }
+
+    #[test]
+    fn fork_point_includes_latest_output_even_mid_turn() {
+        // A question answer (tool output) lives in the last assistant message,
+        // which may still be streaming; the fork must include it.
+        let mut s = SessionState::new(1, "x".into(), std::path::PathBuf::from("/tmp"));
+        s.messages.push(text_msg("msg_u1", Role::User, None, "ask me"));
+        let mut tool_msg = msg("msg_a1", Role::Assistant, None);
+        tool_msg
+            .parts
+            .push(crate::harness::transcript::Part {
+                id: "p-tool".into(),
+                message_id: "msg_a1".into(),
+                kind: crate::harness::transcript::PartKind::Tool(
+                    crate::harness::transcript::ToolInfo {
+                        tool: "ask".into(),
+                        call_id: "c".into(),
+                        status: crate::harness::transcript::ToolStatus::Completed,
+                        title: Some("Ask".into()),
+                        input: serde_json::json!({}),
+                        output: Some("A".into()),
+                        error: None,
+                        metadata: serde_json::json!({}),
+                        start_ms: None,
+                    },
+                ),
+            });
+        s.messages.push(tool_msg);
+        assert_eq!(App::fork_point(&s).as_deref(), Some("msg_a1"));
+    }
+
+    #[test]
+    fn fork_point_none_without_output() {
+        let mut s = SessionState::new(1, "x".into(), std::path::PathBuf::from("/tmp"));
+        s.messages.push(msg("msg_u1", Role::User, None));
+        assert_eq!(App::fork_point(&s), None);
+    }
+
+    #[test]
+    fn fork_point_skips_optimistic_local_ids() {
+        let mut s = SessionState::new(1, "x".into(), std::path::PathBuf::from("/tmp"));
+        s.messages.push(msg("local-1", Role::User, None));
+        s.messages.push(text_msg("msg_a1", Role::Assistant, Some(1), "done"));
+        s.messages.push(msg("local-2", Role::User, None));
+        assert_eq!(App::fork_point(&s).as_deref(), Some("msg_a1"));
+    }
+
+    #[test]
+    fn events_route_by_dir_and_session_id() {
+        let mk = |id: u32, dir: &str, oc: &str| {
+            let mut s = SessionState::new(id, format!("s{id}"), PathBuf::from(dir));
+            s.oc_sid = Some(oc.to_string());
+            s
+        };
+        let sessions = vec![
+            mk(1, "/projA", "a1"),
+            mk(2, "/projA", "a2"),
+            mk(3, "/projB", "b1"),
+            mk(4, "/projB", "b2"),
+        ];
+        assert_eq!(App::route_session(&sessions, Path::new("/projA"), "a2"), Some(1));
+        assert_eq!(App::route_session(&sessions, Path::new("/projB"), "b1"), Some(2));
+        assert_eq!(App::route_session(&sessions, Path::new("/projA"), "b1"), None);
+        assert_eq!(App::route_session(&sessions, Path::new("/projC"), "a1"), None);
     }
 }

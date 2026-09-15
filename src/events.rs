@@ -1,9 +1,12 @@
 //! Events flowing from background tasks into the UI loop.
 
+use crate::harness::transcript::Message;
+use crate::harness::HarnessEvent;
 use crate::opencode::{
-    AgentInfo, CustomCommand, GrepMatch, Message, ModelEntry, ModelRef, OcSession,
-    PermissionRequest, QuestionRequest,
+    AgentInfo, CustomCommand, GrepMatch, ModelEntry, ModelRef, OcSession, PermissionRequest,
+    QuestionRequest,
 };
+use crate::providers::ProviderSession;
 use std::path::PathBuf;
 
 /// A transient key used to correlate async replies with UI requests.
@@ -16,11 +19,15 @@ pub enum AppEvent {
     ServerFailed { dir: PathBuf, error: String },
     ServerDied { dir: PathBuf },
 
-    OcCreated { req: ReqId, session: OcSession },
+    OcCreated { req: ReqId, session: ProviderSession },
     OcCreateFailed { req: ReqId, error: String },
 
-    /// Raw SSE event from a server; routed by sessionID inside the app.
-    OcEvent { dir: PathBuf, ev: OcEvent },
+    /// Provider-neutral harness event, routed by native session id.
+    Harness {
+        dir: PathBuf,
+        oc_sid: String,
+        event: HarnessEvent,
+    },
 
     HistoryLoaded {
         dir: PathBuf,
@@ -97,8 +104,13 @@ pub enum AppEvent {
     /// A session was forked; the new one shares the history.
     OcForked {
         dir: PathBuf,
-        session: OcSession,
+        session: ProviderSession,
         source: u32,
+    },
+    /// A fork failed; the placeholder pane for `source` should show the error.
+    OcForkFailed {
+        source: u32,
+        error: String,
     },
     /// Pending agent questions fetched when (re)connecting.
     QuestionsListed {
@@ -119,28 +131,4 @@ pub enum AppEvent {
         message: String,
         repo: Option<String>,
     },
-}
-
-/// A raw OpenCode bus event: `{ id, type, properties }`.
-#[derive(Debug, Clone)]
-pub struct OcEvent {
-    pub typ: String,
-    pub properties: serde_json::Value,
-}
-
-impl OcEvent {
-    pub fn parse(v: serde_json::Value) -> Option<Self> {
-        let typ = v.get("type")?.as_str()?.to_string();
-        Some(Self {
-            typ,
-            properties: v.get("properties").cloned().unwrap_or_default(),
-        })
-    }
-
-    pub fn session_id(&self) -> Option<String> {
-        self.properties
-            .get("sessionID")
-            .and_then(|s| s.as_str())
-            .map(|s| s.to_string())
-    }
 }

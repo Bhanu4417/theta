@@ -3,7 +3,7 @@
 //! Blocks map transcript entities (messages, tool calls, errors) to line
 //! ranges so scrolling/search can jump precisely.
 
-use crate::opencode::{PartKind, Role, ToolStatus};
+use crate::harness::transcript::{PartKind, Role, ToolInfo, ToolStatus};
 use crate::session::{SessionState, ToolRef};
 use crate::theme::{pal, self};
 
@@ -362,7 +362,7 @@ pub fn build_cache(sess: &SessionState, width: u16, tick: u64) -> Cache {
     }
 }
 
-fn tool_detail_lines(t: &crate::opencode::ToolInfo, w: usize, cap: usize) -> Vec<Line<'static>> {
+fn tool_detail_lines(t: &ToolInfo, w: usize, cap: usize) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     let indent = "    ";
     let inner = w.saturating_sub(6).max(8);
@@ -418,7 +418,7 @@ fn tool_detail_lines(t: &crate::opencode::ToolInfo, w: usize, cap: usize) -> Vec
 
 /// OpenCode's read tool returns an XML-ish envelope; show just the content.
 /// Human label for a running shell command (best-effort).
-fn activity_label(t: &crate::opencode::ToolInfo) -> String {
+fn activity_label(t: &ToolInfo) -> String {
     let cmd = t.input_str(&["command", "cmd"]).unwrap_or_default();
     let c = cmd.to_lowercase();
     if c.contains("git clone") {
@@ -466,7 +466,7 @@ fn parse_percent(s: &str) -> Option<u8> {
 
 /// Fallback when the command gives no live percentage (git suppresses its own
 /// progress off a TTY): estimate from elapsed time, easing toward 95%.
-fn synth_progress(t: &crate::opencode::ToolInfo, now_ms: i64) -> Option<u8> {
+fn synth_progress(t: &ToolInfo, now_ms: i64) -> Option<u8> {
     if !matches!(t.status, ToolStatus::Pending | ToolStatus::Running) {
         return None;
     }
@@ -871,4 +871,111 @@ fn patch_range(line: &Line<'static>, c0: usize, c1: usize, bg: Color) -> Line<'s
         }
     }
     Line::from(out)
+}
+
+#[cfg(test)]
+mod transcript_boundary_tests {
+    use super::*;
+    use crate::harness::transcript::{Message, Part, PartKind, Role, ToolInfo, ToolStatus};
+    use crate::session::SessionState;
+    use serde_json::json;
+
+    fn text_part(text: &str) -> Part {
+        Part {
+            id: "p-text".into(),
+            message_id: "m1".into(),
+            kind: PartKind::Text {
+                text: text.into(),
+                synthetic: false,
+            },
+        }
+    }
+
+    fn assistant_meta(part: &Part) -> Message {
+        Message {
+            id: part.message_id.clone(),
+            role: Role::Assistant,
+            error: None,
+            completed: None,
+            created: None,
+            cost: None,
+            tokens: None,
+            parts: vec![part.clone()],
+        }
+    }
+
+    fn cache_text(sess: &SessionState) -> String {
+        build_cache(sess, 60, 0)
+            .lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|sp| sp.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn streaming_assistant_text_renders_incrementally() {
+        let mut s = SessionState::new(1, "s".into(), std::path::PathBuf::from("/tmp"));
+        let first = text_part("Let me inspect");
+        s.upsert_part(&assistant_meta(&first), first);
+        assert!(cache_text(&s).contains("Let me inspect"));
+        // The same part id with more text simulates a streaming delta.
+        let grown = text_part("Let me inspect the project structure");
+        s.upsert_part(&assistant_meta(&grown), grown);
+        let rendered = cache_text(&s);
+        assert!(rendered.contains("the project structure"));
+    }
+
+    #[test]
+    fn tool_states_render_from_neutral_model() {
+        let mut s = SessionState::new(1, "s".into(), std::path::PathBuf::from("/tmp"));
+        let tool = ToolInfo {
+            tool: "bash".into(),
+            call_id: "c1".into(),
+            status: ToolStatus::Running,
+            title: Some("Running tests".into()),
+            input: json!({"command": "cargo test"}),
+            output: None,
+            error: None,
+            metadata: json!({}),
+            start_ms: None,
+        };
+        let part = Part {
+            id: "p-tool".into(),
+            message_id: "m1".into(),
+            kind: PartKind::Tool(tool),
+        };
+        s.upsert_part(&assistant_meta(&part), part);
+        assert!(cache_text(&s).contains("Running tests"));
+    }
+
+    #[test]
+    fn user_message_renders_from_neutral_model() {
+        let mut s = SessionState::new(1, "s".into(), std::path::PathBuf::from("/tmp"));
+        let part = Part {
+            id: "p-user".into(),
+            message_id: "mu".into(),
+            kind: PartKind::Text {
+                text: "fix the login bug".into(),
+                synthetic: false,
+            },
+        };
+        let msg = Message {
+            id: "mu".into(),
+            role: Role::User,
+            error: None,
+            completed: None,
+            created: None,
+            cost: None,
+            tokens: None,
+            parts: vec![part.clone()],
+        };
+        s.upsert_part(&msg, part);
+        assert!(cache_text(&s).contains("fix the login bug"));
+    }
 }

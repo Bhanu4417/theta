@@ -1,6 +1,9 @@
 //! Per-session state: transcript, input buffer, status, scroll.
 
-use crate::opencode::{Message, ModelRef, Part, PartKind, QuestionInfo, Role, ToolInfo, ToolStatus};
+use crate::harness::transcript::{Message, Part, PartKind, Role, ToolInfo, ToolStatus};
+use crate::harness::{Question, Task};
+use crate::opencode::ModelRef;
+use crate::providers::ProviderKind;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -36,7 +39,7 @@ pub struct PendingPermission {
 #[derive(Debug, Clone)]
 pub struct PendingQuestion {
     pub id: String,
-    pub questions: Vec<QuestionInfo>,
+    pub questions: Vec<Question>,
     /// Index of the question currently being answered.
     pub qi: usize,
     /// Highlighted option per question.
@@ -50,7 +53,7 @@ pub struct PendingQuestion {
 }
 
 impl PendingQuestion {
-    pub fn new(id: String, questions: Vec<QuestionInfo>) -> Self {
+    pub fn new(id: String, questions: Vec<Question>) -> Self {
         let n = questions.len();
         let selected = vec![0usize; n];
         let chosen = questions
@@ -69,7 +72,7 @@ impl PendingQuestion {
         }
     }
 
-    pub fn current(&self) -> Option<&QuestionInfo> {
+    pub fn current(&self) -> Option<&Question> {
         self.questions.get(self.qi)
     }
 
@@ -270,6 +273,12 @@ pub struct ToolRef {
 #[derive(Debug, Clone)]
 pub struct SessionState {
     pub id: u32,
+    /// Theta-owned identity wrapper (provider ids are metadata).
+    pub session_id: crate::harness::SessionId,
+    /// Which agent runtime backs this session.
+    pub provider: ProviderKind,
+    /// The harness task for the current prompt, if any.
+    pub task: Option<Task>,
     pub name: String,
     pub dir: PathBuf,
     pub oc_sid: Option<String>,
@@ -328,6 +337,9 @@ impl SessionState {
             id,
             name,
             dir,
+            session_id: crate::harness::SessionId(id),
+            provider: ProviderKind::OpenCode,
+            task: None,
             oc_sid: None,
             model: None,
             agy_model: None,

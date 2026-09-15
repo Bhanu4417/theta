@@ -158,6 +158,7 @@ quiet `✓ thought for 4.7s` marker afterwards.
 [opencode]
 binary = "opencode"      # server binary to launch
 port_base = 4310         # per-directory servers use ports [base, base+1500)
+keep_alive = true        # keep servers running after quit for instant reconnects
 
 [ui]
 restore = true           # restore last workspace on startup

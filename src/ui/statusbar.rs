@@ -317,19 +317,18 @@ fn working_scanner(
     out
 }
 
-/// Mono black-and-white push bar: a thin, 8-cell half-block track (same look
-/// as the shell download bar) that fills left-to-right while pushing.
+/// Mono black-and-white push bar: an 8-cell full-block track that fills
+/// left-to-right, easing toward ~95% like the shell download bar. Full blocks
+/// keep it aligned with the neighbouring text.
 fn push_anim(elapsed_ms: usize, barbg: ratatui::style::Color) -> Vec<Span<'static>> {
     let n = 8usize;
-    let period = 1500usize;
-    let t = (elapsed_ms % period) as f32 / period as f32;
-    let eased = t * t * (3.0 - 2.0 * t);
-    let filled = (eased * n as f32).round() as usize;
+    let pct = (1.0 - (-(elapsed_ms as f32) / 700.0).exp()) * 95.0;
+    let filled = ((pct / 100.0) * n as f32).round() as usize;
     let mut out: Vec<Span<'static>> = Vec::with_capacity(n);
     for i in 0..n {
-        let fg = if i < filled { Color::White } else { Color::DarkGray };
+        let fg = if i < filled { Color::White } else { Color::Gray };
         out.push(Span::styled(
-            "▄".to_string(),
+            "█".to_string(),
             Style::default().fg(fg).bg(barbg),
         ));
     }

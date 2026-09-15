@@ -5,6 +5,7 @@ mod config;
 mod events;
 mod fsx;
 mod git;
+mod harness;
 mod highlight;
 mod keys;
 mod logging;
@@ -12,6 +13,7 @@ mod manager;
 mod opencode;
 mod panes;
 mod persist;
+mod providers;
 mod session;
 mod theme;
 mod ui;
@@ -140,9 +142,12 @@ async fn main() -> Result<()> {
         exec_self()?;
     }
 
-    // Normal exit: shut the servers down gracefully so OpenCode can
-    // checkpoint its database.
-    app.manager.shutdown_all().await;
+    // Normal exit: with `keep_alive` (default) the servers stay up so the next
+    // launch reuses them instantly; otherwise shut them down gracefully so
+    // OpenCode can checkpoint its database.
+    if !app.cfg.opencode.keep_alive {
+        app.manager.shutdown_all().await;
+    }
 
     match result {
         Ok(()) => Ok(()),
