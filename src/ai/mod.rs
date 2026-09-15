@@ -5,7 +5,9 @@
 //! vendor wire format. Concrete providers (OpenAI-compatible, Anthropic,
 //! Google) live next to this module and translate to/from it.
 
+pub mod anthropic;
 pub mod catalog;
+pub mod google;
 pub mod openai;
 
 use crate::providers::ProviderError;
@@ -38,17 +40,22 @@ pub struct ChatMessage {
     pub tool_calls: Vec<ToolCall>,
     /// Set on tool-result messages: which call this answers.
     pub tool_call_id: Option<String>,
+    /// Provider-reported token usage, captured on assistant messages so the
+    /// context estimate can use the real prompt size (Pi's
+    /// `getLastAssistantUsage` + tail estimate).
+    #[serde(default)]
+    pub tokens: Option<crate::harness::transcript::TokenUsage>,
 }
 
 impl ChatMessage {
     pub fn system(text: impl Into<String>) -> Self {
-        Self { role: Role::System, text: text.into(), tool_calls: Vec::new(), tool_call_id: None }
+        Self { role: Role::System, text: text.into(), tool_calls: Vec::new(), tool_call_id: None, tokens: None }
     }
     pub fn user(text: impl Into<String>) -> Self {
-        Self { role: Role::User, text: text.into(), tool_calls: Vec::new(), tool_call_id: None }
+        Self { role: Role::User, text: text.into(), tool_calls: Vec::new(), tool_call_id: None, tokens: None }
     }
     pub fn assistant(text: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
-        Self { role: Role::Assistant, text: text.into(), tool_calls, tool_call_id: None }
+        Self { role: Role::Assistant, text: text.into(), tool_calls, tool_call_id: None, tokens: None }
     }
     pub fn tool_result(call_id: impl Into<String>, text: impl Into<String>) -> Self {
         Self {
@@ -56,6 +63,7 @@ impl ChatMessage {
             text: text.into(),
             tool_calls: Vec::new(),
             tool_call_id: Some(call_id.into()),
+            tokens: None,
         }
     }
 }

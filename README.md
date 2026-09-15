@@ -174,12 +174,14 @@ binary = "opencode"      # server binary to launch
 port_base = 4310         # per-directory servers use ports [base, base+1500)
 keep_alive = true        # keep servers running after quit for instant reconnects
 
-# Settings for backend = "local": any OpenAI-compatible gateway.
+# Settings for backend = "local".
 [ai]
-provider = "openai"      # openai | xai | groq | deepseek | openrouter | together | fireworks | ollama
+provider = "openai"      # anthropic | google | openai | xai | groq | deepseek |
+                         # openrouter | together | fireworks | ollama
 base_url = ""            # set for a custom/compatible endpoint (overrides provider)
-api_key_env = "OPENAI_API_KEY"
-model = "gpt-4o"         # xai → grok-2-latest, groq → llama-3.3-70b-versatile, …
+api_key_env = "OPENAI_API_KEY"   # fallback when no key is stored
+model = "gpt-4o"         # anthropic → claude-3-7-sonnet-20250219,
+                         # google → gemini-2.0-flash, xai → grok-2-latest, …
 
 # Context compaction (local backend), Pi-style token budgets.
 [compaction]
@@ -199,7 +201,13 @@ explorer_width = 32
 auto_approve_permissions = false
 confirm_quit = true
 notify = true            # bell + desktop notification when a run finishes
+local_permissions = "ask"  # local backend tools: ask | allow | deny | read-only
 ```
+
+API keys for the local backend are stored in
+`~/.config/theta/keys.toml` (chmod `0600`) with `/login <provider> <api-key>`
+(`/login <provider>` reports whether one is set); the matching
+`ai.api_key_env` variable is used as a fallback.
 
 ## Headless mode, local backend & skills
 
@@ -210,8 +218,10 @@ theta --print --json "list the files"     # stream neutral events as JSON lines
 
 With `backend = "local"`, Theta runs its **own agent loop** (no `opencode serve`):
 an OpenAI-compatible provider plus built-in tools (`read`, `write`, `edit`,
-`bash`, `grep`, `glob`, `webfetch`), automatic context compaction, and the same
-event stream the UI renders. Any OpenAI-compatible gateway works — set
+`multiedit`, `bash`, `grep`, `glob`, `webfetch`), automatic context compaction,
+and the same event stream the UI renders. Native **Anthropic** (Messages API)
+and **Google Gemini** providers are built in; tool calls are gated by
+`behavior.local_permissions` (`ask` prompts with `a`/`A`/`r` in the UI). Any OpenAI-compatible gateway works — set
 `ai.provider` to a preset or point `ai.base_url` at a custom endpoint, so
 OpenAI, xAI/Grok, Groq, OpenRouter, DeepSeek, Together, Fireworks, Ollama and
 LM Studio are all supported without code changes.
@@ -220,7 +230,8 @@ LM Studio are all supported without code changes.
 (`~/.local/share/theta/sessions/<id>.jsonl`, override with `THETA_SESSION_DIR`).
 `/tree` opens a navigator; jumping to an earlier entry summarizes the
 abandoned branch with the model, injects that summary, and fans out a new
-branch while the old one is kept on disk. Compaction and branch summaries are
+branch while the old one is kept on disk. `/resume` lists saved local sessions,
+and `/compact` folds the current context into a summary on demand. Compaction and branch summaries are
 first-class nodes that rebuild the model context (`id`/`parentId`, like Pi).
 
 **Skills and prompt packs** are discovered from `~/.config/theta/skills/`,

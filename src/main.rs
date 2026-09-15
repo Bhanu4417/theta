@@ -8,6 +8,7 @@ mod agent;
 mod ai;
 mod app;
 mod config;
+mod credentials;
 mod events;
 #[allow(dead_code)]
 mod export;
@@ -205,7 +206,7 @@ async fn main() -> Result<()> {
 /// streams every provider-neutral event as a JSON line; otherwise only the
 /// final assistant text is printed.
 async fn run_headless(cfg: config::Config, prompt: String, json: bool) -> Result<()> {
-    let agent = manager::build_agent(&cfg)?;
+    let (agent, _broker) = manager::build_agent(&cfg, false)?;
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut history = Vec::new();
     let final_text = std::sync::Arc::new(std::sync::Mutex::new(String::new()));

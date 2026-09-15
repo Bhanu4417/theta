@@ -63,6 +63,7 @@ impl Entry {
                 text: self.text.clone(),
                 tool_calls: self.tool_calls.clone(),
                 tool_call_id: None,
+                tokens: None,
             },
             EntryKind::Tool => ChatMessage::tool_result(
                 self.tool_call_id.clone().unwrap_or_default(),
@@ -71,6 +72,15 @@ impl Entry {
             EntryKind::System => ChatMessage::system(self.text.clone()),
         }
     }
+}
+
+/// A resumable local session discovered from its sidecar.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionSummary {
+    pub id: String,
+    pub title: String,
+    pub updated_ms: i64,
+    pub entries: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -318,6 +328,48 @@ impl SessionTree {
         let text = std::fs::read_to_string(path).ok()?;
         let tree = Self::from_jsonl(&text);
         (!tree.is_empty()).then_some(tree)
+    }
+
+    /// List local sessions saved under the sidecar directory (newest first).
+    /// Missing directories yield an empty list.
+    pub fn list_sessions() -> Vec<SessionSummary> {
+        let base = match std::env::var_os("THETA_SESSION_DIR") {
+            Some(dir) => PathBuf::from(dir),
+            None => match dirs::data_dir() {
+                Some(d) => d.join("theta").join("sessions"),
+                None => return Vec::new(),
+            },
+        };
+        let mut out = Vec::new();
+        let Ok(rd) = std::fs::read_dir(&base) else {
+            return out;
+        };
+        for e in rd.flatten() {
+            let path = e.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(id) = path.file_stem().and_then(|x| x.to_str()).map(str::to_string) else {
+                continue;
+            };
+            let Some(tree) = SessionTree::load(&path) else { continue };
+            let title = tree
+                .entries
+                .iter()
+                .find(|e| e.kind == EntryKind::User)
+                .map(|e| e.text.lines().next().unwrap_or("").chars().take(60).collect())
+                .unwrap_or_else(|| "(empty session)".to_string());
+            let updated_ms = e
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            out.push(SessionSummary { id, title, updated_ms, entries: tree.entries.len() });
+        }
+        out.sort_by(|a, b| b.updated_ms.cmp(&a.updated_ms));
+        out
     }
 
     /// Default on-disk path for a provider session id. Override the directory

@@ -88,9 +88,17 @@ pub fn total_tokens(messages: &[ChatMessage]) -> u64 {
     messages.iter().map(message_tokens).sum()
 }
 
-/// Best available context size. Without a cached provider usage this is the
-/// estimate over all messages (Pi uses the last assistant usage + tail).
+/// Pi's `estimateContextTokens`: prefer the last assistant's real usage as the
+/// base and estimate only the messages after it; otherwise estimate everything.
 pub fn estimate_context_tokens(messages: &[ChatMessage]) -> u64 {
+    if let Some(i) = messages
+        .iter()
+        .rposition(|m| m.role == Role::Assistant && m.tokens.is_some())
+    {
+        let base = calculate_context_tokens(messages[i].tokens.unwrap());
+        let tail: u64 = messages[i + 1..].iter().map(message_tokens).sum();
+        return base + tail;
+    }
     total_tokens(messages)
 }
 

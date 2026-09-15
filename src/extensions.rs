@@ -130,6 +130,36 @@ impl Registry {
     }
 }
 
+/// Load `AGENTS.md` / `CLAUDE.md` from `cwd` up to the filesystem root
+/// (root-first, capped). Mirrors Pi's context-file loading.
+pub fn load_context_files(cwd: &Path) -> String {
+    const CAP: usize = 20_000;
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut cur = Some(cwd.to_path_buf());
+    while let Some(d) = cur {
+        dirs.push(d.clone());
+        if dirs.len() > 8 {
+            break;
+        }
+        cur = d.parent().map(|p| p.to_path_buf());
+    }
+    dirs.reverse();
+    let mut out = String::new();
+    for d in dirs {
+        for name in ["AGENTS.md", "CLAUDE.md"] {
+            let p = d.join(name);
+            if let Ok(text) = std::fs::read_to_string(&p) {
+                let text = text.trim();
+                if !text.is_empty() {
+                    let clipped: String = text.chars().take(CAP).collect();
+                    out.push_str(&format!("\n\n# Context: {}\n{}", p.display(), clipped));
+                }
+            }
+        }
+    }
+    out
+}
+
 fn make_skill(name: &str, body: &str) -> Skill {
     Skill {
         name: name.to_string(),
@@ -189,6 +219,17 @@ mod tests {
         let appendix = reg.system_appendix();
         assert!(appendix.contains("review"));
         assert!(appendix.contains("hotfix"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn loads_agents_md_from_cwd_upward() {
+        let root = tempdir("ctx");
+        std::fs::create_dir_all(root.join("sub/deep")).unwrap();
+        std::fs::write(root.join("AGENTS.md"), "root rules").unwrap();
+        std::fs::write(root.join("sub/AGENTS.md"), "sub rules").unwrap();
+        let text = load_context_files(&root.join("sub/deep"));
+        assert!(text.contains("root rules") && text.contains("sub rules"));
         let _ = std::fs::remove_dir_all(&root);
     }
 

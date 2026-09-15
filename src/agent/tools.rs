@@ -64,6 +64,22 @@ impl PermissionGate for AllowAll {
     }
 }
 
+/// Ask the user before any tool that could have side effects.
+pub struct AskGate;
+impl PermissionGate for AskGate {
+    fn check(&self, _tool: &str, _input: &Value) -> PermissionDecision {
+        PermissionDecision::Ask
+    }
+}
+
+/// Deny everything.
+pub struct DenyAll;
+impl PermissionGate for DenyAll {
+    fn check(&self, _tool: &str, _input: &Value) -> PermissionDecision {
+        PermissionDecision::Deny
+    }
+}
+
 /// Allow read-only tools, deny anything that mutates the workspace.
 pub struct ReadOnly;
 impl PermissionGate for ReadOnly {
@@ -231,6 +247,70 @@ impl Tool for EditTool {
                 Ok(()) => ToolOutcome::ok(format!("edited {path}")),
                 Err(e) => ToolOutcome::err(format!("edit {path}: {e}")),
             }
+        })
+    }
+}
+
+/// Apply several `edit` operations in one call.
+pub struct MultiEditTool;
+impl Tool for MultiEditTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "multiedit".into(),
+            description: "Apply multiple edits atomically (all or nothing).".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "edits": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string" },
+                                "old": { "type": "string" },
+                                "new": { "type": "string" }
+                            },
+                            "required": ["path", "old", "new"]
+                        }
+                    }
+                },
+                "required": ["edits"]
+            }),
+        }
+    }
+    fn run<'a>(&'a self, input: &'a Value, cwd: &'a Path) -> Pin<Box<dyn Future<Output = ToolOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(edits) = input.get("edits").and_then(|e| e.as_array()) else {
+                return ToolOutcome::err("missing required argument: edits");
+            };
+            if edits.is_empty() {
+                return ToolOutcome::err("edits is empty");
+            }
+            let mut applied = 0usize;
+            for e in edits {
+                let Some(path) = str_arg(e, &["path", "file_path", "filePath"]) else {
+                    return ToolOutcome::err("each edit needs a path");
+                };
+                let old = str_arg(e, &["old", "old_string", "oldString"]).unwrap_or_default();
+                let new = str_arg(e, &["new", "new_string", "newString"]).unwrap_or_default();
+                let full = resolve(cwd, &path);
+                let text = match tokio::fs::read_to_string(&full).await {
+                    Ok(t) => t,
+                    Err(err) => return ToolOutcome::err(format!("multiedit {path}: {err}")),
+                };
+                let Some(pos) = text.find(&old) else {
+                    return ToolOutcome::err(format!("multiedit {path}: pattern not found"));
+                };
+                let mut updated = String::with_capacity(text.len() + new.len());
+                updated.push_str(&text[..pos]);
+                updated.push_str(&new);
+                updated.push_str(&text[pos + old.len()..]);
+                if let Err(err) = tokio::fs::write(&full, updated.as_bytes()).await {
+                    return ToolOutcome::err(format!("multiedit {path}: {err}"));
+                }
+                applied += 1;
+            }
+            ToolOutcome::ok(format!("applied {applied} edit(s)"))
         })
     }
 }
@@ -440,6 +520,7 @@ pub fn default_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(ReadTool),
         Arc::new(WriteTool),
         Arc::new(EditTool),
+        Arc::new(MultiEditTool),
         Arc::new(BashTool),
         Arc::new(GrepTool),
         Arc::new(GlobTool),
@@ -492,6 +573,27 @@ mod tests {
         assert!(out.output.contains("hi"));
         let bad = BashTool.run(&json!({"command": "exit 3"}), &dir).await;
         assert!(!bad.ok);
+    }
+
+    #[tokio::test]
+    async fn multiedit_applies_in_order() {
+        let dir = std::env::temp_dir().join(format!("theta-me-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let w = WriteTool;
+        w.run(&json!({"path": "a.txt", "content": "one two three"}), &dir).await;
+        let r = MultiEditTool
+            .run(
+                &json!({"edits": [
+                    {"path": "a.txt", "old": "one", "new": "1"},
+                    {"path": "a.txt", "old": "three", "new": "3"}
+                ]}),
+                &dir,
+            )
+            .await;
+        assert!(r.ok, "{r:?}");
+        assert_eq!(ReadTool.run(&json!({"path": "a.txt"}), &dir).await.output, "1 two 3");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

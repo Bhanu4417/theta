@@ -107,6 +107,23 @@ Design every new feature so it works for both the current OpenCode backend and
 a future in-process harness.
 
 ## Work log (recent, high-level)
+- Native **Anthropic (Messages API)** and **Google Gemini** providers in
+  `ai/anthropic.rs` / `ai/google.rs`; `build_agent` selects by `[ai].provider`
+  (with per-provider default models) and falls back to the OpenAI-compatible
+  adapter. Credentials load from `~/.config/theta/keys.toml` (`/login`) with
+  the `ai.api_key_env` variable as fallback (`credentials.rs`).
+- Local backend now loads `AGENTS.md`/`CLAUDE.md` (cwd → root, capped) into the
+  system prompt (`extensions::load_context_files`) and ships a `multiedit` tool.
+- **Interactive permissions for the local loop**: `agent::permissions::Broker`
+  + `AskGate` (from `behavior.local_permissions = ask|allow|deny|read-only`);
+  the loop emits `PermissionAsked` and awaits the UI (`a`/`A`/`r`), auto-allows
+  in headless mode.
+- **Local session index + resume**: `SessionTree::list_sessions` scans sidecars;
+  `/resume` lists them for the local backend and `LocalProvider::adopt` replays
+  stored history into the transcript. Manual `/compact` forces a Pi-style
+  compaction (`AgentLoop::force_compact`) and records a tree compaction node.
+
+
 
 - Multi-pane workspace, slash commands, model/agent pickers, themes.
 - Provider-neutral harness: `HarnessEvent` protocol, owned `SessionId`,
@@ -136,7 +153,9 @@ a future in-process harness.
   (walk back to `keepRecentTokens`, cut only at user/assistant), **split-turn**
   detection with a merged turn-prefix summary, `tokensBefore`, the initial vs
   iterative update prompt, `<conversation>`/`<previous-summary>` framing, and
-  cumulative `FileOps` (`read` minus `written`/`edited`).
+  cumulative `FileOps` (`read` minus `written`/`edited`), a usage-aware
+  `estimateContextTokens` (last assistant usage + tail), and rejects incomplete
+  summaries (length stop / empty) instead of persisting them.
   `HarnessEvent::CompactionStarted/Finished` drive a `Compacting` session status
   ("N compacting" beside the working scanner) and a centered "conversation
   compacted" divider (`PartKind::Compaction`). Budgets in `[compaction]`.

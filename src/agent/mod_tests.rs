@@ -59,6 +59,77 @@ fn call(id: &str, name: &str, args: &str) -> ToolCall {
 }
 
 #[tokio::test]
+async fn ask_gate_waits_for_broker_then_runs() {
+    let dir = std::env::temp_dir().join(format!("theta-perm-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let provider = Box::new(ScriptedProvider::new(vec![
+        AssistantTurn {
+            text: String::new(),
+            tool_calls: vec![call("c1", "write", r#"{"path":"p.txt","content":"ok"}"#)],
+            finish: Some(FinishReason::ToolCalls),
+        },
+        AssistantTurn { text: "done".into(), tool_calls: vec![], finish: Some(FinishReason::Stop) },
+    ]));
+
+    let broker = std::sync::Arc::new(crate::agent::permissions::Broker::new());
+    let agent = AgentLoop::new(provider, "test")
+        .with_permission(Box::new(crate::agent::tools::AskGate))
+        .with_broker(broker.clone());
+
+    let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
+    let run_dir = dir.clone();
+    let handle = tokio::spawn(async move {
+        let mut history = Vec::new();
+        let mut emit = move |e: HarnessEvent| {
+            let _ = etx.send(e);
+        };
+        agent.run_turn(&mut history, "go", &run_dir, &mut emit).await
+    });
+
+    // The loop must emit PermissionAsked and block until answered.
+    let perm_id = loop {
+        match erx.recv().await.unwrap() {
+            HarnessEvent::PermissionAsked { id, .. } => break id,
+            _ => continue,
+        }
+    };
+    assert!(broker.reply(&perm_id, crate::agent::tools::PermissionDecision::Allow));
+
+    let result = handle.await.unwrap();
+    assert!(result.is_ok());
+    assert_eq!(std::fs::read_to_string(dir.join("p.txt")).unwrap(), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn ask_gate_denied_blocks_the_tool() {
+    let dir = std::env::temp_dir().join(format!("theta-permdeny-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let provider = Box::new(ScriptedProvider::new(vec![
+        AssistantTurn {
+            text: String::new(),
+            tool_calls: vec![call("c1", "write", r#"{"path":"no.txt","content":"x"}"#)],
+            finish: Some(FinishReason::ToolCalls),
+        },
+        AssistantTurn { text: "done".into(), tool_calls: vec![], finish: Some(FinishReason::Stop) },
+    ]));
+    let agent = AgentLoop::new(provider, "test")
+        .with_permission(Box::new(crate::agent::tools::DenyAll));
+
+    let mut history = Vec::new();
+    let mut emit = |_e: HarnessEvent| {};
+    agent.run_turn(&mut history, "go", &dir, &mut emit).await.unwrap();
+    assert!(!dir.join("no.txt").exists(), "denied tool must not write");
+    // The denial is reported back to the model as a tool result.
+    assert!(history.iter().any(|m| m.text.contains("denied")), "{history:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn loop_runs_a_tool_then_finishes() {
     let dir = std::env::temp_dir().join(format!("theta-loop-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -263,6 +334,71 @@ async fn compaction_summarizes_with_the_model_and_rebuilds_the_prompt() {
     assert!(history
         .iter()
         .any(|m| m.text.contains("conversation-summary") && m.text.contains("GOAL: finish")));
+}
+
+/// Returns a truncated (length-capped) summarization, which must be rejected.
+struct LengthFailProvider;
+impl Provider for LengthFailProvider {
+    fn id(&self) -> &'static str {
+        "length-fail"
+    }
+    fn stream<'a>(
+        &'a self,
+        request: ChatRequest,
+        on_event: &'a mut (dyn FnMut(ProviderEvent) + Send),
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<AssistantTurn, ProviderError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let summarizing = request
+                .messages
+                .first()
+                .map(|m| m.text.contains("summarization"))
+                .unwrap_or(false);
+            if summarizing {
+                on_event(ProviderEvent::Done(FinishReason::Length));
+                return Ok(AssistantTurn { text: String::new(), tool_calls: vec![], finish: Some(FinishReason::Length) });
+            }
+            Ok(AssistantTurn { text: "ok".into(), tool_calls: vec![], finish: Some(FinishReason::Stop) })
+        })
+    }
+}
+
+#[tokio::test]
+async fn failed_summarization_keeps_full_history() {
+    use crate::ai::catalog::{Catalog, ModelSpec};
+    let dir = std::env::temp_dir();
+    let catalog = Catalog::builtin().with_fallback(ModelSpec {
+        id: "m".into(),
+        provider: "t".into(),
+        context_limit: 1_000,
+        input_per_mtok: 0.0,
+        output_per_mtok: 0.0,
+        tools: true,
+    });
+    let agent = AgentLoop::new(Box::new(LengthFailProvider), "m")
+        .with_catalog(catalog)
+        .with_compaction(
+            crate::agent::context::CompactionSettings { reserve_tokens: 0, keep_recent_tokens: 200, tool_result_cap: 2_000 },
+            true,
+        );
+    let mut history = vec![crate::ai::ChatMessage::system("sys")];
+    for _ in 0..20 {
+        history.push(crate::ai::ChatMessage::user(&"x".repeat(400)));
+    }
+    let events = std::sync::Arc::new(Mutex::new(Vec::<HarnessEvent>::new()));
+    let sink = events.clone();
+    let mut emit = move |e: HarnessEvent| sink.lock().unwrap().push(e);
+    agent.run_turn(&mut history, "q", &dir, &mut emit).await.unwrap();
+    let events = events.lock().unwrap();
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, HarnessEvent::SessionError(m) if m.contains("compaction failed"))));
+    // No summary was written; the original messages are intact.
+    assert!(!history
+        .iter()
+        .any(|m| crate::agent::context::is_summary(m)));
+    assert!(history.iter().filter(|m| m.role == crate::ai::Role::User).count() >= 20);
 }
 
 #[tokio::test]

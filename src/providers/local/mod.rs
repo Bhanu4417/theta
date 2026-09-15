@@ -15,6 +15,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use crate::agent::AgentLoop;
 use crate::ai::ChatMessage;
 use crate::tree::SessionTree;
+use crate::harness::transcript::{Message, Part, PartKind, Role as TRole, TranscriptUpdate};
 use crate::harness::HarnessEvent;
 use crate::providers::{
     AgentProvider, EventPump, EventSink, ModelId, ProviderError, ProviderKind, ProviderSession,
@@ -75,6 +76,112 @@ impl LocalProvider {
         );
         let _ = title;
         session
+    }
+
+    /// Adopt an existing on-disk session (resume): load its tree, replay the
+    /// visible history into the transcript, and register it under `id`.
+    pub fn adopt(&self, id: &str, dir: &str, title: &str) -> ProviderSession {
+        let dir = if dir.is_empty() { self.default_dir.clone() } else { dir.to_string() };
+        let session = ProviderSession {
+            provider: ProviderKind::Local,
+            id: id.to_string(),
+            directory: dir,
+        };
+        let tree = SessionTree::sidecar_path(id)
+            .and_then(|p| SessionTree::load(&p))
+            .unwrap_or_default();
+        self.replay(id, &tree);
+        self.inner.sessions.lock().unwrap().insert(
+            id.to_string(),
+            LocalSession { session: session.clone(), tree, cancel: Arc::new(AtomicBool::new(false)) },
+        );
+        let _ = title;
+        session
+    }
+
+    /// Re-emit a stored transcript so a resumed pane shows prior turns.
+    fn replay(&self, sid: &str, tree: &SessionTree) {
+        if tree.is_empty() {
+            return;
+        }
+        let mut n = 0u64;
+        for entry in tree.active_path() {
+            let (role, text) = match entry.kind {
+                crate::tree::EntryKind::User => (TRole::User, entry.text.clone()),
+                crate::tree::EntryKind::Assistant => (TRole::Assistant, entry.text.clone()),
+                _ => continue,
+            };
+            if text.trim().is_empty() {
+                continue;
+            }
+            n += 1;
+            let message_id = format!("{sid}-hist-{n}");
+            let part_id = format!("{message_id}-p1");
+            let _ = self.events_tx.send(RoutedEvent {
+                session_id: Some(sid.to_string()),
+                event: HarnessEvent::Transcript(TranscriptUpdate::MessageMeta(Message {
+                    id: message_id.clone(),
+                    role,
+                    error: None,
+                    completed: Some(entry.timestamp_ms),
+                    created: Some(entry.timestamp_ms),
+                    cost: None,
+                    tokens: None,
+                    parts: Vec::new(),
+                })),
+            });
+            let _ = self.events_tx.send(RoutedEvent {
+                session_id: Some(sid.to_string()),
+                event: HarnessEvent::Transcript(TranscriptUpdate::Part(Part {
+                    id: part_id,
+                    message_id,
+                    kind: PartKind::Text { text, synthetic: false },
+                })),
+            });
+        }
+    }
+
+    /// Force a compaction of a live session (the `/compact` command). Rebuilds
+    /// the tree as `[compaction summary] + retained tail` and persists it.
+    pub async fn compact_session(&self, id: &str) -> bool {
+        let mut tree = {
+            let mut sessions = self.inner.sessions.lock().unwrap();
+            match sessions.get_mut(id) {
+                Some(s) => std::mem::take(&mut s.tree),
+                None => return false,
+            }
+        };
+        let mut messages = tree.context();
+        self.emit_event(id, HarnessEvent::CompactionStarted);
+        let Some((summary, tokens_before, tail)) =
+            self.inner.agent.force_compact(&mut messages).await
+        else {
+            // Nothing to compact; put the untouched tree back.
+            if let Some(s) = self.inner.sessions.lock().unwrap().get_mut(id) {
+                s.tree = tree;
+            }
+            return false;
+        };
+        tree.push_compaction(&summary, None, tokens_before);
+        for m in &tail {
+            tree.append(m);
+        }
+        if let Some(path) = SessionTree::sidecar_path(id) {
+            let _ = tree.save(&path);
+        }
+        if let Some(s) = self.inner.sessions.lock().unwrap().get_mut(id) {
+            s.tree = tree;
+        }
+        self.emit_event(id, HarnessEvent::CompactionFinished { tokens_before });
+        self.emit_event(id, crate::agent::part_compaction(tokens_before));
+        true
+    }
+
+    fn emit_event(&self, sid: &str, event: HarnessEvent) {
+        let _ = self.events_tx.send(RoutedEvent {
+            session_id: Some(sid.to_string()),
+            event,
+        });
     }
 
     /// Snapshot a session's history tree (for the `/tree` overlay).
@@ -410,6 +517,103 @@ mod tests {
         assert!(ctx.iter().any(|m| m.text.contains("bye")), "summary present in context");
 
         let _ = std::fs::remove_dir_all(&session_dir);
+    }
+
+    #[tokio::test]
+    async fn compact_session_folds_history_into_a_summary() {
+        let dir = std::env::temp_dir().to_string_lossy().to_string();
+        let session_dir =
+            std::env::temp_dir().join(format!("theta-cs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&session_dir);
+        std::env::set_var("THETA_SESSION_DIR", &session_dir);
+
+        // The provider answers both the turn and the summarization request.
+        let provider = OneShot {
+            turns: Mutex::new(
+                vec![
+                    AssistantTurn { text: "first answer".into(), tool_calls: vec![], finish: Some(FinishReason::Stop) },
+                    AssistantTurn { text: "SUMMARY-OF-PAST".into(), tool_calls: vec![], finish: Some(FinishReason::Stop) },
+                ]
+                .into(),
+            ),
+        };
+        let settings = crate::agent::context::CompactionSettings {
+            reserve_tokens: 100,
+            keep_recent_tokens: 1,
+            tool_result_cap: 2_000,
+        };
+        let agent = Arc::new(
+            AgentLoop::new(Box::new(provider), "m").with_compaction(settings, true),
+        );
+        let local = Arc::new(LocalProvider::new(agent, &dir));
+        let session = local
+            .create_session(SessionConfig { directory: dir, title: "t".into() })
+            .await
+            .unwrap();
+        local.send_message(&session, "remember this", None, None, &[]).await.unwrap();
+        for _ in 0..100 {
+            let done = local
+                .tree_snapshot(&session.id)
+                .map(|t| t.entries.iter().any(|e| e.kind == crate::tree::EntryKind::Assistant))
+                .unwrap_or(false);
+            if done {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        assert!(local.compact_session(&session.id).await, "compaction ran");
+        let tree = local.tree_snapshot(&session.id).expect("tree");
+        assert!(tree.entries.iter().any(|e| e.kind == crate::tree::EntryKind::Compaction));
+        let ctx = tree.context();
+        assert!(
+            ctx.iter().any(|m| m.text.contains("SUMMARY-OF-PAST")),
+            "summary replaces the folded history"
+        );
+
+        let _ = std::fs::remove_dir_all(&session_dir);
+    }
+
+    #[tokio::test]
+    async fn replay_reemits_stored_history() {
+        let dir = std::env::temp_dir().to_string_lossy().to_string();
+        let provider = OneShot { turns: Mutex::new(VecDeque::new()) };
+        let agent = Arc::new(AgentLoop::new(Box::new(provider), "m"));
+        let local = Arc::new(LocalProvider::new(agent, &dir));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let pump_local = local.clone();
+        let pump_task = tokio::spawn(async move { let _ = pump_local.pump(tx).await; });
+
+        let mut tree = crate::tree::SessionTree::new();
+        tree.append(&crate::ai::ChatMessage::user("earlier question"));
+        tree.append(&crate::ai::ChatMessage {
+            role: crate::ai::Role::Assistant,
+            text: "earlier answer".into(),
+            tool_calls: vec![],
+            tool_call_id: None,
+            tokens: None,
+        });
+        local.replay("theta-old-1", &tree);
+
+        let mut texts = Vec::new();
+        for _ in 0..4 {
+            let Ok(Some(ev)) =
+                tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await
+            else {
+                break;
+            };
+            if let crate::harness::HarnessEvent::Transcript(
+                crate::harness::transcript::TranscriptUpdate::Part(p),
+            ) = ev.event
+            {
+                if let crate::harness::transcript::PartKind::Text { text, .. } = p.kind {
+                    texts.push(text);
+                }
+            }
+        }
+        pump_task.abort();
+        assert!(texts.iter().any(|t| t == "earlier question"), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "earlier answer"), "{texts:?}");
     }
 
     #[tokio::test]

@@ -80,6 +80,7 @@ pub enum SlashKind {
     Tree,
     Editor,
     Export,
+    Login,
     Custom(String),
 }
 
@@ -117,6 +118,7 @@ fn builtin_slash_items() -> Vec<SlashItem> {
         SlashItem { name: "tree".into(), args: "".into(), desc: "Jump to an earlier point (local backend)".into(), kind: SlashKind::Tree },
         SlashItem { name: "editor".into(), args: "".into(), desc: "Compose the prompt in $EDITOR".into(), kind: SlashKind::Editor },
         SlashItem { name: "export".into(), args: "[file]".into(), desc: "Export this session (Markdown/JSONL)".into(), kind: SlashKind::Export },
+        SlashItem { name: "login".into(), args: "<provider> <key>".into(), desc: "Store an API key for a provider".into(), kind: SlashKind::Login },
         SlashItem { name: "push".into(), args: "[message]".into(), desc: "Commit and push this project (session only)".into(), kind: SlashKind::Push },
         SlashItem { name: "fork".into(), args: "".into(), desc: "Fork this session into a new pane (instant, session only)".into(), kind: SlashKind::Fork },
     ]
@@ -1454,8 +1456,13 @@ impl App {
             }
         };
         if let Some((dir, oc_sid, pid)) = request {
-            self.manager
-                .reply_permission(dir, oc_sid, pid, response.to_string());
+            if self.manager.is_local() {
+                self.manager
+                    .local_permission_reply(oc_sid, pid, response.to_string());
+            } else {
+                self.manager
+                    .reply_permission(dir, oc_sid, pid, response.to_string());
+            }
         }
         if let Some(s) = self.session_mut(id) {
             s.pending_perm = None;
@@ -2366,6 +2373,15 @@ impl App {
                 self.flash("view cleared (server history kept)");
             }
             "compact" => {
+                if self.manager.is_local() {
+                    if let Some(oc) = self.session(sid).and_then(|s| s.oc_sid.clone()) {
+                        self.manager.local_compact(oc);
+                        self.flash("compacting…");
+                    } else {
+                        self.flash("session is still connecting…");
+                    }
+                    return;
+                }
                 let req = {
                     let Some(s) = self.session(sid) else { return };
                     match (s.oc_sid.clone(), s.model.clone().or_else(|| self.default_model.clone())) {
@@ -2477,6 +2493,7 @@ impl App {
             "tree" => self.open_tree(),
             "editor" => self.open_editor(),
             "export" => self.export_session(if args.is_empty() { None } else { Some(args) }),
+            "login" => self.login(args),
             "push" => self.start_push(sid, args),
             "fork" => self.fork_active(),
             "theme" => self.open_theme_picker(),
@@ -3381,6 +3398,30 @@ impl App {
         self.dirty = true;
     }
 
+    /// `/login <provider> <key>` stores an API key; `/login <provider>` checks.
+    pub fn login(&mut self, args: &str) {
+        let mut parts = args.split_whitespace();
+        match (parts.next(), parts.next()) {
+            (Some(provider), Some(key)) => {
+                let mut creds = crate::credentials::Credentials::load();
+                match creds.set(provider, key) {
+                    Ok(()) => self.flash(format!("saved API key for {provider}")),
+                    Err(e) => self.flash(format!("could not save key: {e}")),
+                }
+            }
+            (Some(provider), None) => {
+                let creds = crate::credentials::Credentials::load();
+                let configured = creds.resolve(provider, "").is_some();
+                self.flash(if configured {
+                    format!("{provider}: key configured")
+                } else {
+                    format!("usage: /login {provider} <api-key>")
+                });
+            }
+            _ => self.flash("usage: /login <provider> <api-key>"),
+        }
+    }
+
     /// Export the focused session transcript to `path` (Markdown, or JSONL when
     /// the path ends in `.jsonl`).
     pub fn export_session(&mut self, path: Option<&str>) {
@@ -3476,6 +3517,23 @@ impl App {
             .unwrap_or_else(|| self.initial_dir.clone());
         self.remember_dir(&dir);
         self.resume_picker = ResumePickerState::default();
+        // The local backend keeps sessions as on-disk tree sidecars.
+        if self.manager.is_local() {
+            let dir_s = dir.to_string_lossy().to_string();
+            self.resume_picker.items = crate::tree::SessionTree::list_sessions()
+                .into_iter()
+                .map(|s| crate::opencode::OcSession {
+                    id: s.id,
+                    title: s.title,
+                    directory: dir_s.clone(),
+                    updated_ms: Some(s.updated_ms),
+                })
+                .collect();
+            self.resume_picker.loaded = true;
+            self.overlay = Overlay::ResumeSession;
+            self.dirty = true;
+            return;
+        }
         // Show every known session first; the refresh below fills in the rest.
         self.resume_picker.items = self.all_cached_sessions();
         self.resume_picker.loaded = true;
@@ -5070,7 +5128,11 @@ impl App {
                 let oc = self.sessions[idx].oc_sid.clone();
                 if auto {
                     if let Some(oc) = oc {
-                        self.manager.reply_permission(dir, oc, id.clone(), "once".into());
+                        if self.manager.is_local() {
+                            self.manager.local_permission_reply(oc, id.clone(), "once".into());
+                        } else {
+                            self.manager.reply_permission(dir, oc, id.clone(), "once".into());
+                        }
                     }
                 }
                 let s = &mut self.sessions[idx];

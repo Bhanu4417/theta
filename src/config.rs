@@ -116,6 +116,9 @@ pub struct Behavior {
     /// Ring the bell / send a desktop notification when a background agent
     /// finishes or needs attention.
     pub notify: bool,
+    /// Local-backend tool permission mode: `ask` (default), `allow`, `deny`,
+    /// or `read-only`.
+    pub local_permissions: String,
 }
 
 impl Default for OcConfig {
@@ -146,6 +149,7 @@ impl Default for Behavior {
             history_limit: 200,
             confirm_quit: true,
             notify: true,
+            local_permissions: "ask".into(),
         }
     }
 }

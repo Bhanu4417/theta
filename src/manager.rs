@@ -48,6 +48,8 @@ struct ManagerRef {
     children: Arc<Mutex<Vec<u32>>>,
     /// Present when `cfg.backend == "local"`: the in-process agent backend.
     local: Option<Arc<LocalProvider>>,
+    /// Interactive permission broker for the local backend.
+    local_broker: Option<Arc<crate::agent::permissions::Broker>>,
 }
 
 impl ManagerRef {
@@ -124,10 +126,12 @@ pub struct Manager {
 
 impl Manager {
     pub fn new(tx: tokio::sync::mpsc::UnboundedSender<AppEvent>, cfg: Config) -> Self {
+        let mut local_broker = None;
         let local = if cfg.backend == "local" {
             match build_local_provider(&cfg) {
-                Ok(provider) => {
+                Ok((provider, broker)) => {
                     let local = Arc::new(provider);
+                    local_broker = broker;
                     // Local events carry no workspace; routing is by session id
                     // (an empty dir is a wildcard in `App::route_session`).
                     spawn_event_pump(local.clone(), PathBuf::new(), tx.clone());
@@ -150,6 +154,7 @@ impl Manager {
                 inner: Arc::new(Mutex::new(Inner::default())),
                 children: Arc::new(Mutex::new(Vec::new())),
                 local,
+                local_broker,
             },
             req_seq: AtomicU64::new(1),
         }
@@ -227,6 +232,33 @@ impl Manager {
         }
     }
 
+    /// Force compaction of a local session (`/compact`).
+    pub fn local_compact(&self, oc_sid: String) {
+        let Some(local) = self.ref_.local.clone() else {
+            self.ref_.emit(AppEvent::OpResult {
+                ok: false,
+                message: "compaction is only available on the local backend".into(),
+            });
+            return;
+        };
+        tokio::spawn(async move {
+            let ok = local.compact_session(&oc_sid).await;
+            if !ok {
+                crate::tlog!("COMPACT local: nothing to compact for {oc_sid}");
+            }
+        });
+    }
+
+    /// Answer an interactive permission request for the local backend.
+    pub fn local_permission_reply(&self, _oc_sid: String, id: String, response: String) {
+        if let Some(broker) = &self.ref_.local_broker {
+            let decision = crate::agent::permissions::decision_for(&response);
+            if !broker.reply(&id, decision) {
+                crate::tlog!("PERM local reply for unknown request {id}");
+            }
+        }
+    }
+
     /// Navigate a local session to an earlier history entry (summarizing the
     /// abandoned branch with the model first).
     pub fn local_navigate(&self, oc_sid: String, entry: String) {
@@ -269,7 +301,7 @@ impl Manager {
                 let session = match oc_sid.as_deref() {
                     Some(sid) => match local.resume_session(sid).await {
                         Ok(s) => s,
-                        Err(_) => local.register(&dir_s, &name),
+                        Err(_) => local.adopt(sid, &dir_s, &name),
                     },
                     None => local.register(&dir_s, &name),
                 };
@@ -1045,39 +1077,54 @@ async fn spawn_server(cfg: &Config, dir: &Path) -> Result<(String, Option<tokio:
 
 /// Build the local backend from config: an OpenAI-compatible LLM provider
 /// wrapped in an agent loop (tools + permission policy + catalog).
-fn build_local_provider(cfg: &Config) -> Result<LocalProvider, ProviderError> {
-    let agent = build_agent(cfg)?;
+fn build_local_provider(
+    cfg: &Config,
+) -> Result<(LocalProvider, Option<Arc<crate::agent::permissions::Broker>>), ProviderError> {
+    let (agent, broker) = build_agent(cfg, true)?;
     let dir = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .to_string_lossy()
         .to_string();
-    Ok(LocalProvider::new(Arc::new(agent), dir))
+    Ok((LocalProvider::new(Arc::new(agent), dir), broker))
 }
 
 /// Build the in-process agent from config (also used by headless modes).
-pub fn build_agent(cfg: &Config) -> Result<crate::agent::AgentLoop, ProviderError> {
+pub fn build_agent(
+    cfg: &Config,
+    interactive: bool,
+) -> Result<(crate::agent::AgentLoop, Option<Arc<crate::agent::permissions::Broker>>), ProviderError>
+{
     let ai = &cfg.ai;
-    let key = if ai.api_key_env.is_empty() {
-        None
-    } else {
-        std::env::var(&ai.api_key_env)
-            .ok()
-            .filter(|k| !k.trim().is_empty())
-    };
+    let provider_id = ai.provider.to_ascii_lowercase();
+    let creds = crate::credentials::Credentials::load();
+    let key = creds.resolve(&provider_id, &ai.api_key_env);
     let provider: Box<dyn crate::ai::Provider> = if !ai.base_url.trim().is_empty() {
         Box::new(crate::ai::openai::OpenAiCompat::new(ai.base_url.clone(), key))
     } else {
-        Box::new(
-            crate::ai::openai::OpenAiCompat::preset(&ai.provider, key).ok_or_else(|| {
-                ProviderError::Unsupported(format!(
-                    "unknown ai.provider '{}' (set ai.base_url for a custom gateway)",
-                    ai.provider
-                ))
-            })?,
-        )
+        match provider_id.as_str() {
+            "anthropic" | "claude" => Box::new(crate::ai::anthropic::Anthropic::new(key)),
+            "google" | "gemini" => Box::new(crate::ai::google::Google::new(key)),
+            _ => Box::new(
+                crate::ai::openai::OpenAiCompat::preset(&provider_id, key).ok_or_else(|| {
+                    ProviderError::Unsupported(format!(
+                        "unknown ai.provider '{}' (use anthropic/google/openai/xai/… or set ai.base_url)",
+                        ai.provider
+                    ))
+                })?,
+            ),
+        }
+    };
+    let model = if ai.model.trim().is_empty() {
+        default_model_for(&provider_id).to_string()
+    } else {
+        ai.model.clone()
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let registry = crate::extensions::Registry::discover(&crate::extensions::Registry::default_roots(&cwd));
+    let registry =
+        crate::extensions::Registry::discover(&crate::extensions::Registry::default_roots(&cwd));
+    // System prompt = base + project context files (AGENTS.md) + skill index.
+    let mut appendix = crate::extensions::load_context_files(&cwd);
+    appendix.push_str(&registry.system_appendix());
     let base = crate::agent::context::CompactionSettings {
         reserve_tokens: cfg.compaction.reserve_tokens,
         keep_recent_tokens: cfg.compaction.keep_recent_tokens,
@@ -1089,11 +1136,42 @@ pub fn build_agent(cfg: &Config) -> Result<crate::agent::AgentLoop, ProviderErro
         .iter()
         .map(|(k, v)| (k.clone(), (v.reserve_tokens, v.keep_recent_tokens)))
         .collect();
-    let settings = crate::agent::context::resolve_settings(base, &overrides, &ai.model);
-    let agent = crate::agent::AgentLoop::new(provider, ai.model.clone())
+    let settings = crate::agent::context::resolve_settings(base, &overrides, &model);
+    let mut agent = crate::agent::AgentLoop::new(provider, model)
         .with_compaction(settings, cfg.compaction.enabled)
-        .with_system_appendix(registry.system_appendix());
-    Ok(agent)
+        .with_system_appendix(appendix);
+    // Permissions: interactive `ask` for the TUI, auto-allow for headless.
+    let mut broker = None;
+    agent = agent.with_permission(gate_for(&cfg.behavior.local_permissions, interactive));
+    if interactive && cfg.behavior.local_permissions == "ask" {
+        let b = Arc::new(crate::agent::permissions::Broker::new());
+        agent = agent.with_broker(b.clone());
+        broker = Some(b);
+    }
+    Ok((agent, broker))
+}
+
+fn gate_for(mode: &str, interactive: bool) -> Box<dyn crate::agent::tools::PermissionGate> {
+    use crate::agent::tools::{AllowAll, AskGate, DenyAll, ReadOnly};
+    match mode {
+        "allow" => Box::new(AllowAll),
+        "deny" => Box::new(DenyAll),
+        "read-only" | "readonly" => Box::new(ReadOnly),
+        "ask" if interactive => Box::new(AskGate),
+        _ => Box::new(AllowAll),
+    }
+}
+
+/// Sensible default model per provider when `ai.model` is unset.
+fn default_model_for(provider: &str) -> &'static str {
+    match provider {
+        "anthropic" | "claude" => "claude-3-7-sonnet-20250219",
+        "google" | "gemini" => "gemini-2.0-flash",
+        "xai" | "grok" => "grok-2-latest",
+        "deepseek" => "deepseek-chat",
+        "groq" => "llama-3.3-70b-versatile",
+        _ => "gpt-4o",
+    }
 }
 
 /// Supervisor for one adapter's event pump: reconnect-on-failure policy lives

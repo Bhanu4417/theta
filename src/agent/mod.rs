@@ -5,6 +5,7 @@
 //! emits — so the UI renders local turns with no changes.
 
 pub mod context;
+pub mod permissions;
 pub mod tools;
 
 use std::path::Path;
@@ -13,7 +14,8 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::ai::{
-    catalog::Catalog, AssistantTurn, ChatMessage, ChatRequest, Provider, ProviderEvent, ToolCall,
+    catalog::Catalog, AssistantTurn, ChatMessage, ChatRequest, FinishReason, Provider,
+    ProviderEvent, ToolCall,
 };
 use crate::harness::transcript::{Message, Part, PartKind, Role as TRole, ToolInfo, ToolStatus, TokenUsage};
 use crate::harness::transcript::TranscriptUpdate;
@@ -33,6 +35,8 @@ pub struct AgentLoop {
     max_turns: usize,
     compaction: context::CompactionSettings,
     compaction_enabled: bool,
+    /// Answers interactive `Ask` permission decisions (local backend).
+    broker: Option<std::sync::Arc<permissions::Broker>>,
 }
 
 impl AgentLoop {
@@ -47,6 +51,7 @@ impl AgentLoop {
             max_turns: 24,
             compaction: context::CompactionSettings::default(),
             compaction_enabled: true,
+            broker: None,
         }
     }
 
@@ -64,6 +69,12 @@ impl AgentLoop {
 
     pub fn with_permission(mut self, gate: Box<dyn PermissionGate>) -> Self {
         self.permission = gate;
+        self
+    }
+
+    /// Wire the interactive permission broker (local backend).
+    pub fn with_broker(mut self, broker: std::sync::Arc<permissions::Broker>) -> Self {
+        self.broker = Some(broker);
         self
     }
 
@@ -161,12 +172,23 @@ impl AgentLoop {
             {
                 if let Some(prep) = context::prepare(history, &self.compaction) {
                     emit(HarnessEvent::CompactionStarted);
-                    let summary = self.summarize_prep(&prep).await;
-                    context::apply_summary(history, prep.first_kept, &summary);
-                    emit(HarnessEvent::CompactionFinished {
-                        tokens_before: prep.tokens_before,
-                    });
-                    emit(part_compaction(prep.tokens_before));
+                    match self.summarize_prep(&prep).await {
+                        Some(summary) => {
+                            context::apply_summary(history, prep.first_kept, &summary);
+                            emit(HarnessEvent::CompactionFinished {
+                                tokens_before: prep.tokens_before,
+                            });
+                            emit(part_compaction(prep.tokens_before));
+                        }
+                        None => {
+                            // Pi aborts the run on a failed compaction; we keep
+                            // the full context and surface the error instead of
+                            // losing information.
+                            emit(HarnessEvent::SessionError(
+                                "context compaction failed; keeping full history".into(),
+                            ));
+                        }
+                    }
                 }
             }
 
@@ -180,6 +202,7 @@ impl AgentLoop {
 
             let msg_id = format!("local-{turn}");
             let mut acc_text = String::new();
+            let mut turn_usage: Option<crate::harness::transcript::TokenUsage> = None;
             let turn_result = {
                 let mut on_event = |ev: ProviderEvent| match ev {
                     ProviderEvent::TextDelta(t) => {
@@ -190,6 +213,11 @@ impl AgentLoop {
                         emit(part_reasoning(&msg_id, &t));
                     }
                     ProviderEvent::Usage { input, output } => {
+                        turn_usage = Some(crate::harness::transcript::TokenUsage {
+                            input,
+                            output,
+                            ..Default::default()
+                        });
                         emit(part_meta(&msg_id, input, output));
                     }
                     ProviderEvent::Done(_) | ProviderEvent::ToolCall(_) => {}
@@ -197,10 +225,12 @@ impl AgentLoop {
                 self.provider.stream(request, &mut on_event).await?
             };
 
-            let assistant_msg = ChatMessage::assistant(
+            let mut assistant_msg = ChatMessage::assistant(
                 turn_result.text.clone(),
                 turn_result.tool_calls.clone(),
             );
+            // Record real usage so the next context estimate is accurate.
+            assistant_msg.tokens = turn_usage;
             history.push(assistant_msg.clone());
             journal.push(assistant_msg);
 
@@ -232,7 +262,7 @@ impl AgentLoop {
     /// Produce the final summary for a prepared compaction, mirroring Pi's
     /// `compact()`: split turns get a history summary and a merged turn-prefix
     /// summary; file operations are cumulative and appended in Pi's format.
-    async fn summarize_prep(&self, prep: &context::Preparation) -> String {
+    async fn summarize_prep(&self, prep: &context::Preparation) -> Option<String> {
         let cap = self.compaction.tool_result_cap;
         let mut ops = prep.file_ops.clone();
         let raw = if prep.is_split_turn && !prep.turn_prefix.is_empty() {
@@ -240,7 +270,7 @@ impl AgentLoop {
                 "No prior history.".to_string()
             } else {
                 self.summarize_span(&prep.messages_to_summarize, prep.previous_summary.as_deref())
-                    .await
+                    .await?
             };
             let conversation = context::serialize_conversation(&prep.turn_prefix, cap);
             let user = format!(
@@ -250,31 +280,46 @@ impl AgentLoop {
             let prefix = self
                 .complete(context::SUMMARIZATION_SYSTEM_PROMPT, &user)
                 .await
-                .unwrap_or_else(|_| "(summary unavailable)".to_string());
+                .ok()?;
             format!("{history_text}\n\n---\n\n**Turn Context (split turn):**\n\n{prefix}")
         } else {
             self.summarize_span(&prep.messages_to_summarize, prep.previous_summary.as_deref())
-                .await
+                .await?
         };
         // Keep the model's file lists and merge ours, cumulatively.
         ops.merge(&context::FileOps::from_summary(&raw));
         let prose = context::strip_summary_markers(&raw);
-        if ops.is_empty() {
+        Some(if ops.is_empty() {
             prose
         } else {
             format!("{prose}{}", ops.format())
-        }
+        })
     }
 
-    async fn summarize_span(&self, messages: &[ChatMessage], previous: Option<&str>) -> String {
+    async fn summarize_span(&self, messages: &[ChatMessage], previous: Option<&str>) -> Option<String> {
         let conversation = context::serialize_conversation(messages, self.compaction.tool_result_cap);
         let user = context::summarization_user_message(&conversation, previous, None);
         self.complete(context::SUMMARIZATION_SYSTEM_PROMPT, &user)
             .await
-            .unwrap_or_else(|_| "(summary unavailable)".to_string())
+            .ok()
+            .filter(|s| !s.trim().is_empty())
     }
 
     /// Summarize an abandoned branch for tree navigation (Pi's branch summary).
+    /// Force a compaction pass regardless of the budget (the `/compact`
+    /// command). Returns the summary, the pre-compaction token count, and the
+    /// messages retained after the cut so callers can rebuild a tree.
+    pub async fn force_compact(
+        &self,
+        messages: &mut Vec<ChatMessage>,
+    ) -> Option<(String, u64, Vec<ChatMessage>)> {
+        let prep = context::prepare(messages, &self.compaction)?;
+        let tail = messages[prep.first_kept..].to_vec();
+        let summary = self.summarize_prep(&prep).await?;
+        context::apply_summary(messages, prep.first_kept, &summary);
+        Some((summary, prep.tokens_before, tail))
+    }
+
     pub async fn summarize_branch(&self, text: &str) -> Result<String, ProviderError> {
         let user = format!(
             "<conversation>\n{text}\n</conversation>\n\n{}",
@@ -295,16 +340,30 @@ impl AgentLoop {
             max_tokens: Some(context::summary_max_tokens(self.compaction.reserve_tokens) as u32),
         };
         let mut acc = String::new();
+        let mut finish: Option<FinishReason> = None;
         {
-            let mut on_event = |ev: ProviderEvent| {
-                if let ProviderEvent::TextDelta(t) = ev {
-                    acc.push_str(&t);
-                }
+            let mut on_event = |ev: ProviderEvent| match ev {
+                ProviderEvent::TextDelta(t) => acc.push_str(&t),
+                ProviderEvent::Done(f) => finish = Some(f),
+                _ => {}
             };
             let turn = self.provider.stream(request, &mut on_event).await?;
             if !turn.text.is_empty() {
                 acc = turn.text;
             }
+            if finish.is_none() {
+                finish = turn.finish;
+            }
+        }
+        // A truncated summary must not become a checkpoint (Pi's
+        // getSummarizationFailure).
+        if matches!(finish, Some(FinishReason::Length)) {
+            return Err(ProviderError::Protocol(
+                "summarization hit the token cap and is incomplete".into(),
+            ));
+        }
+        if acc.trim().is_empty() {
+            return Err(ProviderError::Protocol("summarization returned no text".into()));
         }
         Ok(acc)
     }
@@ -320,18 +379,38 @@ impl AgentLoop {
     ) where
         F: FnMut(HarnessEvent),
     {
+        // (permission `Ask` is resolved inside via the broker)
         let input: Value = serde_json::from_str(&call.arguments).unwrap_or(json!({}));
         emit(HarnessEvent::ToolStarted { tool: call.name.clone(), title: call.name.clone() });
 
         let tool = self.tools.iter().find(|t| t.spec().name == call.name);
         let outcome = match tool {
             None => tools::ToolOutcome::err(format!("unknown tool: {}", call.name)),
-            Some(tool) => match self.permission.check(&call.name, &input) {
-                PermissionDecision::Allow => tool.run(&input, cwd).await,
-                PermissionDecision::Deny | PermissionDecision::Ask => {
-                    tools::ToolOutcome::err(format!("permission denied for {}", call.name))
+            Some(tool) => {
+                let mut decision = self.permission.check(&call.name, &input);
+                if decision == PermissionDecision::Ask {
+                    match &self.broker {
+                        Some(broker) => {
+                            let id = format!("{msg_id}-perm-{}", call.id);
+                            let rx = broker.register(id.clone());
+                            emit(HarnessEvent::PermissionAsked {
+                                id: id.clone(),
+                                kind: call.name.clone(),
+                                detail: truncate_detail(&call.arguments),
+                            });
+                            decision = rx.await.unwrap_or(PermissionDecision::Deny);
+                            emit(HarnessEvent::PermissionReplied);
+                        }
+                        None => decision = PermissionDecision::Deny,
+                    }
                 }
-            },
+                match decision {
+                    PermissionDecision::Allow => tool.run(&input, cwd).await,
+                    PermissionDecision::Deny | PermissionDecision::Ask => {
+                        tools::ToolOutcome::err(format!("permission denied for {}", call.name))
+                    }
+                }
+            }
         };
 
         let status = if outcome.ok { ToolStatus::Completed } else { ToolStatus::Error };
@@ -378,6 +457,10 @@ fn part_reasoning(msg_id: &str, text: &str) -> HarnessEvent {
     }))
 }
 
+fn truncate_detail(args: &str) -> String {
+    args.chars().take(200).collect()
+}
+
 fn part_meta(msg_id: &str, input: u64, output: u64) -> HarnessEvent {
     HarnessEvent::Transcript(TranscriptUpdate::MessageMeta(Message {
         id: msg_id.to_string(),
@@ -392,7 +475,7 @@ fn part_meta(msg_id: &str, input: u64, output: u64) -> HarnessEvent {
 }
 
 /// A transcript marker for a compaction boundary (rendered as a divider).
-fn part_compaction(tokens_before: u64) -> HarnessEvent {
+pub(crate) fn part_compaction(tokens_before: u64) -> HarnessEvent {
     HarnessEvent::Transcript(TranscriptUpdate::Part(Part {
         id: format!("compaction-{tokens_before}"),
         message_id: "compaction".to_string(),
