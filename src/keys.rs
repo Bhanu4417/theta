@@ -23,11 +23,23 @@ pub enum Action {
     Interrupt,
     FocusNext,
     FocusPrev,
+    FocusLeft,
+    FocusRight,
+    FocusUp,
+    FocusDown,
+    MoveLeft,
+    MoveRight,
+    MoveUp,
+    MoveDown,
+    ResizeLeft,
+    ResizeRight,
+    ResizeUp,
+    ResizeDown,
     Keymap,
 }
 
 impl Action {
-    pub const ALL: [Action; 20] = [
+    pub const ALL: [Action; 32] = [
         Action::NewSession,
         Action::Resume,
         Action::Switch,
@@ -47,6 +59,18 @@ impl Action {
         Action::Interrupt,
         Action::FocusNext,
         Action::FocusPrev,
+        Action::FocusLeft,
+        Action::FocusRight,
+        Action::FocusUp,
+        Action::FocusDown,
+        Action::MoveLeft,
+        Action::MoveRight,
+        Action::MoveUp,
+        Action::MoveDown,
+        Action::ResizeLeft,
+        Action::ResizeRight,
+        Action::ResizeUp,
+        Action::ResizeDown,
         Action::Keymap,
     ];
 
@@ -71,6 +95,18 @@ impl Action {
             Action::Interrupt => "interrupt",
             Action::FocusNext => "focus_next",
             Action::FocusPrev => "focus_prev",
+            Action::FocusLeft => "focus_left",
+            Action::FocusRight => "focus_right",
+            Action::FocusUp => "focus_up",
+            Action::FocusDown => "focus_down",
+            Action::MoveLeft => "move_left",
+            Action::MoveRight => "move_right",
+            Action::MoveUp => "move_up",
+            Action::MoveDown => "move_down",
+            Action::ResizeLeft => "resize_left",
+            Action::ResizeRight => "resize_right",
+            Action::ResizeUp => "resize_up",
+            Action::ResizeDown => "resize_down",
             Action::Keymap => "keymap",
         }
     }
@@ -96,6 +132,18 @@ impl Action {
             "interrupt" => Action::Interrupt,
             "focus_next" => Action::FocusNext,
             "focus_prev" => Action::FocusPrev,
+            "focus_left" => Action::FocusLeft,
+            "focus_right" => Action::FocusRight,
+            "focus_up" => Action::FocusUp,
+            "focus_down" => Action::FocusDown,
+            "move_left" => Action::MoveLeft,
+            "move_right" => Action::MoveRight,
+            "move_up" => Action::MoveUp,
+            "move_down" => Action::MoveDown,
+            "resize_left" => Action::ResizeLeft,
+            "resize_right" => Action::ResizeRight,
+            "resize_up" => Action::ResizeUp,
+            "resize_down" => Action::ResizeDown,
             "keymap" => Action::Keymap,
             _ => return None,
         })
@@ -122,6 +170,18 @@ impl Action {
             Action::Interrupt => "Interrupt agent",
             Action::FocusNext => "Focus next pane",
             Action::FocusPrev => "Focus previous pane",
+            Action::FocusLeft => "Focus pane to the left",
+            Action::FocusRight => "Focus pane to the right",
+            Action::FocusUp => "Focus pane above",
+            Action::FocusDown => "Focus pane below",
+            Action::MoveLeft => "Move pane left",
+            Action::MoveRight => "Move pane right",
+            Action::MoveUp => "Move pane up",
+            Action::MoveDown => "Move pane down",
+            Action::ResizeLeft => "Resize pane left",
+            Action::ResizeRight => "Resize pane right",
+            Action::ResizeUp => "Resize pane taller",
+            Action::ResizeDown => "Resize pane shorter",
             Action::Keymap => "Open keymap",
         }
     }
@@ -253,7 +313,7 @@ pub fn default_bindings() -> Vec<(Action, String)> {
     vec![
         (Action::NewSession, "ctrl+n".into()),
         (Action::Resume, "ctrl+r".into()),
-        (Action::Switch, "ctrl+o".into()),
+        (Action::Switch, String::new()),
         (Action::Palette, "ctrl+k".into()),
         (Action::Close, "ctrl+w".into()),
         (Action::Quit, "ctrl+q".into()),
@@ -270,6 +330,18 @@ pub fn default_bindings() -> Vec<(Action, String)> {
         (Action::Interrupt, "ctrl+c".into()),
         (Action::FocusNext, "tab".into()),
         (Action::FocusPrev, "shift+tab".into()),
+        (Action::FocusLeft, "alt+left".into()),
+        (Action::FocusRight, "alt+right".into()),
+        (Action::FocusUp, "alt+up".into()),
+        (Action::FocusDown, "alt+down".into()),
+        (Action::MoveLeft, "alt+shift+left".into()),
+        (Action::MoveRight, "alt+shift+right".into()),
+        (Action::MoveUp, "alt+shift+up".into()),
+        (Action::MoveDown, "alt+shift+down".into()),
+        (Action::ResizeLeft, "ctrl+alt+left".into()),
+        (Action::ResizeRight, "ctrl+alt+right".into()),
+        (Action::ResizeUp, "ctrl+alt+up".into()),
+        (Action::ResizeDown, "ctrl+alt+down".into()),
         (Action::Keymap, "f1".into()),
     ]
 }
@@ -337,5 +409,55 @@ impl Keymap {
             .iter()
             .map(|(a, ks)| (a.name().to_string(), ks.as_ref().map(|s| s.to_str()).unwrap_or_default()))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::collections::HashMap;
+
+    #[test]
+    fn arrow_family_resolves_to_pane_ops() {
+        let km = Keymap::load(&HashMap::new());
+        let ev = |code, mods| KeyEvent::new(code, mods);
+        assert_eq!(
+            km.action_for(&ev(KeyCode::Left, KeyModifiers::ALT)),
+            Some(Action::FocusLeft)
+        );
+        assert_eq!(
+            km.action_for(&ev(
+                KeyCode::Left,
+                KeyModifiers::ALT | KeyModifiers::SHIFT
+            )),
+            Some(Action::MoveLeft)
+        );
+        assert_eq!(
+            km.action_for(&ev(
+                KeyCode::Left,
+                KeyModifiers::ALT | KeyModifiers::CONTROL
+            )),
+            Some(Action::ResizeLeft)
+        );
+        assert_eq!(
+            km.action_for(&ev(
+                KeyCode::Down,
+                KeyModifiers::ALT | KeyModifiers::SHIFT
+            )),
+            Some(Action::MoveDown)
+        );
+        assert_eq!(
+            km.action_for(&ev(
+                KeyCode::Up,
+                KeyModifiers::ALT | KeyModifiers::CONTROL
+            )),
+            Some(Action::ResizeUp)
+        );
+        // Ctrl+O is no longer bound to Switch.
+        assert_eq!(
+            km.action_for(&ev(KeyCode::Char('o'), KeyModifiers::CONTROL)),
+            None
+        );
     }
 }

@@ -75,7 +75,7 @@ pub fn clear() {
 // ---------------------------------------------------------------------------
 
 /// Maximum messages cached per session.
-pub const TRANSCRIPT_CACHE_LIMIT: usize = 120;
+pub const TRANSCRIPT_CACHE_LIMIT: usize = 50;
 
 pub fn transcript_path() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join("theta").join("transcripts.json"))

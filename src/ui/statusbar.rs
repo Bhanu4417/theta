@@ -140,8 +140,7 @@ pub fn render(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
     right.push(hint(crate::keys::Action::Palette));
     right.push(Span::styled("Commands", theme::mute()));
     right.push(Span::styled("  ", bg));
-    right.push(hint(crate::keys::Action::Switch));
-    right.push(Span::styled("Switch", theme::mute()));
+    right.push(Span::styled("Alt+←↑→↓ Panes", theme::mute()));
     right.push(Span::styled("  ", bg));
     right.push(hint(crate::keys::Action::NewSession));
     right.push(Span::styled("New", theme::mute()));

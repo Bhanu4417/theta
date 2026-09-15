@@ -59,6 +59,8 @@ pub enum SlashKind {
     Sessions,
     Resume,
     Close,
+    Delete,
+    Rename,
     Agy,
     AgyModel,
     Keymap,
@@ -104,6 +106,8 @@ fn builtin_slash_items() -> Vec<SlashItem> {
         SlashItem { name: "keys".into(), args: "".into(), desc: "View and edit keybindings".into(), kind: SlashKind::Keymap },
         SlashItem { name: "help".into(), args: "".into(), desc: "Overview of keys and commands".into(), kind: SlashKind::Keymap },
         SlashItem { name: "close".into(), args: "".into(), desc: "Close this session".into(), kind: SlashKind::Close },
+        SlashItem { name: "delete".into(), args: "".into(), desc: "Delete this session from the workspace (server history kept)".into(), kind: SlashKind::Delete },
+        SlashItem { name: "rename".into(), args: "[name]".into(), desc: "Rename this session".into(), kind: SlashKind::Rename },
         SlashItem { name: "quit".into(), args: "".into(), desc: "Quit Theta".into(), kind: SlashKind::Quit },
         SlashItem { name: "refresh".into(), args: "".into(), desc: "Reload the newest build in place".into(), kind: SlashKind::Refresh },
         SlashItem { name: "push".into(), args: "[message]".into(), desc: "Commit and push this project (session only)".into(), kind: SlashKind::Push },
@@ -893,19 +897,23 @@ impl App {
     /// Fork `id` into a fresh pane sharing its history, then send `text`
     /// there once the fork connects. History is never modified.
     fn fork_with_prompt(&mut self, id: u32, text: String) {
-        self.begin_fork(id, Some(text));
+        // Pinned to the last settled point so the busy dialog doesn't inherit
+        // the source's in-progress turn.
+        self.begin_fork(id, Some(text), false);
     }
 
-    /// Fork the focused session at its last message with output. No prompt is
-    /// sent; the new pane simply opens with the history.
+    /// `/fork`: duplicate the focused session with its complete history (up to
+    /// the current tip, including the latest output). No prompt is sent.
     pub fn fork_active(&mut self) {
         let id = self.focus;
-        self.begin_fork(id, None);
+        self.begin_fork(id, None, true);
     }
 
     /// Create the forked pane immediately (seeded with the source transcript so
     /// it renders instantly), then ask the provider to fork in the background.
-    fn begin_fork(&mut self, source: u32, text: Option<String>) {
+    /// `full` forks the entire session; otherwise it forks at the last settled
+    /// message (`fork_point`).
+    fn begin_fork(&mut self, source: u32, text: Option<String>, full: bool) {
         let can_fork = self
             .session(source)
             .map(|s| s.provider.capabilities().native_fork)
@@ -929,7 +937,7 @@ impl App {
             (
                 s.dir.clone(),
                 oc,
-                Self::fork_point(s),
+                if full { None } else { Self::fork_point(s) },
                 s.messages.clone(),
                 s.model.clone(),
                 s.agent.clone(),
@@ -989,29 +997,15 @@ impl App {
         format!("{base}(fork#{})", max_fork + 1)
     }
 
-    /// The message to fork at: the last message with real output (assistant
-    /// text, reasoning, or tool output), so the fork carries the latest answer
-    /// and its output — including a resolved agent question. Turns that have
-    /// produced nothing yet are skipped.
+    /// The message to fork at: the newest real message, so the fork carries
+    /// the entire conversation through to the end — including the latest
+    /// assistant output and any answered agent question.
     fn fork_point(s: &SessionState) -> Option<String> {
-        for m in s.messages.iter().rev() {
-            if !m.id.starts_with("msg") {
-                continue;
-            }
-            let has_output = m.parts.iter().any(|p| match &p.kind {
-                PartKind::Text { text, synthetic } => !synthetic && !text.trim().is_empty(),
-                PartKind::Reasoning { text, .. } => !text.trim().is_empty(),
-                PartKind::Tool(t) => {
-                    t.output.is_some()
-                        || matches!(t.status, ToolStatus::Completed | ToolStatus::Error)
-                }
-                _ => false,
-            });
-            if has_output {
-                return Some(m.id.clone());
-            }
-        }
-        None
+        s.messages
+            .iter()
+            .rev()
+            .find(|m| m.id.starts_with("msg"))
+            .map(|m| m.id.clone())
     }
 
     /// Reload the newest binary in place: save state, then re-exec on exit.
@@ -1569,6 +1563,7 @@ impl App {
             }
         }
         let _ = persist::save_transcripts(&cache);
+        crate::tlog!("TRANSCRIPT cache saved {} sessions", cache.len());
     }
 
     fn transcript_key(s: &SessionState) -> Option<String> {
@@ -1624,6 +1619,7 @@ impl App {
             if let Some(oc) = &sess.oc_sid {
                 let key = format!("{}|{}", dir.display(), oc);
                 if let Some(msgs) = transcript_cache.get(&key) {
+                    crate::tlog!("TRANSCRIPT cache hit {} msgs for {}", msgs.len(), key);
                     sess.messages = msgs.clone();
                     sess.recompute_metrics();
                     sess.stick_bottom = true;
@@ -2140,6 +2136,27 @@ impl App {
                 }
             }
             "close" => self.close_session(self.focus),
+            "delete" | "remove" => {
+                self.close_session(self.focus);
+                self.flash("session deleted from workspace (server history kept)");
+            }
+            "rename" => {
+                if args.is_empty() {
+                    // Open the rename prompt pre-filled with the current name.
+                    self.rename.input.clear();
+                    if let Some((name, len)) =
+                        self.focused().map(|s| (s.name.clone(), s.name.chars().count()))
+                    {
+                        self.rename.input.buf = name;
+                        self.rename.input.cursor = len;
+                    }
+                    self.overlay = Overlay::Rename;
+                } else {
+                    let name = args.to_string();
+                    self.rename_session(sid, &name);
+                    self.flash(format!("renamed to {name}"));
+                }
+            }
             "keys" | "help" => self.open_keymap(),
             "agy" => {
                 if args.is_empty() {
@@ -2449,6 +2466,39 @@ impl App {
 
         // Global bindings from the (user-editable) keymap.
         if let Some(action) = self.keys.action_for(&key) {
+            // Directional focus (Ctrl+arrows) moves to the neighbouring pane.
+            // Directional pane ops: Alt+arrows focus, Alt+Shift+arrows move,
+            // Alt+Ctrl+arrows resize.
+            #[derive(Clone, Copy)]
+            enum PaneOp {
+                Focus,
+                Move,
+                Resize,
+            }
+            let op = match action {
+                Action::FocusLeft => Some((PaneOp::Focus, Dir::Left)),
+                Action::FocusRight => Some((PaneOp::Focus, Dir::Right)),
+                Action::FocusUp => Some((PaneOp::Focus, Dir::Up)),
+                Action::FocusDown => Some((PaneOp::Focus, Dir::Down)),
+                Action::MoveLeft => Some((PaneOp::Move, Dir::Left)),
+                Action::MoveRight => Some((PaneOp::Move, Dir::Right)),
+                Action::MoveUp => Some((PaneOp::Move, Dir::Up)),
+                Action::MoveDown => Some((PaneOp::Move, Dir::Down)),
+                Action::ResizeLeft => Some((PaneOp::Resize, Dir::Left)),
+                Action::ResizeRight => Some((PaneOp::Resize, Dir::Right)),
+                Action::ResizeUp => Some((PaneOp::Resize, Dir::Up)),
+                Action::ResizeDown => Some((PaneOp::Resize, Dir::Down)),
+                _ => None,
+            };
+            if let Some((op, dir)) = op {
+                let rects = self.layout_rects(self.last_body_area).unwrap_or_default();
+                match op {
+                    PaneOp::Focus => self.move_focus(dir, &rects),
+                    PaneOp::Move => self.swap_pane(dir, &rects),
+                    PaneOp::Resize => self.resize_pane(dir),
+                }
+                return;
+            }
             let cmd = match action {
                 Action::NewSession => Cmd::NewSession,
                 Action::Resume => Cmd::ResumeSession,
@@ -2470,12 +2520,26 @@ impl App {
                 Action::FocusNext => Cmd::FocusNext,
                 Action::FocusPrev => Cmd::FocusPrev,
                 Action::Keymap => Cmd::Keymap,
+                Action::FocusLeft
+                | Action::FocusRight
+                | Action::FocusUp
+                | Action::FocusDown
+                | Action::MoveLeft
+                | Action::MoveRight
+                | Action::MoveUp
+                | Action::MoveDown
+                | Action::ResizeLeft
+                | Action::ResizeRight
+                | Action::ResizeUp
+                | Action::ResizeDown => unreachable!(),
             };
             self.execute(cmd).await;
             return;
         }
 
-        // Alt+arrows: directional focus. Alt+hjkl: resize. Alt+1..9: focus nth.
+        // Arrow family (bound actions): Alt+arrows focus, Alt+Shift+arrows
+        // move, Alt+Ctrl+arrows resize. This block keeps the vim-style aliases:
+        // Alt+hjkl resize, Alt+Shift+hjkl move, Alt+1..9 focus nth.
         if alt {
             match key.code {
                 KeyCode::Left => {
@@ -4720,13 +4784,13 @@ mod harness_tests {
     }
 
     #[test]
-    fn fork_point_uses_last_message_with_output() {
+    fn fork_point_includes_the_newest_message() {
         let mut s = SessionState::new(1, "x".into(), std::path::PathBuf::from("/tmp"));
         s.messages.push(text_msg("msg_u1", Role::User, None, "hi"));
         s.messages.push(text_msg("msg_a1", Role::Assistant, Some(10), "the answer"));
-        // trailing in-progress turn that has produced nothing yet
+        // trailing in-progress turn: still the end of the conversation
         s.messages.push(msg("msg_a2", Role::Assistant, None));
-        assert_eq!(App::fork_point(&s).as_deref(), Some("msg_a1"));
+        assert_eq!(App::fork_point(&s).as_deref(), Some("msg_a2"));
     }
 
     #[test]
@@ -4760,9 +4824,9 @@ mod harness_tests {
     }
 
     #[test]
-    fn fork_point_none_without_output() {
+    fn fork_point_none_for_only_optimistic_messages() {
         let mut s = SessionState::new(1, "x".into(), std::path::PathBuf::from("/tmp"));
-        s.messages.push(msg("msg_u1", Role::User, None));
+        s.messages.push(msg("local-1", Role::User, None));
         assert_eq!(App::fork_point(&s), None);
     }
 

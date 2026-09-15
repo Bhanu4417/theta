@@ -77,6 +77,8 @@ Type `/` in any session input for the command menu (filter by typing,
 | `/init [focus]` | Guided AGENTS.md setup (server command) |
 | `/refresh` | Reload the newest build in place (soft restart) |
 | `/push [message]` | Commit all changes and push the session's project |
+| `/rename [name]` | Rename this session |
+| `/delete` | Delete session from the workspace (server history kept) |
 | `/help` · `/quit` | Keys · quit |
 
 Custom commands defined in the project's OpenCode config are fetched from the
@@ -107,11 +109,12 @@ the status bar, then `pushed to owner/repo`.
 | `^K` | Command palette |
 | `^T` | Change tiling (auto grid / rows / columns) |
 | `^Space` | Maximize / restore pane |
-| `^O` | Switch session (list of open panes) |
 | `Tab` / `S-Tab` | Cycle pane focus |
-| `Alt+Arrows` | Focus pane in a direction |
-| `Alt+h j k l` | Resize pane left / down / up / right |
-| `Alt+⇧h/j/k/l` | Move pane in a direction (Hyprland-style) |
+| `Alt+← ↑ → ↓` | Focus the pane in that direction |
+| `Alt+Shift+← ↑ → ↓` | Move (swap) the pane in that direction |
+| `Alt+Ctrl+← ↑ → ↓` | Resize the pane in that direction |
+| `Alt+h j k l` | Resize pane left / down / up / right (alias) |
+| `Alt+Shift+h j k l` | Move pane in a direction (alias) |
 | `Alt+1..9` | Focus nth pane |
 | `^P` | Search files (server-side, gitignore-aware) |
 | `^⇧F` (or `Alt+⇧F`) | Search project content |
