@@ -168,6 +168,7 @@ pub fn render(f: &mut ratatui::Frame, app: &mut App) {
         Overlay::SessionList => overlays::render_session_list(f, app, area),
         Overlay::ResumeSession => overlays::render_resume_picker(f, app, area),
         Overlay::LayoutPicker => overlays::render_layout_picker(f, app, area),
+        Overlay::Tree => overlays::render_tree(f, app, area),
         Overlay::None => {}
     }
 }

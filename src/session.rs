@@ -17,13 +17,18 @@ pub enum SessStatus {
     Error(String),
     Permission,
     Question,
+    /// The harness is summarizing the conversation to free context.
+    Compacting,
 }
 
 impl SessStatus {
     pub fn is_busy(&self) -> bool {
         matches!(
             self,
-            SessStatus::Working | SessStatus::Thinking | SessStatus::Retrying(_)
+            SessStatus::Working
+                | SessStatus::Thinking
+                | SessStatus::Retrying(_)
+                | SessStatus::Compacting
         )
     }
 }
@@ -327,6 +332,14 @@ pub struct SessionState {
     unadopted_locals: u64,
     /// Sequence counter for synthetic (agy) message ids.
     synthetic_seq: u64,
+    /// Collapsed pastes (`[Pasted ~N lines]`, `[Image N]`) for this input.
+    pub paste_parts: Vec<crate::paste::PastePart>,
+    /// Counter for image/file paste placeholders.
+    pub paste_seq: u64,
+    /// `@file` mention suggestions for the current input word.
+    pub mention_results: Vec<String>,
+    /// Selected row in the `@` mention popup.
+    pub mention_selected: usize,
     /// Invalidate the rendered-line cache.
     pub dirty: bool,
 }
@@ -366,6 +379,10 @@ impl SessionState {
             optimistic_seq: 0,
             unadopted_locals: 0,
             synthetic_seq: 0,
+            paste_parts: Vec::new(),
+            paste_seq: 0,
+            mention_results: Vec::new(),
+            mention_selected: 0,
             dirty: true,
         }
     }

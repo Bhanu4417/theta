@@ -109,6 +109,56 @@ a future in-process harness.
 ## Work log (recent, high-level)
 
 - Multi-pane workspace, slash commands, model/agent pickers, themes.
+- Provider-neutral harness: `HarnessEvent` protocol, owned `SessionId`,
+  task lifecycle, capability-gated `AgentProvider` adapters (PostCode adapters,
+  `-Multi` field `-new`).
+- Step 1 of the provider plan: **event streaming is part of the adapter
+  contract** (`providers::EventPump` + `RoutedEvent`/`EventSink`); the
+  OpenCode SSE transport and conversion moved into `providers/opencode`, and
+  `manager.rs` supervises reconnects only. New adapters implement
+  `AgentProvider` + `EventPump` and plug straight into `spawn_event_pump`.
+- Step 2: **`ai/` LLM layer** — dyn-compatible `Provider` trait, OpenAI-compatible
+  provider (covers OpenAI, xAI/Grok, Groq, OpenRouter, DeepSeek, Together,
+  Fireworks, Ollama, LM Studio…), normalized `ProviderEvent` streaming and a
+  built-in model catalog (ctx/pricing/tools).
+- Step 3: **`agent/` loop + tools** — `AgentLoop` (provider → tool calls →
+  results → repeat) with `read`/`write`/`edit`/`bash`/`grep`/`glob`/`webfetch`,
+  a `PermissionGate`, cancellation, and context compaction (`agent::context`).
+  Emits the same `HarnessEvent`s, so the UI is unchanged.
+- Step 4: **backend selection** — `backend = "opencode" | "local"`; the local
+  backend is `providers::local::LocalProvider` (in-process loop behind the same
+  `AgentProvider` + `EventPump` contract). Server-only ops degrade gracefully.
+- Step 5: **headless + skills** — `theta --print ["--json"]` runs one prompt
+  through the local agent (no TUI); `extensions::Registry` discovers skills and
+  prompt packs and feeds the system prompt. RPC mode and tree sessions remain.
+- **Compaction mirrors Pi's `core/compaction` exactly**: `agent::context` follows
+  `shouldCompact(contextTokens > window - reserveTokens)`, `findCutPoint`
+  (walk back to `keepRecentTokens`, cut only at user/assistant), **split-turn**
+  detection with a merged turn-prefix summary, `tokensBefore`, the initial vs
+  iterative update prompt, `<conversation>`/`<previous-summary>` framing, and
+  cumulative `FileOps` (`read` minus `written`/`edited`).
+  `HarnessEvent::CompactionStarted/Finished` drive a `Compacting` session status
+  ("N compacting" beside the working scanner) and a centered "conversation
+  compacted" divider (`PartKind::Compaction`). Budgets in `[compaction]`.
+- Compaction is now Pi-complete for the local backend: **cumulative file
+  tracking** (`FileOps` → `<read-files>`/`<modified-files>`, merged across
+  compactions), **iterative previous-summary reuse** (`system_prefix` excludes
+  prior summaries so they are re-summarized, and the previous summary is passed
+  into the summarizer), **per-model overrides**
+  (`[compaction.model_overrides]`), and a tested **branch-summarization** input
+  builder (`context::branch_summary_input`).
+- Launch P0 ergonomics: **`@file` mentions** (`mentions::extract` → OpenCode
+  file parts / inlined for local, with an inline picker), **`!`/`!!` shell
+  escape**, **`Ctrl+G`/`/editor`** (`$VISITOR`/`$EDITOR` via the main loop),
+  **finish notifications** (bell + `notify-send`, `behavior.notify`), and
+  **`/export`** to Markdown/JSONL (`export::markdown`/`jsonl`), **long-paste
+  collapsing** (`[Pasted ~N lines]`) and **clipboard image/file paste** via
+  `Ctrl+V` (`[Image N]` placeholder → `data:` URL file part; `paste.rs`).
+- `tree::SessionTree`: Pi-style history tree (entries with `parent`, compaction
+  and branch-summary nodes, root→leaf context rebuild), JSONL persistence, and a
+  `/tree` navigator overlay that jumps to earlier entries, generating an LLM
+  branch summary of the abandoned work first. The local backend records each
+  turn into the tree and rebuilds the prompt from the active branch.
 - Queue-or-fork when an agent is busy; forked panes share history.
 - `agy` CLI (Gemini) integration as an alternate one-shot backend.
 - Agent questions (the `ask` tool) with a picker; permission re-fetch on

@@ -125,6 +125,11 @@ pub enum PartKind {
     Tool(ToolInfo),
     StepStart,
     StepFinish,
+    /// A context-compaction boundary. Rendered as a centered divider; the
+    /// summary itself is kept in the model prompt, not the transcript.
+    Compaction {
+        tokens_before: u64,
+    },
     Other,
 }
 
@@ -166,7 +171,7 @@ pub struct Message {
 /// An incremental transcript change produced by a provider adapter and applied
 /// to the Theta session transcript. Streaming is preserved because partial
 /// parts arrive as repeated `Part` updates.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TranscriptUpdate {
     /// Message metadata (from a `message.updated`-style native event).
     MessageMeta(Message),

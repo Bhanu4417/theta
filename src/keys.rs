@@ -36,10 +36,11 @@ pub enum Action {
     ResizeUp,
     ResizeDown,
     Keymap,
+    Editor,
 }
 
 impl Action {
-    pub const ALL: [Action; 32] = [
+    pub const ALL: [Action; 33] = [
         Action::NewSession,
         Action::Resume,
         Action::Switch,
@@ -72,6 +73,7 @@ impl Action {
         Action::ResizeUp,
         Action::ResizeDown,
         Action::Keymap,
+        Action::Editor,
     ];
 
     pub fn name(&self) -> &'static str {
@@ -108,6 +110,7 @@ impl Action {
             Action::ResizeUp => "resize_up",
             Action::ResizeDown => "resize_down",
             Action::Keymap => "keymap",
+            Action::Editor => "editor",
         }
     }
 
@@ -145,6 +148,7 @@ impl Action {
             "resize_up" => Action::ResizeUp,
             "resize_down" => Action::ResizeDown,
             "keymap" => Action::Keymap,
+            "editor" => Action::Editor,
             _ => return None,
         })
     }
@@ -183,6 +187,7 @@ impl Action {
             Action::ResizeUp => "Resize pane taller",
             Action::ResizeDown => "Resize pane shorter",
             Action::Keymap => "Open keymap",
+            Action::Editor => "Edit prompt in $EDITOR",
         }
     }
 }
@@ -343,6 +348,7 @@ pub fn default_bindings() -> Vec<(Action, String)> {
         (Action::ResizeUp, "ctrl+alt+up".into()),
         (Action::ResizeDown, "ctrl+alt+down".into()),
         (Action::Keymap, "f1".into()),
+        (Action::Editor, "ctrl+g".into()),
     ]
 }
 

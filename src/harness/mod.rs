@@ -15,7 +15,7 @@ pub use transcript::TranscriptUpdate;
 
 /// Common, provider-neutral events. Where a provider produces something that
 /// has no common representation, `ProviderSpecific` preserves it untouched.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub enum HarnessEvent {
     SessionIdle,
     SessionWorking,
@@ -45,6 +45,11 @@ pub enum HarnessEvent {
 
     AssistantFinished,
 
+    /// Context compaction is about to run (provider call in flight).
+    CompactionStarted,
+    /// Context compaction finished; the prompt was rebuilt from a summary.
+    CompactionFinished { tokens_before: u64 },
+
     /// A provider-neutral transcript change (streaming text, tool state, …).
     Transcript(TranscriptUpdate),
 
@@ -63,14 +68,14 @@ pub enum HarnessEvent {
 }
 
 /// A single selectable option in an agent question.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct QuestionChoice {
     pub label: String,
     pub description: String,
 }
 
 /// A single question (provider-neutral form of the `ask` tool payload).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Question {
     pub question: String,
     pub header: String,
@@ -80,7 +85,7 @@ pub struct Question {
 }
 
 /// A pending question request from the agent.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct QuestionPrompt {
     pub id: String,
     pub questions: Vec<Question>,

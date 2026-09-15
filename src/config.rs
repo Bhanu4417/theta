@@ -10,6 +10,14 @@ pub struct Config {
     pub opencode: OcConfig,
     pub ui: UiConfig,
     pub behavior: Behavior,
+    /// Which harness backend to drive: `"opencode"` (default) or `"local"`
+    /// (Theta's own in-process agent loop).
+    #[serde(default = "default_backend")]
+    pub backend: String,
+    /// Settings for the local backend (LLM provider + model).
+    pub ai: AiConfig,
+    /// Context compaction budgets (local backend).
+    pub compaction: CompactionConfig,
     /// User keybindings: action name -> key spec ("ctrl+n").
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub keys: HashMap<String, String>,
@@ -24,6 +32,51 @@ pub struct Config {
     /// (Tokyo Night); only a user change rewrites it.
     #[serde(default = "default_theme")]
     pub theme: String,
+}
+
+/// LLM provider settings for the local backend. Any OpenAI-compatible gateway
+/// works: set `provider` to a known preset, or leave it `compat`/empty and set
+/// `base_url` explicitly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiConfig {
+    pub provider: String,
+    pub base_url: String,
+    pub api_key_env: String,
+    pub model: String,
+}
+
+/// Context-compaction tuning, mirroring Pi's reserve/keep token budgets.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CompactionConfig {
+    /// Auto-compact when the prompt approaches the model's limit.
+    pub enabled: bool,
+    /// Tokens reserved for the model's response (trigger headroom).
+    pub reserve_tokens: u64,
+    /// Recent tokens kept verbatim (not summarized).
+    pub keep_recent_tokens: u64,
+    /// Per-model overrides keyed by `provider/model` or bare `model`.
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub model_overrides: HashMap<String, ModelCompaction>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelCompaction {
+    pub reserve_tokens: Option<u64>,
+    pub keep_recent_tokens: Option<u64>,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            reserve_tokens: 16_384,
+            keep_recent_tokens: 20_000,
+            model_overrides: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +113,9 @@ pub struct Behavior {
     pub history_limit: u32,
     /// Ask before quitting while agents are working.
     pub confirm_quit: bool,
+    /// Ring the bell / send a desktop notification when a background agent
+    /// finishes or needs attention.
+    pub notify: bool,
 }
 
 impl Default for OcConfig {
@@ -89,12 +145,28 @@ impl Default for Behavior {
             auto_approve_permissions: false,
             history_limit: 200,
             confirm_quit: true,
+            notify: true,
         }
     }
 }
 
 fn default_theme() -> String {
     "theta-night".to_string()
+}
+
+fn default_backend() -> String {
+    "opencode".to_string()
+}
+
+impl Default for AiConfig {
+    fn default() -> Self {
+        Self {
+            provider: "openai".into(),
+            base_url: String::new(),
+            api_key_env: "OPENAI_API_KEY".into(),
+            model: "gpt-4o".into(),
+        }
+    }
 }
 
 fn default_agy_model() -> String {
@@ -107,6 +179,9 @@ impl Default for Config {
             opencode: OcConfig::default(),
             ui: UiConfig::default(),
             behavior: Behavior::default(),
+            backend: default_backend(),
+            ai: AiConfig::default(),
+            compaction: CompactionConfig::default(),
             keys: HashMap::new(),
             theme: "theta-night".into(),
             agy_model: "gemini-3.8-flash-medium".into(),

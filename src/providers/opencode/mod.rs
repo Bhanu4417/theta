@@ -3,12 +3,14 @@
 //! It implements the provider-neutral [`AgentProvider`] interface and converts
 //! native OpenCode bus events into [`HarnessEvent`]s.
 
-use crate::harness::transcript::{PartKind, Role, ToolStatus, TranscriptUpdate};
+use crate::harness::transcript::{Part, PartKind, Role, ToolStatus, TranscriptUpdate};
 use crate::harness::{HarnessEvent, Question, QuestionChoice, QuestionPrompt};
 use crate::opencode::{Client, ModelRef};
 use crate::providers::{
-    AgentProvider, ModelId, ProviderError, ProviderKind, ProviderSession, SessionConfig,
+    AgentProvider, EventPump, EventSink, ModelId, ProviderError, ProviderKind, ProviderSession,
+    RoutedEvent, SessionConfig,
 };
+use futures::StreamExt;
 
 pub struct OpenCodeProvider {
     client: Client,
@@ -47,6 +49,10 @@ fn transport(e: anyhow::Error) -> ProviderError {
     } else {
         ProviderError::Protocol(s)
     }
+}
+
+fn net(e: reqwest::Error) -> ProviderError {
+    ProviderError::Transport(e.to_string())
 }
 
 impl AgentProvider for OpenCodeProvider {
@@ -100,13 +106,14 @@ impl AgentProvider for OpenCodeProvider {
         text: &str,
         model: Option<ModelId>,
         agent: Option<String>,
+        attachments: &[crate::mentions::Attachment],
     ) -> Result<(), ProviderError> {
         let model_ref = model.map(|m| ModelRef {
             provider_id: m.provider,
             model_id: m.model,
         });
         self.client
-            .prompt_async(&session.id, text, model_ref.as_ref(), agent.as_deref())
+            .prompt_async(&session.id, text, model_ref.as_ref(), agent.as_deref(), attachments)
             .await
             .map_err(transport)
     }
@@ -136,6 +143,65 @@ impl AgentProvider for OpenCodeProvider {
     }
 }
 
+/// Event streaming is the adapter's job: this struct owns the SSE transport to
+/// the OpenCode event bus and never leaks native payloads past the trait.
+impl EventPump for OpenCodeProvider {
+    /// One live connection to the native event bus. Neutral events are
+    /// delivered through `out`; the supervisor decides when to reconnect.
+    fn pump(
+        &self,
+        out: EventSink,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), ProviderError>> + Send + '_>,
+    > {
+        Box::pin(async move {
+        let resp = self
+            .client
+            .raw()
+            .get(format!("{}/event", self.client.base))
+            .header("Accept", "text/event-stream")
+            .send()
+            .await
+            .map_err(net)?;
+        if !resp.status().is_success() {
+            return Err(ProviderError::Transport(format!(
+                "event stream status {}",
+                resp.status()
+            )));
+        }
+        let mut stream = resp.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(net)?;
+            feed_sse(&mut buf, &chunk, |ev| {
+                let _ = out.send(ev);
+            });
+        }
+        Ok(())
+        })
+    }
+}
+
+/// Feed raw SSE bytes into the parser; every complete `data:` line is converted
+/// and emitted. Buffered state lives in `buf` so chunks may split lines.
+fn feed_sse(buf: &mut Vec<u8>, chunk: &[u8], mut emit: impl FnMut(RoutedEvent)) {
+    buf.extend_from_slice(chunk);
+    while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+        let line: Vec<u8> = buf.drain(..=pos).collect();
+        let line = String::from_utf8_lossy(&line[..line.len().saturating_sub(1)]);
+        if let Some(data) = line.strip_prefix("data:") {
+            let data = data.trim_start();
+            if data.is_empty() {
+                continue;
+            }
+            crate::tlog!("SSE {}", crate::logging::snippet(data, 800));
+            for routed in convert_native(data) {
+                emit(routed);
+            }
+        }
+    }
+}
+
 /// A raw OpenCode bus event. Private to the adapter — nothing outside
 /// `providers::opencode` should ever see it.
 #[derive(Debug, Clone)]
@@ -161,16 +227,9 @@ impl NativeEvent {
     }
 }
 
-/// A provider-neutral event plus the native session id it belongs to, used by
-/// the manager to route it to the right Theta session.
-pub struct RoutedEvent {
-    pub session_id: Option<String>,
-    pub event: HarnessEvent,
-}
-
 /// Parse a raw SSE `data:` payload and translate it into provider-neutral
 /// events. Returns an empty vec for unparseable data.
-pub fn convert_native(data: &str) -> Vec<RoutedEvent> {
+fn convert_native(data: &str) -> Vec<RoutedEvent> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
         return Vec::new();
     };
@@ -352,6 +411,27 @@ fn native_events(ev: &NativeEvent) -> Vec<HarnessEvent> {
         }
         "file.watcher.updated" | "file.edited" => vec![HarnessEvent::FilesChanged],
         "vcs.branch.updated" => vec![HarnessEvent::BranchChanged],
+        // Server-side context compaction (OpenCode summarizes the session when
+        // the context window fills). Surface it so the UI shows a "compacting"
+        // status and a "conversation compacted" divider, exactly like our own
+        // local compaction does.
+        "session.next.compaction.started" => vec![HarnessEvent::CompactionStarted],
+        "session.next.compaction.ended" => {
+            let message_id = ev
+                .properties
+                .get("messageID")
+                .and_then(|v| v.as_str())
+                .unwrap_or("compaction")
+                .to_string();
+            vec![
+                HarnessEvent::CompactionFinished { tokens_before: 0 },
+                HarnessEvent::Transcript(TranscriptUpdate::Part(Part {
+                    id: format!("compaction-{message_id}"),
+                    message_id,
+                    kind: PartKind::Compaction { tokens_before: 0 },
+                })),
+            ]
+        }
         _ => vec![HarnessEvent::ProviderSpecific {
             kind: ev.typ.clone(),
         }],
@@ -572,6 +652,28 @@ mod tests {
     }
 
     #[test]
+    fn compaction_events_surface_status_and_divider() {
+        let started = native_events(&ev(
+            "session.next.compaction.started",
+            json!({"sessionID": "ses_1", "messageID": "msg_1", "reason": "auto"}),
+        ));
+        assert_eq!(started, vec![HarnessEvent::CompactionStarted]);
+
+        let ended = native_events(&ev(
+            "session.next.compaction.ended",
+            json!({"sessionID": "ses_1", "messageID": "msg_1", "reason": "auto", "text": "sum", "recent": "r"}),
+        ));
+        assert!(ended
+            .iter()
+            .any(|e| matches!(e, HarnessEvent::CompactionFinished { .. })));
+        assert!(ended.iter().any(|e| matches!(
+            e,
+            HarnessEvent::Transcript(TranscriptUpdate::Part(p))
+                if matches!(p.kind, PartKind::Compaction { .. })
+        )));
+    }
+
+    #[test]
     fn convert_native_parses_and_routes() {
         let data = r#"{"type":"session.status","properties":{"sessionID":"ses_x","status":{"type":"busy"}}}"#;
         let routed = convert_native(data);
@@ -579,6 +681,27 @@ mod tests {
         assert_eq!(routed[0].session_id.as_deref(), Some("ses_x"));
         assert_eq!(routed[0].event, HarnessEvent::SessionWorking);
         assert!(convert_native("not json").is_empty());
+    }
+
+    /// The pump's byte-level testable surface: chunks may split a `data:` line
+    /// anywhere, and only complete lines are emitted.
+    #[test]
+    fn sse_chunks_split_across_lines_are_reassembled() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut out: Vec<RoutedEvent> = Vec::new();
+        feed_sse(&mut buf, b"data: {\"type\":\"session.sta", |ev| out.push(ev));
+        assert!(out.is_empty(), "incomplete line must not emit");
+        feed_sse(
+            &mut buf,
+            b"tus\",\"properties\":{\"sessionID\":\"ses_y\",\"status\":{\"type\":\"busy\"}}}\n",
+            |ev| out.push(ev),
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].session_id.as_deref(), Some("ses_y"));
+        assert_eq!(out[0].event, HarnessEvent::SessionWorking);
+        // Heartbeats and non-data lines are ignored.
+        feed_sse(&mut buf, b"\n: keepalive\n\n", |ev| out.push(ev));
+        assert_eq!(out.len(), 1);
     }
 
     /// Opt-in end-to-end check against a real OpenCode server. Never runs in

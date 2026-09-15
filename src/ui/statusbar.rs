@@ -20,6 +20,7 @@ pub fn render(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
 
     let n = app.sessions.len();
     let working = app.working_count();
+    let compacting = app.compacting_count();
     let active = app.active_count();
     // A `/push` (or similar) status takes over the activity strip.
     let activity = app.sessions.iter().find_map(|s| s.activity.as_ref());
@@ -54,6 +55,13 @@ pub fn render(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
                 left.push(Span::styled(
                     format!("{working} working"),
                     Style::default().bg(barbg).fg(pal().cyan),
+                ));
+            }
+            if compacting > 0 {
+                sep(&mut left);
+                left.push(Span::styled(
+                    format!("{compacting} compacting"),
+                    Style::default().bg(barbg).fg(pal().purple),
                 ));
             }
             // Slider animates as long as anything is going on in any workspace.

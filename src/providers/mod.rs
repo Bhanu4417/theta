@@ -6,9 +6,13 @@
 //! and declaring [`ProviderCapabilities`]; the UI/harness never depend on
 //! provider protocol details.
 
+pub mod local;
 pub mod opencode;
 
+use crate::harness::HarnessEvent;
 use std::fmt;
+use std::pin::Pin;
+use tokio::sync::mpsc::UnboundedSender;
 
 /// Identifies which agent runtime a Theta session is backed by. This is
 /// provider metadata — the Theta session itself has its own identity.
@@ -16,24 +20,29 @@ use std::fmt;
 pub enum ProviderKind {
     #[default]
     OpenCode,
+    /// Theta's own in-process agent loop.
+    Local,
 }
 
 impl ProviderKind {
     pub fn id(self) -> &'static str {
         match self {
             ProviderKind::OpenCode => "opencode",
+            ProviderKind::Local => "local",
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
             ProviderKind::OpenCode => "OpenCode",
+            ProviderKind::Local => "Theta",
         }
     }
 
     pub fn from_id(s: &str) -> Option<Self> {
         match s {
             "opencode" => Some(ProviderKind::OpenCode),
+            "local" => Some(ProviderKind::Local),
             _ => None,
         }
     }
@@ -42,6 +51,7 @@ impl ProviderKind {
     pub fn capabilities(self) -> ProviderCapabilities {
         match self {
             ProviderKind::OpenCode => ProviderCapabilities::OPENCODE,
+            ProviderKind::Local => ProviderCapabilities::LOCAL,
         }
     }
 }
@@ -71,6 +81,17 @@ impl ProviderCapabilities {
         streaming: true,
         permissions: true,
         questions: true,
+        filesystem: true,
+    };
+
+    /// Theta's own loop: streams and has file tools, but no provider-native
+    /// resume/fork/permissions/questions yet.
+    pub const LOCAL: Self = Self {
+        native_resume: false,
+        native_fork: false,
+        streaming: true,
+        permissions: false,
+        questions: false,
         filesystem: true,
     };
 }
@@ -132,11 +153,54 @@ pub struct ModelId {
     pub model: String,
 }
 
+// ---------------------------------------------------------------------------
+// Event streaming contract
+// ---------------------------------------------------------------------------
+
+/// A provider-neutral event plus the native session id it belongs to; the
+/// harness routes it to the right Theta session. Adapters never speak `AppEvent`
+/// — this is the neutral currency they emit.
+#[derive(Debug, Clone)]
+pub struct RoutedEvent {
+    pub session_id: Option<String>,
+    pub event: HarnessEvent,
+}
+
+/// Where an adapter's event pump delivers [`RoutedEvent`]s.
+pub type EventSink = UnboundedSender<RoutedEvent>;
+
+/// Event delivery is part of the provider contract. Lifecycle operations live
+/// on [`AgentProvider`]; this trait owns the *inbound* side: each adapter runs
+/// its native event transport (SSE for OpenCode, CLI output for others) and
+/// yields provider-neutral routed events. Pumping is one live connection; the
+/// supervisor decides reconnect policy, so implementations must not retry
+/// internally.
+pub trait EventPump {
+    /// Pump native events until the connection ends cleanly (`Ok`) or breaks
+    /// (`Err`). Delivery targets `out`. The returned future is `Send`, so a
+    /// supervisor can drive it on a spawned task.
+    fn pump(
+        &self,
+        out: EventSink,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), ProviderError>> + Send + '_>>;
+}
+
+/// Forward through an `Arc` so shared providers (e.g. the local loop) satisfy
+/// the same contract.
+impl<T: EventPump + ?Sized> EventPump for std::sync::Arc<T> {
+    fn pump(
+        &self,
+        out: EventSink,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), ProviderError>> + Send + '_>> {
+        (**self).pump(out)
+    }
+}
+
 /// The interface every agent runtime adapter implements.
 ///
 /// This is intentionally small: session lifecycle, messaging and interruption.
-/// Streaming/event delivery is provider-specific and exposed through
-/// [`crate::harness::HarnessEvent`] by the adapter's event pump.
+/// The inbound side (event streaming) lives on [`EventPump`]; together they
+/// are the complete adapter contract.
 pub trait AgentProvider {
     fn kind(&self) -> ProviderKind;
 
@@ -149,12 +213,16 @@ pub trait AgentProvider {
 
     async fn resume_session(&self, provider_id: &str) -> Result<ProviderSession, ProviderError>;
 
+    /// `attachments` are `(label, absolute path)` pairs from `@file` mentions.
+    /// Backends that understand file parts (OpenCode) use them; text-only
+    /// backends receive the content inlined by the manager.
     async fn send_message(
         &self,
         session: &ProviderSession,
         text: &str,
         model: Option<ModelId>,
         agent: Option<String>,
+        attachments: &[crate::mentions::Attachment],
     ) -> Result<(), ProviderError>;
 
     async fn interrupt(&self, session: &ProviderSession) -> Result<(), ProviderError>;
@@ -235,6 +303,26 @@ pub mod testing {
         }
     }
 
+    /// The pump half of the contract, so the mock can test supervisors.
+    impl crate::providers::EventPump for MockProvider {
+        fn pump(
+            &self,
+            out: crate::providers::EventSink,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), ProviderError>> + Send + '_>,
+        > {
+            Box::pin(async move {
+                for event in self.script() {
+                    let _ = out.send(RoutedEvent {
+                        session_id: Some("mock-ses".into()),
+                        event,
+                    });
+                }
+                Ok(())
+            })
+        }
+    }
+
     impl AgentProvider for MockProvider {
         fn kind(&self) -> ProviderKind {
             ProviderKind::OpenCode
@@ -273,6 +361,7 @@ pub mod testing {
             text: &str,
             _model: Option<ModelId>,
             _agent: Option<String>,
+            _attachments: &[crate::mentions::Attachment],
         ) -> Result<(), ProviderError> {
             if self.fail_send {
                 return Err(ProviderError::Transport("mock failure".into()));
@@ -306,6 +395,34 @@ mod tests {
     use super::testing::MockProvider;
     use super::*;
 
+    /// Step-1 contract check: an adapter's event pump yields neutral routed
+    /// events through the sink, and ends letting the supervisor reconnect.
+    #[tokio::test]
+    async fn event_pump_contract_delivers_routed_events() {
+        let p = MockProvider::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoutedEvent>();
+        let handle = tokio::spawn(async move {
+            p.pump(tx).await.expect("mock pump should succeed");
+        });
+        let got: Vec<RoutedEvent> = {
+            let mut v = Vec::new();
+            while let Some(ev) = rx.recv().await {
+                v.push(ev);
+            }
+            v
+        };
+        handle.await.unwrap();
+        assert_eq!(got.len(), 7, "script size: {:?}", got.len());
+        for ev in &got {
+            assert_eq!(ev.session_id.as_deref(), Some("mock-ses"));
+        }
+        assert!(matches!(
+            got[0].event,
+            HarnessEvent::SessionWorking
+        ));
+        assert!(got.last().unwrap().event == HarnessEvent::SessionIdle);
+    }
+
     #[tokio::test]
     async fn mock_provider_lifecycle() {
         let p = MockProvider::new();
@@ -318,7 +435,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(s.provider, ProviderKind::OpenCode);
-        p.send_message(&s, "hello", None, None).await.unwrap();
+        p.send_message(&s, "hello", None, None, &[]).await.unwrap();
         assert_eq!(p.sent.lock().unwrap().as_slice(), &["hello".to_string()]);
         p.interrupt(&s).await.unwrap();
         assert_eq!(*p.interrupted.lock().unwrap(), 1);
@@ -340,7 +457,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let err = p.send_message(&s, "x", None, None).await.unwrap_err();
+        let err = p.send_message(&s, "x", None, None, &[]).await.unwrap_err();
         assert!(matches!(err, ProviderError::Transport(_)));
         assert!(err.to_string().contains("transport error"));
         let e = p.resume_session("").await.unwrap_err();

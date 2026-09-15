@@ -843,6 +843,7 @@ pub fn render_session_list(f: &mut ratatui::Frame, app: &App, area: Rect) {
             crate::session::SessStatus::Retrying(_) => "↻",
             crate::session::SessStatus::Permission => "!",
             crate::session::SessStatus::Question => "?",
+            crate::session::SessStatus::Compacting => "◐",
         };
         let glyph_color = match &sess.status {
             crate::session::SessStatus::Working | crate::session::SessStatus::Thinking => {
@@ -1298,6 +1299,64 @@ pub fn render_diff(f: &mut ratatui::Frame, area: Rect, d: &crate::app::DiffState
             }
             used += len;
             spans.push(s.clone());
+        }
+        lines.push(Line::from(spans));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The `/tree` history navigator: indented branches with the active path marked.
+pub fn render_tree(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    let total = app.tree_ui.items.len();
+    let visible = total.min(16);
+    let h = (visible + 4) as u16;
+    let rect = centered_rect_w(72, h, area);
+    let inner = surface(
+        f,
+        rect,
+        title_line(vec![
+            Span::styled("History tree", theme::bold(pal().fg)),
+            Span::styled("   branches preserved", theme::mute()),
+        ]),
+    );
+    if inner.width < 20 || inner.height == 0 {
+        return;
+    }
+    let w = inner.width as usize;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "  ↑/↓ move · Enter jump here · Esc close",
+        theme::mute(),
+    )));
+    if total == 0 {
+        lines.push(Line::from(Span::styled("  no history", theme::dim())));
+    }
+    let offset = window_offset(app.tree_ui.selected, total, visible.max(1));
+    for (i, row) in app.tree_ui.items.iter().enumerate().skip(offset) {
+        if lines.len() >= inner.height as usize {
+            break;
+        }
+        let is_sel = i == app.tree_ui.selected;
+        let indent = "  ".repeat(row.depth.min(8));
+        let dot = if row.active { "●" } else { "○" };
+        let dot_style = if row.active { theme::fg(pal().green) } else { theme::mute() };
+        let label = truncate(
+            &row.label,
+            w.saturating_sub(row.depth * 2 + 6).max(8),
+        );
+        let mut spans = vec![
+            Span::styled("  ".to_string(), Style::default()),
+            Span::styled(indent, Style::default()),
+            Span::styled(format!("{dot} "), dot_style),
+            Span::styled(
+                label,
+                if is_sel { theme::bold(pal().fg) } else { theme::fg(pal().fg_soft) },
+            ),
+        ];
+        if is_sel {
+            for s in &mut spans {
+                s.style = s.style.bg(pal().selection);
+            }
         }
         lines.push(Line::from(spans));
     }

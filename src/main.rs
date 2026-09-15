@@ -1,8 +1,18 @@
 //! Theta — a multi-session OpenCode workspace TUI.
 
+// The ai/agent/extensions layers are a reusable library surface; not every
+// entry point is wired into the TUI yet.
+#[allow(dead_code)]
+mod agent;
+#[allow(dead_code)]
+mod ai;
 mod app;
 mod config;
 mod events;
+#[allow(dead_code)]
+mod export;
+#[allow(dead_code)]
+mod extensions;
 mod fsx;
 mod git;
 mod harness;
@@ -10,12 +20,15 @@ mod highlight;
 mod keys;
 mod logging;
 mod manager;
+mod mentions;
 mod opencode;
 mod panes;
+mod paste;
 mod persist;
 mod providers;
 mod session;
 mod theme;
+mod tree;
 mod ui;
 
 use anyhow::Result;
@@ -41,6 +54,12 @@ struct Args {
     log: bool,
     help: bool,
     version: bool,
+    /// Headless: run one turn and print the reply, no TUI.
+    print: bool,
+    /// Headless: emit neutral harness events as JSON lines.
+    json: bool,
+    /// Prompt / positional arguments.
+    prompt: Vec<String>,
 }
 
 fn usage() -> &'static str {
@@ -55,6 +74,8 @@ ARGS:
 OPTIONS:
     --no-restore       Do not restore the last workspace
     --log              Write a verbose debug log (works from any directory)
+    -p, --print        Run one prompt headlessly and print the reply
+    --json             With --print, emit events as JSON lines
     --help             Show this help
     --version          Show version
 
@@ -71,15 +92,26 @@ fn parse_args() -> Args {
         log: false,
         help: false,
         version: false,
+        print: false,
+        json: false,
+        prompt: Vec::new(),
     };
+    let mut positional: Vec<String> = Vec::new();
     for a in std::env::args().skip(1) {
         match a.as_str() {
             "--no-restore" => args.no_restore = true,
             "--log" => args.log = true,
             "--help" | "-h" => args.help = true,
             "--version" | "-V" => args.version = true,
-            _ => args.dir = Some(PathBuf::from(a)),
+            "--print" | "-p" => args.print = true,
+            "--json" => args.json = true,
+            _ => positional.push(a),
         }
+    }
+    if args.print || args.json {
+        args.prompt = positional;
+    } else {
+        args.dir = positional.into_iter().next().map(PathBuf::from);
     }
     args
 }
@@ -95,6 +127,21 @@ async fn main() -> Result<()> {
         println!("theta 0.1.0");
         return Ok(());
     }
+
+    config::Config::save_default_if_missing()?;
+    let cfg = config::Config::load()?;
+    theme::set_theme(&cfg.theme);
+
+    // Headless modes do not need a TTY (print / JSON event stream).
+    if args.print || args.json {
+        let prompt = args.prompt.join(" ");
+        if prompt.trim().is_empty() {
+            eprintln!("theta: --print requires a prompt");
+            std::process::exit(2);
+        }
+        return run_headless(cfg, prompt, args.json).await;
+    }
+
     if !stdout().is_tty() {
         eprintln!("theta: stdout is not a terminal");
         std::process::exit(1);
@@ -113,10 +160,6 @@ async fn main() -> Result<()> {
         std::env::current_dir().ok(),
         std::env::args().collect::<Vec<_>>()
     );
-
-    config::Config::save_default_if_missing()?;
-    let cfg = config::Config::load()?;
-    theme::set_theme(&cfg.theme);
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let manager = manager::Manager::new(tx, cfg.clone());
@@ -156,6 +199,34 @@ async fn main() -> Result<()> {
             Err(e)
         }
     }
+}
+
+/// Run one prompt through the local agent and print the result. `--json`
+/// streams every provider-neutral event as a JSON line; otherwise only the
+/// final assistant text is printed.
+async fn run_headless(cfg: config::Config, prompt: String, json: bool) -> Result<()> {
+    let agent = manager::build_agent(&cfg)?;
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut history = Vec::new();
+    let final_text = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let sink = final_text.clone();
+    let mut emit = move |ev: harness::HarnessEvent| {
+        if json {
+            if let Ok(s) = serde_json::to_string(&ev) {
+                println!("{s}");
+            }
+        }
+        if let harness::HarnessEvent::Transcript(harness::TranscriptUpdate::Part(p)) = &ev {
+            if let harness::transcript::PartKind::Text { text, synthetic: false } = &p.kind {
+                *sink.lock().unwrap() = text.clone();
+            }
+        }
+    };
+    agent.run_turn(&mut history, &prompt, &cwd, &mut emit).await?;
+    if !json {
+        println!("{}", final_text.lock().unwrap());
+    }
+    Ok(())
 }
 
 async fn run(
@@ -201,10 +272,49 @@ async fn run(
         if app.should_quit {
             break;
         }
+
+        // Suspend the TUI to compose a prompt in `$EDITOR` (Ctrl+G / /editor).
+        if let Some((sid, initial)) = app.take_pending_editor() {
+            restore_terminal();
+            let edited = edit_in_external_editor(&initial);
+            *terminal = init_terminal()?;
+            terminal.clear()?;
+            app.dirty = true;
+            if let Some(text) = edited {
+                app.set_input(sid, text);
+            }
+        }
     }
 
     app.save_workspace();
     Ok(())
+}
+
+/// Run the user's editor on a temp file and return the edited text.
+/// `$VISUAL`, then `$EDITOR`, then a sensible default.
+fn edit_in_external_editor(initial: &str) -> Option<String> {
+    let editor = std::env::var("VISUAL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("EDITOR").ok().filter(|s| !s.trim().is_empty()))
+        .unwrap_or_else(|| {
+            if cfg!(windows) {
+                "notepad".into()
+            } else {
+                "vi".into()
+            }
+        });
+    let path = std::env::temp_dir().join(format!("theta-prompt-{}.md", std::process::id()));
+    if std::fs::write(&path, initial).is_err() {
+        return None;
+    }
+    let status = std::process::Command::new(&editor).arg(&path).status();
+    let text = std::fs::read_to_string(&path).ok();
+    let _ = std::fs::remove_file(&path);
+    match status {
+        Ok(s) if s.success() => text,
+        _ => None,
+    }
 }
 
 fn init_terminal() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>> {

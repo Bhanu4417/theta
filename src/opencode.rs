@@ -621,16 +621,9 @@ impl Client {
         text: &str,
         model: Option<&ModelRef>,
         agent: Option<&str>,
+        attachments: &[crate::mentions::Attachment],
     ) -> Result<()> {
-        let mut body = json!({ "parts": [{ "type": "text", "text": text }] });
-        if let Some(m) = model {
-            body["model"] = json!({ "providerID": m.provider_id, "modelID": m.model_id });
-        }
-        if let Some(a) = agent {
-            if !a.is_empty() {
-                body["agent"] = json!(a);
-            }
-        }
+        let body = prompt_body(text, model, agent, attachments);
         let resp = self
             .http
             .post(format!("{}/session/{sid}/prompt_async", self.base))
@@ -942,4 +935,68 @@ pub fn escape_regex(s: &str) -> String {
         out.push(c);
     }
     out
+}
+
+/// Build the `prompt_async` body: the text part first, followed by `@file`
+/// attachments as OpenCode file parts.
+pub fn prompt_body(
+    text: &str,
+    model: Option<&ModelRef>,
+    agent: Option<&str>,
+    attachments: &[crate::mentions::Attachment],
+) -> Value {
+    let mut parts = vec![json!({ "type": "text", "text": text })];
+    for a in attachments {
+        parts.push(json!({
+            "type": "file",
+            "mime": a.mime,
+            "filename": a.label,
+            "url": a.url,
+        }));
+    }
+    let mut body = json!({ "parts": parts });
+    if let Some(m) = model {
+        body["model"] = json!({ "providerID": m.provider_id, "modelID": m.model_id });
+    }
+    if let Some(a) = agent {
+        if !a.is_empty() {
+            body["agent"] = json!(a);
+        }
+    }
+    body
+}
+
+#[cfg(test)]
+mod prompt_tests {
+    use super::*;
+
+    #[test]
+    fn prompt_body_includes_text_and_file_parts() {
+        let m = ModelRef { provider_id: "openai".into(), model_id: "gpt-4o".into() };
+        let body = prompt_body(
+            "explain @src/main.rs",
+            Some(&m),
+            Some("build"),
+            &[crate::mentions::Attachment {
+                label: "src/main.rs".into(),
+                mime: "text/plain".into(),
+                url: "file:///tmp/x/src/main.rs".into(),
+            }],
+        );
+        assert_eq!(body["parts"][0]["type"], "text");
+        assert_eq!(body["parts"][0]["text"], "explain @src/main.rs");
+        assert_eq!(body["parts"][1]["type"], "file");
+        assert_eq!(body["parts"][1]["filename"], "src/main.rs");
+        assert!(body["parts"][1]["url"].as_str().unwrap().starts_with("file://"));
+        assert_eq!(body["model"]["providerID"], "openai");
+        assert_eq!(body["agent"], "build");
+    }
+
+    #[test]
+    fn prompt_body_without_attachments_has_one_text_part() {
+        let body = prompt_body("hi", None, None, &[]);
+        assert_eq!(body["parts"].as_array().unwrap().len(), 1);
+        assert!(body.get("model").is_none());
+        assert!(body.get("agent").is_none());
+    }
 }

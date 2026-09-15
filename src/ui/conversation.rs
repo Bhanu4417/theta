@@ -306,6 +306,21 @@ pub fn build_cache(sess: &SessionState, width: u16, tick: u64) -> Cache {
                     };
                     rendered_any = false;
                 }
+                PartKind::Compaction { tokens_before } => {
+                    // A centered rule marking where context was summarized.
+                    finish_block(&mut lines, &mut blocks);
+                    start_block(
+                        BlockKind::Assistant,
+                        format!("conversation compacted ({tokens_before} tokens)"),
+                        &mut lines,
+                        &mut blocks,
+                    );
+                    lines.push(Line::from(""));
+                    lines.push(centered_divider("conversation compacted", w, theme::dim()));
+                    lines.push(Line::from(""));
+                    finish_block(&mut lines, &mut blocks);
+                    rendered_any = false;
+                }
                 _ => {}
             }
         }
@@ -706,6 +721,23 @@ pub fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// A centered label between horizontal rules (used for compaction markers).
+fn centered_divider(label: &str, w: usize, style: Style) -> Line<'static> {
+    let text = format!(" {label} ");
+    let tw = text.chars().count();
+    if tw + 2 >= w {
+        return Line::from(Span::styled(truncate(label, w), style));
+    }
+    let remaining = w - tw;
+    let left = remaining / 2;
+    let right = remaining - left;
+    Line::from(vec![
+        Span::styled("─".repeat(left), style),
+        Span::styled(text, style),
+        Span::styled("─".repeat(right), style),
+    ])
+}
+
 /// Word-wrap styled spans into rows of spans (char-based widths).
 pub fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
     let width = width.max(4);
@@ -977,5 +1009,53 @@ mod transcript_boundary_tests {
         };
         s.upsert_part(&msg, part);
         assert!(cache_text(&s).contains("fix the login bug"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::harness::transcript::{Message, Part, Role as TRole};
+
+    fn plain(cache: &Cache) -> String {
+        cache
+            .lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|sp| sp.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn compaction_part_renders_a_centered_divider() {
+        let mut s = SessionState::new(1, "s".into(), std::path::PathBuf::from("."));
+        let part = Part {
+            id: "c1".into(),
+            message_id: "m1".into(),
+            kind: PartKind::Compaction { tokens_before: 12_345 },
+        };
+        let meta = Message {
+            id: "m1".into(),
+            role: TRole::Assistant,
+            error: None,
+            completed: Some(1),
+            created: None,
+            cost: None,
+            tokens: None,
+            parts: vec![part.clone()],
+        };
+        s.upsert_part(&meta, part);
+        let cache = build_cache(&s, 60, 0);
+        let text = plain(&cache);
+        assert!(text.contains("conversation compacted"), "{text}");
+        // Centered: the label sits on a line that starts with a horizontal rule.
+        assert!(text
+            .lines()
+            .any(|l| l.contains("conversation compacted") && l.starts_with('─')), "{text}");
     }
 }

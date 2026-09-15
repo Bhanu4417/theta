@@ -33,11 +33,48 @@ pub fn list_dir(dir: &Path) -> Vec<Entry> {
             .unwrap_or_default();
         out.push(Entry { name, path, is_dir });
     }
-    out.sort_by(|a, b| match (b.is_dir, a.is_dir) {
+    out.sort_by(|a, b| match (a.is_dir, b.is_dir) {
         (true, false) => std::cmp::Ordering::Less,
         (false, true) => std::cmp::Ordering::Greater,
         _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
     });
+    out
+}
+
+/// Recursively find files whose name contains `query` (gitignore-aware).
+/// Bounded by `limit`; skips heavy directories.
+pub fn find_files(root: &Path, query: &str, limit: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let q = query.to_lowercase();
+    if q.is_empty() {
+        return out;
+    }
+    let walker = WalkBuilder::new(root)
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .filter_entry(|e| {
+            let n = e.file_name().to_string_lossy();
+            n != ".git" && n != "target" && n != "node_modules"
+        })
+        .build();
+    for e in walker.flatten() {
+        if out.len() >= limit {
+            break;
+        }
+        if e.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            let name = e.file_name().to_string_lossy().to_lowercase();
+            if name.contains(&q) {
+                let rel = e
+                    .path()
+                    .strip_prefix(root)
+                    .unwrap_or_else(|_| e.path())
+                    .to_string_lossy()
+                    .to_string();
+                out.push(rel);
+            }
+        }
+    }
     out
 }
 
@@ -90,4 +127,36 @@ pub fn search_local(root: &Path, query: &str, limit: usize) -> Vec<LocalMatch> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn find_files_matches_names_and_is_bounded() {
+        let dir = std::env::temp_dir().join(format!("theta-fsx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/main.rs"), "x").unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "x").unwrap();
+        std::fs::write(dir.join("README.md"), "x").unwrap();
+        let hits = find_files(&dir, "main", 10);
+        assert_eq!(hits, vec!["src/main.rs".to_string()]);
+        let rs = find_files(&dir, ".rs", 1);
+        assert_eq!(rs.len(), 1, "limit respected");
+        assert!(find_files(&dir, "", 10).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_dir_sorts_dirs_first() {
+        let dir = std::env::temp_dir().join(format!("theta-fsx-list-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("zzz_dir")).unwrap();
+        std::fs::write(dir.join("aaa.txt"), "x").unwrap();
+        let entries = list_dir(&dir);
+        assert!(entries[0].is_dir, "directories sort first");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

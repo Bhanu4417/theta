@@ -124,6 +124,19 @@ pub enum AppEvent {
     },
     /// Progress of a `/push` (commit + push) run.
     PushProgress { session: u32, text: String },
+    /// A `!`/`!!` shell escape finished.
+    ShellDone {
+        session: u32,
+        command: String,
+        ok: bool,
+        output: String,
+        send_to_agent: bool,
+    },
+    /// A local session's history tree (for the `/tree` overlay).
+    TreeLoaded {
+        oc_sid: String,
+        tree: crate::tree::SessionTree,
+    },
     /// A `/push` finished; `ok=false` carries the error message.
     PushDone {
         session: u32,

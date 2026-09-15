@@ -135,9 +135,69 @@ pub fn render(f: &mut ratatui::Frame, app: &mut App, area: Rect, sid: u32, focus
         }
     }
 
+    // `@file` mention popup above the input.
+    if focused {
+        if let Some(s) = app.session(sid) {
+            if !s.mention_results.is_empty() {
+                render_mention_popup(f, &s.mention_results, s.mention_selected, input_area);
+            }
+        }
+    }
+
     if input_area.height > 0 {
         let sess = app.session(sid).unwrap();
         render_input(f, app, sess, input_area, focused, allow_cursor);
+    }
+}
+
+fn render_mention_popup(
+    f: &mut ratatui::Frame,
+    results: &[String],
+    selected: usize,
+    input_area: Rect,
+) {
+    if input_area.width < 18 || input_area.y == 0 {
+        return;
+    }
+    let bg = Style::default().bg(pal().bg_float);
+    let visible = (input_area.y as usize).min(8).min(results.len());
+    if visible == 0 {
+        return;
+    }
+    let offset = if results.len() <= visible {
+        0
+    } else {
+        selected
+            .saturating_sub(visible / 2)
+            .min(results.len() - visible)
+    };
+    let y = input_area.y.saturating_sub(visible as u16);
+    let w = input_area.width as usize;
+    for (row, i) in (offset..offset + visible).enumerate() {
+        let Some(path) = results.get(i) else { continue };
+        let is_sel = i == selected;
+        let mut spans = vec![
+            Span::styled("▌".to_string(), Style::default().fg(pal().border_focus).bg(pal().bg_float)),
+            Span::styled("  @".to_string(), theme::fg(pal().cyan).patch(bg)),
+            Span::styled(
+                conversation::truncate(path, w.saturating_sub(8)),
+                if is_sel { theme::bold(pal().fg) } else { theme::fg(pal().fg_soft) },
+            )
+            .patch(bg),
+        ];
+        if is_sel {
+            for s in &mut spans {
+                s.style = s.style.bg(pal().selection);
+            }
+        }
+        let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+        if used < w {
+            spans.push(Span::styled(" ".repeat(w - used), bg));
+        }
+        f.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect { x: input_area.x, y: y + row as u16, width: input_area.width, height: 1 },
+        );
     }
 }
 
@@ -274,6 +334,10 @@ fn pane_title(sess: &SessionState, focused: bool, width: u16, tick: u64) -> Line
         SessStatus::Error(_) => ("✗".to_string(), theme::fg(pal().red)),
         SessStatus::Permission => ("!".to_string(), theme::fg(pal().yellow)),
         SessStatus::Question => ("?".to_string(), theme::fg(pal().purple)),
+        SessStatus::Compacting => (
+            theme::spin(tick).to_string(),
+            Style::default().fg(theme::spin_rgb(tick)),
+        ),
     };
     let name_style = if focused {
         theme::bold(pal().fg)

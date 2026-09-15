@@ -45,6 +45,7 @@ pub enum Overlay {
     SessionList,
     LayoutPicker,
     ResumeSession,
+    Tree,
 }
 
 // ---------------------------------------------------------------------------
@@ -76,6 +77,9 @@ pub enum SlashKind {
     Refresh,
     Push,
     Fork,
+    Tree,
+    Editor,
+    Export,
     Custom(String),
 }
 
@@ -110,6 +114,9 @@ fn builtin_slash_items() -> Vec<SlashItem> {
         SlashItem { name: "rename".into(), args: "[name]".into(), desc: "Rename this session".into(), kind: SlashKind::Rename },
         SlashItem { name: "quit".into(), args: "".into(), desc: "Quit Theta".into(), kind: SlashKind::Quit },
         SlashItem { name: "refresh".into(), args: "".into(), desc: "Reload the newest build in place".into(), kind: SlashKind::Refresh },
+        SlashItem { name: "tree".into(), args: "".into(), desc: "Jump to an earlier point (local backend)".into(), kind: SlashKind::Tree },
+        SlashItem { name: "editor".into(), args: "".into(), desc: "Compose the prompt in $EDITOR".into(), kind: SlashKind::Editor },
+        SlashItem { name: "export".into(), args: "[file]".into(), desc: "Export this session (Markdown/JSONL)".into(), kind: SlashKind::Export },
         SlashItem { name: "push".into(), args: "[message]".into(), desc: "Commit and push this project (session only)".into(), kind: SlashKind::Push },
         SlashItem { name: "fork".into(), args: "".into(), desc: "Fork this session into a new pane (instant, session only)".into(), kind: SlashKind::Fork },
     ]
@@ -219,6 +226,22 @@ pub struct ResumePickerState {
     pub selected: usize,
     pub req: Option<ReqId>,
     pub loaded: bool,
+}
+
+/// One row of the `/tree` history navigator.
+#[derive(Clone)]
+pub struct TreeRow {
+    pub id: String,
+    pub depth: usize,
+    pub label: String,
+    pub kind: crate::tree::EntryKind,
+    pub active: bool,
+}
+
+#[derive(Default)]
+pub struct TreeUi {
+    pub items: Vec<TreeRow>,
+    pub selected: usize,
 }
 
 pub struct FileSearchState {
@@ -336,6 +359,8 @@ pub enum Cmd {
     Palette,
     AgyModel,
     Refresh,
+    Tree,
+    Editor,
     SwapLeft,
     SwapRight,
     SwapUp,
@@ -366,6 +391,8 @@ pub fn all_commands() -> Vec<Command> {
         Command { label: "Swap Pane Down", hint: "", cmd: Cmd::SwapDown },
         Command { label: "Agy model (Gemini)", hint: "/agymodel", cmd: Cmd::AgyModel },
         Command { label: "Refresh (reload build)", hint: "/refresh", cmd: Cmd::Refresh },
+        Command { label: "History tree", hint: "/tree", cmd: Cmd::Tree },
+        Command { label: "Edit in $EDITOR", hint: "Ctrl+G", cmd: Cmd::Editor },
         Command { label: "Theme", hint: "/theme", cmd: Cmd::Theme },
         Command { label: "Keybindings", hint: "/keys", cmd: Cmd::Keymap },
         Command { label: "Switch Session", hint: "^O", cmd: Cmd::SwitchSession },
@@ -434,6 +461,10 @@ pub struct App {
     /// Selection in the busy-prompt dialog (0 queue, 1 new workspace).
     pub busy_choice: usize,
     pub resume_picker: ResumePickerState,
+    /// History tree navigator state (`/tree`).
+    pub tree_ui: TreeUi,
+    /// Set when the TUI should suspend and open `$EDITOR` for a prompt.
+    pub pending_editor: Option<(u32, String)>,
     pub keys: crate::keys::Keymap,
     pub keymap_ui: KeymapUi,
     pub theme_ui: ThemeUi,
@@ -533,6 +564,8 @@ impl App {
             layout_picker: LayoutPickerState::default(),
             busy_choice: 0,
             resume_picker: ResumePickerState::default(),
+            tree_ui: TreeUi::default(),
+            pending_editor: None,
             keys: crate::keys::Keymap::load(&key_overrides),
             session_cache: HashMap::new(),
             known_dirs: BTreeSet::new(),
@@ -576,6 +609,14 @@ impl App {
 
     pub fn working_count(&self) -> usize {
         self.sessions.iter().filter(|s| s.status.is_busy()).count()
+    }
+
+    /// Sessions currently summarizing their context.
+    pub fn compacting_count(&self) -> usize {
+        self.sessions
+            .iter()
+            .filter(|s| s.status == SessStatus::Compacting)
+            .count()
     }
 
     /// Sessions doing anything at all (working, connecting, or waiting on a
@@ -749,14 +790,29 @@ impl App {
     }
 
     pub fn submit_input(&mut self, id: u32) {
+        // `!cmd` runs a shell command and sends its output to the agent;
+        // `!!cmd` runs it without sending. Works even before connecting.
+        if let Some(s) = self.session(id) {
+            if let Some((send, cmd)) = parse_shell_line(s.input.text()) {
+                let limit = self.cfg.ui.history_limit;
+                let entry = format!("{}{}", if send { "!" } else { "!!" }, cmd);
+                if let Some(sm) = self.session_mut(id) {
+                    sm.input.take();
+                    sm.input.push_history(&entry, limit);
+                }
+                self.run_shell(id, cmd, send);
+                return;
+            }
+        }
         let limit = self.cfg.ui.history_limit;
-        let (text, dir, oc_sid, model, agent, agy) = {
+        let (text, dir, oc_sid, model, agent, agy, expanded, attachments) = {
             let Some(s) = self.session_mut(id) else { return };
             if s.oc_sid.is_none() {
                 self.flash("session is still connecting…");
                 return;
             }
             let text = s.input.take();
+            s.mention_results.clear();
             if text.is_empty() {
                 return;
             }
@@ -780,6 +836,11 @@ impl App {
                 self.dirty = true;
                 return;
             }
+            // Expand collapsed pastes and gather @file + pasted attachments.
+            let expanded = crate::paste::expand(&text, &s.paste_parts);
+            let mut attachments = Self::attachments_for(&s.dir, &expanded);
+            attachments.extend(crate::paste::attachments(&text, &s.paste_parts));
+            s.paste_parts.clear();
             s.last_send = Some((
                 std::time::Instant::now(),
                 text.clone(),
@@ -800,14 +861,250 @@ impl App {
                 s.model.clone(),
                 s.agent.clone(),
                 s.agy_model.clone(),
+                expanded,
+                attachments,
             )
         };
         self.start_task(id, &text);
         if let Some(agy_model) = agy {
-            self.spawn_agy_run(id, dir, text, agy_model);
+            self.spawn_agy_run(id, dir, expanded, agy_model);
         } else {
-            self.manager.send_prompt(dir, oc_sid, text, model, agent);
+            self.manager
+                .send_prompt(dir, oc_sid, expanded, model, agent, attachments);
         }
+    }
+
+    /// Run a `!`/`!!` shell escape in the session's directory.
+    fn run_shell(&mut self, id: u32, command: String, send_to_agent: bool) {
+        let Some(dir) = self.session(id).map(|s| s.dir.clone()) else {
+            return;
+        };
+        let tx = self.manager_tx();
+        let cmd = command.clone();
+        // Show the command immediately; output arrives via `ShellDone`.
+        if let Some(s) = self.session_mut(id) {
+            s.push_local_user(&format!("$ {cmd}"));
+            s.status = SessStatus::Working;
+            s.stick_bottom = true;
+            s.dirty = true;
+        }
+        tokio::spawn(async move {
+            let out = tokio::process::Command::new("bash")
+                .arg("-lc")
+                .arg(&cmd)
+                .current_dir(&dir)
+                .output()
+                .await;
+            let (ok, body) = match out {
+                Ok(o) => {
+                    let mut b = String::from_utf8_lossy(&o.stdout).to_string();
+                    let e = String::from_utf8_lossy(&o.stderr);
+                    if !e.trim().is_empty() {
+                        b.push_str("\n[stderr]\n");
+                        b.push_str(&e);
+                    }
+                    (o.status.success(), b)
+                }
+                Err(e) => (false, format!("spawn failed: {e}")),
+            };
+            let mut body = body;
+            if body.len() > 100 * 1024 {
+                body.truncate(100 * 1024);
+                body.push_str("\n… [truncated]");
+            }
+            let _ = tx.send(AppEvent::ShellDone {
+                session: id,
+                command: cmd,
+                ok,
+                output: body,
+                send_to_agent,
+            });
+        });
+    }
+
+    /// Resolve `@file` mentions in `text` against `dir`.
+    pub fn attachments_for(dir: &Path, text: &str) -> Vec<crate::mentions::Attachment> {
+        crate::mentions::to_attachments(&crate::mentions::extract(text, dir))
+    }
+
+    /// Insert clipboard text into the active modal field and refresh any
+    /// search driven by that field. Returns true when a modal consumed the
+    /// paste, even if the modal has no text field.
+    fn apply_overlay_paste(&mut self, raw: &str) -> bool {
+        if !self.insert_overlay_text(raw) {
+            return false;
+        }
+        match self.overlay {
+            Overlay::FileSearch => self.run_file_search(),
+            Overlay::ProjectSearch => self.run_project_search(),
+            Overlay::ConvSearch => self.update_conv_matches(),
+            _ => {}
+        }
+        self.dirty = true;
+        true
+    }
+
+    /// Insert bracketed-paste text into the active modal field, if any.
+    /// Returns true when the paste was consumed (including when a modal has no
+    /// text field, so background chat never receives modal-window pastes).
+    fn insert_overlay_text(&mut self, raw: &str) -> bool {
+        let text = raw.replace("\r\n", "\n").replace('\r', "\n");
+        match self.overlay {
+            Overlay::None => false,
+            Overlay::Palette => {
+                self.palette.input.insert(&text.replace('\n', " "));
+                true
+            }
+            Overlay::Rename => {
+                self.rename.input.insert(&text.replace('\n', " "));
+                true
+            }
+            Overlay::ModelPicker => {
+                self.model_picker.input.insert(&text.replace('\n', " "));
+                true
+            }
+            Overlay::AgentPicker => {
+                self.agent_picker.input.insert(&text.replace('\n', " "));
+                true
+            }
+            Overlay::FileSearch => {
+                self.file_search.input.insert(&text.replace('\n', " "));
+                true
+            }
+            Overlay::ProjectSearch => {
+                self.proj_search.input.insert(&text.replace('\n', " "));
+                true
+            }
+            Overlay::ConvSearch => {
+                self.conv_search.input.insert(&text.replace('\n', " "));
+                true
+            }
+            Overlay::NewSession => match self.newdlg.field {
+                0 => {
+                    self.newdlg.name.insert(&text.replace('\n', " "));
+                    true
+                }
+                1 => {
+                    let path = text.replace('\n', "").trim().to_string();
+                    if !path.is_empty() {
+                        self.newdlg.dir.push_str(&path);
+                    }
+                    true
+                }
+                _ => true,
+            },
+            Overlay::Question => {
+                let sid = self.focus;
+                if let Some(s) = self.session_mut(sid) {
+                    if let Some(pq) = s.pending_question.as_mut() {
+                        let custom = pq.current().map(|q| q.custom).unwrap_or(false);
+                        if custom {
+                            pq.custom.push_str(&text);
+                            s.dirty = true;
+                        }
+                    }
+                }
+                true
+            }
+            _ => true,
+        }
+    }
+
+    /// Insert pasted text, collapsing long pastes into a placeholder.
+    fn add_paste_text(&mut self, id: u32, text: &str) {
+        let Some(s) = self.session_mut(id) else { return };
+        if crate::paste::is_long(text) {
+            let ph = crate::paste::text_placeholder(text);
+            s.paste_parts.push(crate::paste::PastePart {
+                placeholder: ph.clone(),
+                content: crate::paste::PasteContent::Text(text.to_string()),
+            });
+            s.input.insert(&ph);
+        } else {
+            s.input.insert(text);
+        }
+        s.dirty = true;
+        self.dirty = true;
+    }
+
+    /// Insert a pasted image/file as an attachment placeholder.
+    fn add_paste_image(&mut self, id: u32, mime: String, bytes: Vec<u8>) {
+        let Some(s) = self.session_mut(id) else { return };
+        s.paste_seq += 1;
+        let n = s.paste_seq;
+        let ph = crate::paste::file_placeholder(n as usize, &mime);
+        let ext = mime.rsplit('/').next().unwrap_or("bin").to_string();
+        let filename = format!("clipboard-{n}.{ext}");
+        let url = crate::paste::data_url(&mime, &bytes);
+        s.paste_parts.push(crate::paste::PastePart {
+            placeholder: ph.clone(),
+            content: crate::paste::PasteContent::File { mime, filename, url },
+        });
+        s.input.insert(&format!("{ph} "));
+        s.dirty = true;
+        self.dirty = true;
+    }
+
+    /// Read the system clipboard (Ctrl+V) and paste text or an image.
+    /// Modal dialogs take precedence over the background chat box. Image/file
+    /// clipboard content is only supported in an open session prompt.
+    async fn paste_from_clipboard(&mut self) {
+        if self.viewer.is_some() || self.diff.is_some() {
+            self.flash("Close the viewer to paste");
+            self.dirty = true;
+            return;
+        }
+        let data = tokio::task::spawn_blocking(crate::paste::read_clipboard)
+            .await
+            .ok()
+            .flatten();
+        match data {
+            Some(crate::paste::Clipboard::Text(t)) => {
+                if self.apply_overlay_paste(&t) {
+                    return;
+                }
+                let Some(id) = self.focused().map(|s| s.id) else {
+                    return;
+                };
+                self.add_paste_text(id, &t);
+            }
+            Some(crate::paste::Clipboard::Image { mime, bytes }) => {
+                if self.overlay != Overlay::None {
+                    self.flash("Images can only be pasted into an open chat prompt");
+                    self.dirty = true;
+                    return;
+                }
+                let Some(id) = self.focused().map(|s| s.id) else {
+                    return;
+                };
+                self.add_paste_image(id, mime, bytes);
+            }
+            None => self.flash("clipboard empty or unavailable"),
+        }
+    }
+
+    /// Refresh the `@file` suggestion list for the focused session.
+    async fn refresh_mentions(&mut self, id: u32) {
+        let (dir, text) = match self.session(id) {
+            Some(s) => (s.dir.clone(), s.input.buf.clone()),
+            None => return,
+        };
+        let query = crate::mentions::active_query(&text).map(|(_, q)| q);
+        let results = match query {
+            Some(q) if !q.is_empty() => {
+                let dir2 = dir.clone();
+                tokio::task::spawn_blocking(move || crate::fsx::find_files(&dir2, &q, 30))
+                    .await
+                    .unwrap_or_default()
+            }
+            _ => Vec::new(),
+        };
+        if let Some(s) = self.session_mut(id) {
+            s.mention_results = results;
+            s.mention_selected = 0;
+            s.dirty = true;
+        }
+        self.dirty = true;
     }
 
     /// Fire a prompt into a connected session (submit path and queue drain).
@@ -836,8 +1133,9 @@ impl App {
             // Gemini via the agy CLI — not the OpenCode provider.
             self.spawn_agy_run(id, dir, text.to_string(), agy_model);
         } else {
+            let attachments = Self::attachments_for(&dir, text);
             self.manager
-                .send_prompt(dir, oc_sid, text.to_string(), model, agent);
+                .send_prompt(dir, oc_sid, text.to_string(), model, agent, attachments);
         }
     }
 
@@ -2176,6 +2474,9 @@ impl App {
             }
             "agymodel" => self.open_agy_model_picker(),
             "refresh" => self.request_refresh(),
+            "tree" => self.open_tree(),
+            "editor" => self.open_editor(),
+            "export" => self.export_session(if args.is_empty() { None } else { Some(args) }),
             "push" => self.start_push(sid, args),
             "fork" => self.fork_active(),
             "theme" => self.open_theme_picker(),
@@ -2221,12 +2522,21 @@ impl App {
             TermEvent::Key(k) => self.handle_key(k).await,
             TermEvent::Mouse(m) => self.handle_mouse(m),
             TermEvent::Resize(_, _) => self.dirty = true,
-            TermEvent::Paste(text) => {
-                // Bracketed paste arrives as one event; keep newlines intact
-                // so nothing is submitted mid-paste.
-                let text = text.replace("\r\n", "\n").replace('\r', "\n");
-                if let Some(s) = self.focused_mut() {
-                    s.input.insert(&text);
+            TermEvent::Paste(raw) => {
+                if self.viewer.is_some() || self.diff.is_some() {
+                    // A full-screen viewer is on top; do not paste into the
+                    // session underneath it.
+                    self.dirty = true;
+                    return;
+                }
+                if self.apply_overlay_paste(&raw) {
+                    return;
+                }
+                // Keep newlines intact so nothing is submitted mid-paste, and
+                // collapse long pastes.
+                let text = raw.replace("\r\n", "\n").replace('\r', "\n");
+                if let Some(id) = self.focused().map(|s| s.id) {
+                    self.add_paste_text(id, &text);
                 }
                 self.dirty = true;
             }
@@ -2467,6 +2777,12 @@ impl App {
             self.execute(Cmd::Quit).await;
             return;
         }
+        if ctrl && key.code == KeyCode::Char('v') {
+            // Clipboard paste belongs to the active surface: modal field,
+            // viewer guard, or focused chat box.
+            self.paste_from_clipboard().await;
+            return;
+        }
 
         if self.overlay != Overlay::None {
             self.handle_overlay_key(key).await;
@@ -2529,6 +2845,7 @@ impl App {
                 Action::FocusNext => Cmd::FocusNext,
                 Action::FocusPrev => Cmd::FocusPrev,
                 Action::Keymap => Cmd::Keymap,
+                Action::Editor => Cmd::Editor,
                 Action::FocusLeft
                 | Action::FocusRight
                 | Action::FocusUp
@@ -2645,6 +2962,12 @@ impl App {
         let busy = sess.status.is_busy();
         let interrupt_armed = sess.interrupt_armed.is_some();
 /* borrow ends here */
+
+        // Ctrl+V pastes from the system clipboard (text or an image).
+        if ctrl && key.code == KeyCode::Char('v') {
+            self.paste_from_clipboard().await;
+            return;
+        }
 
         // Esc twice interrupts a busy agent. The first press arms it and the
         // footer shows a hint next to the cost readout.
@@ -2777,6 +3100,55 @@ impl App {
                     if let Some(path) = target {
                         self.open_file_viewer(&path, None);
                     }
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // `@file` mention popup: navigate, complete, or dismiss.
+        let mention_active = self
+            .focused()
+            .map(|s| !s.mention_results.is_empty())
+            .unwrap_or(false);
+        if mention_active {
+            match key.code {
+                KeyCode::Up => {
+                    if let Some(s) = self.session_mut(sid) {
+                        s.mention_selected = s.mention_selected.saturating_sub(1);
+                    }
+                    self.dirty = true;
+                    return;
+                }
+                KeyCode::Down => {
+                    if let Some(s) = self.session_mut(sid) {
+                        let n = s.mention_results.len();
+                        if n > 0 {
+                            s.mention_selected = (s.mention_selected + 1).min(n - 1);
+                        }
+                    }
+                    self.dirty = true;
+                    return;
+                }
+                KeyCode::Tab | KeyCode::Enter => {
+                    if let Some(s) = self.session_mut(sid) {
+                        if let Some(label) = s.mention_results.get(s.mention_selected).cloned() {
+                            let completed = crate::mentions::complete(&s.input.buf, &label);
+                            s.input.buf = completed;
+                            s.input.cursor = s.input.buf.chars().count();
+                            s.mention_results.clear();
+                            s.dirty = true;
+                        }
+                    }
+                    self.dirty = true;
+                    return;
+                }
+                KeyCode::Esc => {
+                    if let Some(s) = self.session_mut(sid) {
+                        s.mention_results.clear();
+                        s.dirty = true;
+                    }
+                    self.dirty = true;
                     return;
                 }
                 _ => {}
@@ -2987,6 +3359,116 @@ impl App {
         self.dirty = true;
     }
 
+    /// Request composing the focused prompt in `$EDITOR` (handled by main).
+    pub fn open_editor(&mut self) {
+        let Some(s) = self.focused() else { return };
+        let text = s.input.buf.clone();
+        self.pending_editor = Some((s.id, text));
+    }
+
+    /// Take a pending editor request (called by the event loop).
+    pub fn take_pending_editor(&mut self) -> Option<(u32, String)> {
+        self.pending_editor.take()
+    }
+
+    /// Replace a session's input with `text` (after the editor returns).
+    pub fn set_input(&mut self, id: u32, text: String) {
+        if let Some(s) = self.session_mut(id) {
+            s.input.buf = text;
+            s.input.cursor = s.input.buf.chars().count();
+            s.dirty = true;
+        }
+        self.dirty = true;
+    }
+
+    /// Export the focused session transcript to `path` (Markdown, or JSONL when
+    /// the path ends in `.jsonl`).
+    pub fn export_session(&mut self, path: Option<&str>) {
+        let Some(s) = self.focused() else {
+            self.flash("no session");
+            return;
+        };
+        let name = s.name.clone();
+        let msgs = s.messages.clone();
+        let dir = s.dir.clone();
+        if msgs.is_empty() {
+            self.flash("nothing to export");
+            return;
+        }
+        let jsonl = path.map(|p| p.ends_with(".jsonl")).unwrap_or(false);
+        let target = match path {
+            Some(p) if p.trim().is_empty() => dir.join(crate::export::default_filename(&name, jsonl)),
+            Some(p) => std::path::PathBuf::from(p),
+            None => dir.join(crate::export::default_filename(&name, false)),
+        };
+        let body = if jsonl {
+            crate::export::jsonl(&msgs)
+        } else {
+            crate::export::markdown(&msgs)
+        };
+        match std::fs::write(&target, body) {
+            Ok(()) => self.flash(format!("exported → {}", target.display())),
+            Err(e) => self.flash(format!("export failed: {e}")),
+        }
+    }
+
+    /// Open the history-tree navigator for the focused (local) session.
+    pub fn open_tree(&mut self) {
+        let Some(s) = self.focused() else { return };
+        let Some(oc) = s.oc_sid.clone() else {
+            self.flash("session is still connecting…");
+            return;
+        };
+        self.manager.local_tree(oc);
+    }
+
+    /// Flatten a session tree into indented rows (depth-first).
+    fn tree_rows(tree: &crate::tree::SessionTree) -> Vec<TreeRow> {
+        use std::collections::HashSet;
+        let active: HashSet<String> = tree.active_path().iter().map(|e| e.id.clone()).collect();
+        fn label(e: &crate::tree::Entry) -> String {
+            let t: String = e.text.lines().next().unwrap_or("").chars().take(48).collect();
+            match e.kind {
+                crate::tree::EntryKind::User => format!("you: {t}"),
+                crate::tree::EntryKind::Assistant => format!("ai: {t}"),
+                crate::tree::EntryKind::Tool => format!("tool: {t}"),
+                crate::tree::EntryKind::System => format!("sys: {t}"),
+                crate::tree::EntryKind::Compaction => format!("⊟ summary ({t})"),
+                crate::tree::EntryKind::BranchSummary => format!("↳ branch ({t})"),
+            }
+        }
+        let mut rows = Vec::new();
+        fn walk(
+            tree: &crate::tree::SessionTree,
+            parent: &str,
+            depth: usize,
+            active: &HashSet<String>,
+            rows: &mut Vec<TreeRow>,
+        ) {
+            for e in tree.children(parent) {
+                rows.push(TreeRow {
+                    id: e.id.clone(),
+                    depth,
+                    label: label(e),
+                    kind: e.kind,
+                    active: active.contains(&e.id),
+                });
+                walk(tree, &e.id, depth + 1, active, rows);
+            }
+        }
+        for r in tree.roots() {
+            rows.push(TreeRow {
+                id: r.id.clone(),
+                depth: 0,
+                label: label(r),
+                kind: r.kind,
+                active: active.contains(&r.id),
+            });
+            walk(tree, &r.id, 1, &active, &mut rows);
+        }
+        rows
+    }
+
     pub fn open_resume_picker(&mut self) {
         let dir = self
             .focused()
@@ -3107,7 +3589,10 @@ impl App {
             }
             _ => {}
         }
+        let sid = s.id;
         self.dirty = true;
+        // Keep the `@file` suggestion list in sync with the input word.
+        self.refresh_mentions(sid).await;
     }
 
     fn handle_viewer_key(&mut self, key: KeyEvent) {
@@ -3821,6 +4306,29 @@ impl App {
                     _ => {}
                 }
             }
+            Overlay::Tree => {
+                let n = self.tree_ui.items.len();
+                match key.code {
+                    KeyCode::Esc => self.overlay = Overlay::None,
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.tree_ui.selected = self.tree_ui.selected.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if n > 0 {
+                            self.tree_ui.selected = (self.tree_ui.selected + 1).min(n - 1);
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if let Some(row) = self.tree_ui.items.get(self.tree_ui.selected).cloned() {
+                            if let Some(oc) = self.focused().and_then(|s| s.oc_sid.clone()) {
+                                self.manager.local_navigate(oc, row.id);
+                            }
+                        }
+                        self.overlay = Overlay::None;
+                    }
+                    _ => {}
+                }
+            }
             Overlay::None => {}
         }
         self.dirty = true;
@@ -3919,6 +4427,8 @@ impl App {
             Cmd::Keymap => self.open_keymap(),
             Cmd::AgyModel => self.open_agy_model_picker(),
             Cmd::Refresh => self.request_refresh(),
+            Cmd::Tree => self.open_tree(),
+            Cmd::Editor => self.open_editor(),
             Cmd::Theme => self.open_theme_picker(),
             // Ctrl+O switches directly to the next session — no picker.
             Cmd::SwitchSession => self.focus_next(),
@@ -4312,6 +4822,55 @@ impl App {
             AppEvent::CommandsListed { commands, .. } => {
                 self.custom_commands = commands;
             }
+            AppEvent::ShellDone {
+                session: id,
+                command,
+                ok,
+                output,
+                send_to_agent,
+            } => {
+                if let Some(s) = self.session_mut(id) {
+                    let header = format!("▌ shell · $ {command}\n\n");
+                    let msg = crate::harness::transcript::Message {
+                        id: format!("shell-{}", s.optimistic_seq()),
+                        role: crate::harness::transcript::Role::Assistant,
+                        error: if ok { None } else { Some("command failed".into()) },
+                        completed: Some(1),
+                        created: None,
+                        cost: None,
+                        tokens: None,
+                        parts: vec![crate::harness::transcript::Part {
+                            id: format!("shell-{}-out", s.optimistic_seq()),
+                            message_id: format!("shell-{command}"),
+                            kind: crate::harness::transcript::PartKind::Text {
+                                text: format!("{header}{output}"),
+                                synthetic: false,
+                            },
+                        }],
+                    };
+                    s.messages.push(msg);
+                    s.status = SessStatus::Idle;
+                    s.dirty = true;
+                } else {
+                    return;
+                }
+                if send_to_agent && !output.trim().is_empty() {
+                    self.send_text_now(id, &output);
+                }
+                self.dirty = true;
+            }
+            AppEvent::TreeLoaded { oc_sid, tree } => {
+                let _ = oc_sid;
+                let rows = Self::tree_rows(&tree);
+                if rows.is_empty() {
+                    self.flash("no history recorded yet");
+                } else {
+                    let active = rows.iter().position(|r| r.active).unwrap_or(0);
+                    self.tree_ui.items = rows;
+                    self.tree_ui.selected = active;
+                    self.overlay = Overlay::Tree;
+                }
+            }
             AppEvent::OpResult { ok, message } => {
                 self.flash(message);
                 let _ = ok;
@@ -4563,6 +5122,9 @@ impl App {
                     if self.notifications.should_notify() {
                         let name = self.sessions[idx].name.clone();
                         self.flash(format!("{name}: agent finished"));
+                        if self.cfg.behavior.notify {
+                            notify_desktop("Theta", &format!("{name}: agent finished"));
+                        }
                     } else {
                         crate::tlog!(
                             "notification debounced ({} grouped)",
@@ -4570,6 +5132,18 @@ impl App {
                         );
                     }
                 }
+            }
+            HarnessEvent::CompactionStarted => {
+                let s = &mut self.sessions[idx];
+                s.status = SessStatus::Compacting;
+                s.dirty = true;
+            }
+            HarnessEvent::CompactionFinished { .. } => {
+                let s = &mut self.sessions[idx];
+                if s.status == SessStatus::Compacting {
+                    s.status = SessStatus::Working;
+                }
+                s.dirty = true;
             }
             HarnessEvent::ProviderError(msg) => {
                 let s = &mut self.sessions[idx];
@@ -4594,9 +5168,12 @@ impl App {
     /// working directory and the provider session id, so events never leak
     /// between projects or panes.
     fn route_session(sessions: &[SessionState], dir: &Path, oc_sid: &str) -> Option<usize> {
-        sessions
-            .iter()
-            .position(|s| s.dir == dir && s.oc_sid.as_deref() == Some(oc_sid))
+        // An empty directory acts as a wildcard: in-process backends (the local
+        // loop) emit events without a workspace, and the session id is enough.
+        let wildcard = dir.as_os_str().is_empty();
+        sessions.iter().position(|s| {
+            (wildcard || s.dir == dir) && s.oc_sid.as_deref() == Some(oc_sid)
+        })
     }
 
     fn finish_task(&mut self, idx: usize, status: TaskStatus) {
@@ -4873,4 +5450,97 @@ mod harness_tests {
         assert_eq!(App::route_session(&sessions, Path::new("/projA"), "b1"), None);
         assert_eq!(App::route_session(&sessions, Path::new("/projC"), "a1"), None);
     }
+
+    fn paste_test_app() -> App {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cfg = Config::default();
+        let manager = Manager::new(tx, cfg.clone());
+        App::new(cfg, manager, PathBuf::from("/tmp"))
+    }
+
+    #[tokio::test]
+    async fn terminal_paste_targets_new_session_directory() {
+        let mut app = paste_test_app();
+        app.overlay = Overlay::NewSession;
+        app.newdlg.field = 1;
+        app.newdlg.dir = String::from("/home/bhanu/");
+
+        app.handle_term_event(TermEvent::Paste("/tmp/pasted path/\n".into()))
+            .await;
+
+        assert_eq!(app.newdlg.dir, "/home/bhanu//tmp/pasted path/");
+        assert!(app.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn terminal_paste_collapses_new_session_name_line_breaks() {
+        let mut app = paste_test_app();
+        app.overlay = Overlay::NewSession;
+        app.newdlg.field = 0;
+
+        app.handle_term_event(TermEvent::Paste("New\nSession".into()))
+            .await;
+
+        assert_eq!(app.newdlg.name.text(), "New Session");
+        assert!(app.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn terminal_paste_does_not_leak_into_background_chat() {
+        let mut app = paste_test_app();
+        app.sessions.push(SessionState::new(
+            10,
+            "background".into(),
+            PathBuf::from("/tmp"),
+        ));
+        app.focus = 10;
+        app.overlay = Overlay::BusyChoice;
+
+        app.handle_term_event(TermEvent::Paste("leftover".into())).await;
+
+        assert_eq!(app.session(10).expect("session").input.text(), "");
+    }
+}
+
+/// Parse a `!cmd` / `!!cmd` shell escape line. Returns `(send_to_agent, cmd)`.
+pub fn parse_shell_line(text: &str) -> Option<(bool, String)> {
+    let t = text.trim_start();
+    if let Some(rest) = t.strip_prefix("!!") {
+        let cmd = rest.trim();
+        return (!cmd.is_empty()).then(|| (false, cmd.to_string()));
+    }
+    if let Some(rest) = t.strip_prefix('!') {
+        let cmd = rest.trim();
+        return (!cmd.is_empty()).then(|| (true, cmd.to_string()));
+    }
+    None
+}
+
+#[cfg(test)]
+mod shell_tests {
+    use super::parse_shell_line;
+
+    #[test]
+    fn parses_bang_and_double_bang() {
+        assert_eq!(parse_shell_line("!ls -la"), Some((true, "ls -la".into())));
+        assert_eq!(parse_shell_line("!!git status"), Some((false, "git status".into())));
+        assert_eq!(parse_shell_line("  !pwd"), Some((true, "pwd".into())));
+        assert_eq!(parse_shell_line("hello"), None);
+        assert_eq!(parse_shell_line("!"), None);
+        assert_eq!(parse_shell_line("!!"), None);
+    }
+}
+
+/// Ring the terminal bell and best-effort send a desktop notification.
+fn notify_desktop(title: &str, body: &str) {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = out.write_all(b"\x07");
+    let _ = out.flush();
+    let _ = std::process::Command::new("notify-send")
+        .arg(title)
+        .arg(body)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }

@@ -5,10 +5,12 @@
 use crate::config::Config;
 use crate::events::{AppEvent, ReqId};
 use crate::opencode::{Client, GrepMatch, ModelRef};
+use crate::providers::local::LocalProvider;
 use crate::providers::opencode::OpenCodeProvider;
-use crate::providers::{AgentProvider, ModelId, ProviderSession, SessionConfig};
+use crate::providers::{
+    AgentProvider, ModelId, ProviderError, ProviderKind, ProviderSession, SessionConfig,
+};
 use anyhow::Result;
-use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -44,6 +46,8 @@ struct ManagerRef {
     cfg: Config,
     inner: Arc<Mutex<Inner>>,
     children: Arc<Mutex<Vec<u32>>>,
+    /// Present when `cfg.backend == "local"`: the in-process agent backend.
+    local: Option<Arc<LocalProvider>>,
 }
 
 impl ManagerRef {
@@ -91,14 +95,14 @@ impl ManagerRef {
         }
         let client = Client::new(base.clone());
 
-        // SSE pump: forwards bus events for this directory to the app.
-        let sse_tx = self.tx.clone();
-        let sse_dir = dir.clone();
-        let sse_client = client.clone();
-        let sse_base = base.clone();
-        tokio::spawn(async move {
-            sse_loop(sse_client, sse_base, sse_dir, sse_tx).await;
-        });
+        // Event delivery is part of the provider contract: each adapter owns
+        // its native event pump and yields neutral routed events. The manager
+        // only supervises reconnects and converts them into `AppEvent`s.
+        spawn_event_pump(
+            OpenCodeProvider::new(client.clone(), dir.to_string_lossy().to_string()),
+            dir.clone(),
+            self.tx.clone(),
+        );
 
         let mut inner = self.inner.lock().await;
         inner.servers.insert(
@@ -120,14 +124,52 @@ pub struct Manager {
 
 impl Manager {
     pub fn new(tx: tokio::sync::mpsc::UnboundedSender<AppEvent>, cfg: Config) -> Self {
+        let local = if cfg.backend == "local" {
+            match build_local_provider(&cfg) {
+                Ok(provider) => {
+                    let local = Arc::new(provider);
+                    // Local events carry no workspace; routing is by session id
+                    // (an empty dir is a wildcard in `App::route_session`).
+                    spawn_event_pump(local.clone(), PathBuf::new(), tx.clone());
+                    crate::tlog!("BACKEND local provider ready (model={})", cfg.ai.model);
+                    Some(local)
+                }
+                Err(e) => {
+                    crate::tlog!("BACKEND local init failed: {e}; falling back to opencode");
+                    eprintln!("theta: local backend unavailable ({e}); using opencode");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         Self {
             ref_: ManagerRef {
                 tx,
                 cfg,
                 inner: Arc::new(Mutex::new(Inner::default())),
                 children: Arc::new(Mutex::new(Vec::new())),
+                local,
             },
             req_seq: AtomicU64::new(1),
+        }
+    }
+
+    /// True when the configured backend is Theta's own loop.
+    pub fn is_local(&self) -> bool {
+        self.ref_.local.is_some()
+    }
+
+    /// Guard for server-only operations under the local backend.
+    fn local_unsupported(&self, what: &str) -> bool {
+        if self.ref_.local.is_some() {
+            self.ref_.emit(AppEvent::OpResult {
+                ok: false,
+                message: format!("{what} is not supported by the local backend yet"),
+            });
+            true
+        } else {
+            false
         }
     }
 
@@ -167,6 +209,44 @@ impl Manager {
         self.ref_.tx.clone()
     }
 
+    /// Request a local session's history tree (emits `TreeLoaded`).
+    pub fn local_tree(&self, oc_sid: String) {
+        let Some(local) = self.ref_.local.clone() else {
+            self.ref_.emit(AppEvent::OpResult {
+                ok: false,
+                message: "tree view needs backend = \"local\"".into(),
+            });
+            return;
+        };
+        match local.tree_snapshot(&oc_sid) {
+            Some(tree) => self.ref_.emit(AppEvent::TreeLoaded { oc_sid, tree }),
+            None => self.ref_.emit(AppEvent::OpResult {
+                ok: false,
+                message: "no local session for this pane".into(),
+            }),
+        }
+    }
+
+    /// Navigate a local session to an earlier history entry (summarizing the
+    /// abandoned branch with the model first).
+    pub fn local_navigate(&self, oc_sid: String, entry: String) {
+        let Some(local) = self.ref_.local.clone() else {
+            return;
+        };
+        let m = self.ref_.clone();
+        tokio::spawn(async move {
+            let ok = local.navigate_auto(&oc_sid, &entry).await;
+            m.emit(AppEvent::OpResult {
+                ok,
+                message: if ok {
+                    "jumped · branch summarized".into()
+                } else {
+                    "entry not found".into()
+                },
+            });
+        });
+    }
+
     pub fn next_req(&self) -> ReqId {
         self.req_seq.fetch_add(1, Ordering::Relaxed)
     }
@@ -181,6 +261,58 @@ impl Manager {
         model: Option<ModelRef>,
         history_limit: u32,
     ) {
+        if let Some(local) = self.ref_.local.clone() {
+            let m = self.ref_.clone();
+            tokio::spawn(async move {
+                let dir_c = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+                let dir_s = dir_c.to_string_lossy().to_string();
+                let session = match oc_sid.as_deref() {
+                    Some(sid) => match local.resume_session(sid).await {
+                        Ok(s) => s,
+                        Err(_) => local.register(&dir_s, &name),
+                    },
+                    None => local.register(&dir_s, &name),
+                };
+                m.emit(AppEvent::ServerReady {
+                    dir: dir_c.clone(),
+                    base: "local".into(),
+                });
+                m.emit(AppEvent::OcCreated {
+                    req,
+                    session: session.clone(),
+                });
+                // Model picker is fed from the built-in catalog.
+                let cat = crate::ai::catalog::Catalog::builtin();
+                let providers = cat
+                    .models()
+                    .iter()
+                    .map(|s| crate::opencode::ModelEntry {
+                        provider_id: s.provider.clone(),
+                        model_id: s.id.clone(),
+                        label: format!("{}/{}", s.provider, s.id),
+                        context_limit: Some(s.context_limit),
+                    })
+                    .collect();
+                let default = Some(ModelRef {
+                    provider_id: m.cfg.ai.provider.clone(),
+                    model_id: m.cfg.ai.model.clone(),
+                });
+                m.emit(AppEvent::ProvidersListed {
+                    dir: dir_c.clone(),
+                    providers,
+                    default,
+                });
+                m.emit(AppEvent::AgentsListed {
+                    dir: dir_c,
+                    agents: vec![crate::opencode::AgentInfo {
+                        name: "theta".into(),
+                        description: "Theta local agent".into(),
+                    }],
+                });
+                let _ = (history_limit, model);
+            });
+            return;
+        }
         let m = self.ref_.clone();
         tokio::spawn(async move {
             let dir_c = dir.canonicalize().unwrap_or_else(|_| dir.clone());
@@ -309,7 +441,39 @@ impl Manager {
         text: String,
         model: Option<ModelRef>,
         agent: Option<String>,
+        attachments: Vec<crate::mentions::Attachment>,
     ) {
+        if let Some(local) = self.ref_.local.clone() {
+            let m = self.ref_.clone();
+            tokio::spawn(async move {
+                let session = ProviderSession {
+                    provider: ProviderKind::Local,
+                    id: oc_sid.clone(),
+                    directory: dir.to_string_lossy().to_string(),
+                };
+                let model_id = model.map(|m| ModelId {
+                    provider: m.provider_id,
+                    model: m.model_id,
+                });
+                // Text-only backend: inline `@file` contents into the prompt.
+                let inlined = if attachments.is_empty() {
+                    text
+                } else {
+                    crate::mentions::inline_attachments(&text, &attachments, 20_000)
+                };
+                if let Err(e) = local
+                    .send_message(&session, &inlined, model_id, agent, &[])
+                    .await
+                {
+                    m.emit(AppEvent::SendFailed {
+                        dir,
+                        oc_sid,
+                        error: e.to_string(),
+                    });
+                }
+            });
+            return;
+        }
         let m = self.ref_.clone();
         tokio::spawn(async move {
             let Ok((_, client)) = m.ensure_server(&dir).await else {
@@ -335,7 +499,7 @@ impl Manager {
                 model: m.model_id,
             });
             match provider
-                .send_message(&session, &text, model_id, agent)
+                .send_message(&session, &text, model_id, agent, &attachments)
                 .await
             {
                 Ok(()) => crate::tlog!("PROMPT ok session={oc_sid}"),
@@ -352,6 +516,19 @@ impl Manager {
     }
 
     pub fn abort_session(&self, dir: PathBuf, oc_sid: String) {
+        if let Some(local) = self.ref_.local.clone() {
+            let m = self.ref_.clone();
+            tokio::spawn(async move {
+                let session = ProviderSession {
+                    provider: ProviderKind::Local,
+                    id: oc_sid.clone(),
+                    directory: dir.to_string_lossy().to_string(),
+                };
+                let _ = local.interrupt(&session).await;
+                m.emit(AppEvent::Aborted { dir, oc_sid });
+            });
+            return;
+        }
         let m = self.ref_.clone();
         tokio::spawn(async move {
             let Ok((_, client)) = m.ensure_server(&dir).await else {
@@ -371,6 +548,9 @@ impl Manager {
     }
 
     pub fn reply_permission(&self, dir: PathBuf, oc_sid: String, pid: String, response: String) {
+        if self.local_unsupported("permissions") {
+            return;
+        }
         let m = self.ref_.clone();
         tokio::spawn(async move {
             let Ok((_, client)) = m.ensure_server(&dir).await else {
@@ -381,6 +561,21 @@ impl Manager {
     }
 
     pub fn search_files(&self, req: ReqId, dir: PathBuf, query: String) {
+        if self.ref_.local.is_some() {
+            let m = self.ref_.clone();
+            tokio::spawn(async move {
+                let dir_c = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+                let q = query.to_lowercase();
+                let paths = crate::fsx::list_dir(&dir_c)
+                    .into_iter()
+                    .filter(|e| !e.is_dir && e.name.to_lowercase().contains(&q))
+                    .map(|e| e.path)
+                    .take(100)
+                    .collect();
+                m.emit(AppEvent::FilesFound { req, paths });
+            });
+            return;
+        }
         let m = self.ref_.clone();
         tokio::spawn(async move {
             let dir_c = dir.canonicalize().unwrap_or_else(|_| dir.clone());
@@ -403,6 +598,22 @@ impl Manager {
     }
 
     pub fn search_pattern(&self, req: ReqId, dir: PathBuf, pattern: String) {
+        if self.ref_.local.is_some() {
+            let m = self.ref_.clone();
+            tokio::spawn(async move {
+                let dir_c = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+                let pat = pattern.clone();
+                let matches: Vec<GrepMatch> =
+                    tokio::task::spawn_blocking(move || crate::fsx::search_local(&dir_c, &pat, 200))
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|mm| GrepMatch { path: mm.path, line: mm.line, text: mm.text })
+                        .collect();
+                m.emit(AppEvent::MatchesFound { req, matches });
+            });
+            return;
+        }
         let m = self.ref_.clone();
         tokio::spawn(async move {
             let dir_c = dir.canonicalize().unwrap_or_else(|_| dir.clone());
@@ -459,6 +670,13 @@ impl Manager {
         source: u32,
         at: Option<String>,
     ) {
+        if self.ref_.local.is_some() {
+            self.ref_.emit(AppEvent::OcForkFailed {
+                source,
+                error: "fork is not supported by the local backend yet".into(),
+            });
+            return;
+        }
         let m = self.ref_.clone();
         tokio::spawn(async move {
             let dir_c = dir.canonicalize().unwrap_or_else(|_| dir.clone());
@@ -492,6 +710,9 @@ impl Manager {
 
     /// Answer a pending agent question.
     pub fn reply_question(&self, dir: PathBuf, id: String, answers: Vec<Vec<String>>) {
+        if self.local_unsupported("questions") {
+            return;
+        }
         let m = self.ref_.clone();
         tokio::spawn(async move {
             let Ok((_, client)) = m.ensure_server(&dir).await else {
@@ -507,6 +728,9 @@ impl Manager {
 
     /// Reject a pending agent question.
     pub fn reject_question(&self, dir: PathBuf, id: String) {
+        if self.local_unsupported("questions") {
+            return;
+        }
         let m = self.ref_.clone();
         tokio::spawn(async move {
             let Ok((_, client)) = m.ensure_server(&dir).await else {
@@ -538,6 +762,14 @@ impl Manager {
 
     /// Recent sessions stored on the server for a directory (for /resume).
     pub fn list_server_sessions(&self, req: ReqId, dir: PathBuf) {
+        if self.ref_.local.is_some() {
+            self.ref_.emit(AppEvent::ServerSessionsListed {
+                req,
+                dir,
+                sessions: Vec::new(),
+            });
+            return;
+        }
         let m = self.ref_.clone();
         tokio::spawn(async move {
             let dir_c = dir.canonicalize().unwrap_or_else(|_| dir.clone());
@@ -551,6 +783,9 @@ impl Manager {
     }
 
     pub fn run_command(&self, dir: PathBuf, oc_sid: String, command: String, arguments: String) {
+        if self.local_unsupported("commands") {
+            return;
+        }
         let m = self.ref_.clone();
         tokio::spawn(async move {
             let Ok((_, client)) = m.ensure_server(&dir).await else {
@@ -574,6 +809,9 @@ impl Manager {
     }
 
     pub fn summarize(&self, dir: PathBuf, oc_sid: String, model: ModelRef) {
+        if self.local_unsupported("compact") {
+            return;
+        }
         let m = self.ref_.clone();
         tokio::spawn(async move {
             let Ok((_, client)) = m.ensure_server(&dir).await else {
@@ -592,6 +830,9 @@ impl Manager {
     }
 
     pub fn revert(&self, dir: PathBuf, oc_sid: String, message_id: String) {
+        if self.local_unsupported("undo") {
+            return;
+        }
         let m = self.ref_.clone();
         tokio::spawn(async move {
             let Ok((_, client)) = m.ensure_server(&dir).await else {
@@ -610,6 +851,9 @@ impl Manager {
     }
 
     pub fn unrevert(&self, dir: PathBuf, oc_sid: String) {
+        if self.local_unsupported("redo") {
+            return;
+        }
         let m = self.ref_.clone();
         tokio::spawn(async move {
             let Ok((_, client)) = m.ensure_server(&dir).await else {
@@ -628,6 +872,9 @@ impl Manager {
     }
 
     pub fn share(&self, dir: PathBuf, oc_sid: String, want: bool) {
+        if self.local_unsupported("share") {
+            return;
+        }
         let m = self.ref_.clone();
         tokio::spawn(async move {
             let Ok((_, client)) = m.ensure_server(&dir).await else {
@@ -665,6 +912,14 @@ impl Manager {
     }
 
     pub fn load_file(&self, req: ReqId, dir: PathBuf, path: String) {
+        if self.ref_.local.is_some() {
+            let m = self.ref_.clone();
+            tokio::spawn(async move {
+                let content = std::fs::read_to_string(&path).ok();
+                m.emit(AppEvent::FileLoaded { req, path, content, diff: None });
+            });
+            return;
+        }
         let m = self.ref_.clone();
         tokio::spawn(async move {
             let dir_c = dir.canonicalize().unwrap_or_else(|_| dir.clone());
@@ -788,64 +1043,97 @@ async fn spawn_server(cfg: &Config, dir: &Path) -> Result<(String, Option<tokio:
     }
 }
 
-async fn sse_loop(
-    client: Client,
-    base: String,
-    dir: PathBuf,
-    tx: tokio::sync::mpsc::UnboundedSender<AppEvent>,
-) {
-    loop {
-        let res = pump_once(&client, &base, &dir, &tx).await;
-        if let Err(_e) = res {
-            // Server gone or restarting: retry after a short pause.
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        } else {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-    }
+/// Build the local backend from config: an OpenAI-compatible LLM provider
+/// wrapped in an agent loop (tools + permission policy + catalog).
+fn build_local_provider(cfg: &Config) -> Result<LocalProvider, ProviderError> {
+    let agent = build_agent(cfg)?;
+    let dir = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .to_string_lossy()
+        .to_string();
+    Ok(LocalProvider::new(Arc::new(agent), dir))
 }
 
-async fn pump_once(
-    client: &Client,
-    base: &str,
-    dir: &Path,
-    tx: &tokio::sync::mpsc::UnboundedSender<AppEvent>,
-) -> Result<()> {
-    let resp = client
-        .raw()
-        .get(format!("{base}/event"))
-        .header("Accept", "text/event-stream")
-        .send()
-        .await?;
-    if !resp.status().is_success() {
-        anyhow::bail!("event stream status {}", resp.status());
-    }
-    let mut stream = resp.bytes_stream();
-    let mut buf: Vec<u8> = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        buf.extend_from_slice(&chunk);
-        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = buf.drain(..=pos).collect();
-            let line = String::from_utf8_lossy(&line[..line.len().saturating_sub(1)]);
-            if let Some(data) = line.strip_prefix("data:") {
-                let data = data.trim_start();
-                if data.is_empty() {
-                    continue;
-                }
-                crate::tlog!("SSE dir={} {}", dir.display(), crate::logging::snippet(data, 800));
-                // All OpenCode protocol knowledge stays inside the adapter.
-                for routed in crate::providers::opencode::convert_native(data) {
-                    let _ = tx.send(AppEvent::Harness {
-                        dir: dir.to_path_buf(),
-                        oc_sid: routed.session_id.unwrap_or_default(),
-                        event: routed.event,
-                    });
-                }
+/// Build the in-process agent from config (also used by headless modes).
+pub fn build_agent(cfg: &Config) -> Result<crate::agent::AgentLoop, ProviderError> {
+    let ai = &cfg.ai;
+    let key = if ai.api_key_env.is_empty() {
+        None
+    } else {
+        std::env::var(&ai.api_key_env)
+            .ok()
+            .filter(|k| !k.trim().is_empty())
+    };
+    let provider: Box<dyn crate::ai::Provider> = if !ai.base_url.trim().is_empty() {
+        Box::new(crate::ai::openai::OpenAiCompat::new(ai.base_url.clone(), key))
+    } else {
+        Box::new(
+            crate::ai::openai::OpenAiCompat::preset(&ai.provider, key).ok_or_else(|| {
+                ProviderError::Unsupported(format!(
+                    "unknown ai.provider '{}' (set ai.base_url for a custom gateway)",
+                    ai.provider
+                ))
+            })?,
+        )
+    };
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let registry = crate::extensions::Registry::discover(&crate::extensions::Registry::default_roots(&cwd));
+    let base = crate::agent::context::CompactionSettings {
+        reserve_tokens: cfg.compaction.reserve_tokens,
+        keep_recent_tokens: cfg.compaction.keep_recent_tokens,
+        tool_result_cap: 2_000,
+    };
+    let overrides: crate::agent::context::ModelOverrides = cfg
+        .compaction
+        .model_overrides
+        .iter()
+        .map(|(k, v)| (k.clone(), (v.reserve_tokens, v.keep_recent_tokens)))
+        .collect();
+    let settings = crate::agent::context::resolve_settings(base, &overrides, &ai.model);
+    let agent = crate::agent::AgentLoop::new(provider, ai.model.clone())
+        .with_compaction(settings, cfg.compaction.enabled)
+        .with_system_appendix(registry.system_appendix());
+    Ok(agent)
+}
+
+/// Supervisor for one adapter's event pump: reconnect-on-failure policy lives
+/// here; the adapter owns transport and conversion. Neutral routed events are
+/// converted into `AppEvent::Harness` — the only place that mapping happens.
+fn spawn_event_pump<P>(provider: P, dir: PathBuf, tx: tokio::sync::mpsc::UnboundedSender<AppEvent>)
+where
+    P: crate::providers::EventPump + Send + Sync + 'static,
+{
+    tokio::spawn(async move {
+        let sink = wrap_sink(tx, dir.clone());
+        loop {
+            match provider.pump(sink.clone()).await {
+                // Stream closed cleanly: the server may be restarting; retry
+                // after a short pause.
+                Ok(()) => tokio::time::sleep(Duration::from_millis(200)).await,
+                // Server gone or restarting: retry after a longer pause.
+                Err(_e) => tokio::time::sleep(Duration::from_secs(1)).await,
             }
         }
-    }
-    anyhow::Ok(())
+    });
+}
+
+/// Bridge between the neutral [`RoutedEvent`] sink an adapter expects and the
+/// app's `AppEvent` channel: routing/session ids stay owned by the manager.
+fn wrap_sink(
+    tx: tokio::sync::mpsc::UnboundedSender<AppEvent>,
+    dir: PathBuf,
+) -> tokio::sync::mpsc::UnboundedSender<crate::providers::RoutedEvent> {
+    let (r_tx, mut r_rx) = tokio::sync::mpsc::unbounded_channel::<crate::providers::RoutedEvent>();
+    tokio::spawn(async move {
+        while let Some(ev) = r_rx.recv().await {
+            let _ = tx.send(AppEvent::Harness {
+                dir: dir.clone(),
+                oc_sid: ev.session_id.unwrap_or_default(),
+                event: ev.event,
+            });
+        }
+    });
+    r_tx
 }
 
 fn s_time_updated(s: &crate::opencode::OcSession) -> i64 {
@@ -864,4 +1152,36 @@ fn same_dir(a: &str, b: &Path) -> bool {
     let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
     let pa = Path::new(a);
     canon(pa) == canon(b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_provider_builds_for_preset_and_custom_base() {
+        let mut cfg = Config::default();
+        cfg.backend = "local".into();
+        cfg.ai.provider = "openai".into();
+        assert!(build_local_provider(&cfg).is_ok(), "preset providers build");
+
+        cfg.ai.provider = "compat".into();
+        cfg.ai.base_url = "http://localhost:1234/v1".into();
+        assert!(build_local_provider(&cfg).is_ok(), "explicit base_url builds");
+
+        cfg.ai.base_url = String::new();
+        assert!(
+            matches!(build_local_provider(&cfg), Err(ProviderError::Unsupported(_))),
+            "unknown provider without base_url is a clean error"
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_reports_backend() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut cfg = Config::default();
+        cfg.backend = "local".into();
+        let m = Manager::new(tx, cfg);
+        assert!(m.is_local());
+    }
 }

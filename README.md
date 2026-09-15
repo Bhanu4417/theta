@@ -76,6 +76,9 @@ Type `/` in any session input for the command menu (filter by typing,
 | `/share` / `/unshare` | Share the session and get a URL |
 | `/init [focus]` | Guided AGENTS.md setup (server command) |
 | `/refresh` | Reload the newest build in place (soft restart) |
+| `/export [file]` | Export this session (Markdown, or JSONL if `.jsonl`) |
+| `/editor` | Compose the prompt in `$EDITOR` (also `Ctrl+G`) |
+| `/tree` | Jump to an earlier point in a local session's history tree |
 | `/push [message]` | Commit all changes and push the session's project |
 | `/rename [name]` | Rename this session |
 | `/delete` | Delete session from the workspace (server history kept) |
@@ -123,6 +126,10 @@ the status bar, then `Git pushed "commit subject" owner/repo`.
 | `^C` | Interrupt the focused agent |
 | `Esc` `Esc` | Interrupt the focused agent (double-tap; hint by the cost) |
 | `Shift+Enter` | Newline in the prompt (also `Alt+Enter` / `Ctrl+J`) |
+| `@` | Mention a file: fuzzy picker, attaches it to the prompt |
+| `!cmd` / `!!cmd` | Run a shell command (send / don't send output to the agent) |
+| `Ctrl+G` | Edit the prompt in `$EDITOR` |
+| `Ctrl+V` | Paste text or a clipboard image (long pastes collapse to `[Pasted ~N lines]`) |
 | `↑` | Recall the previous prompt; select a tool entry when one is active |
 | `PgUp` / `PgDn` / wheel | Scroll transcript (`End` re-follows) |
 | `↓`, `Enter` | Select a tool entry / expand–collapse it |
@@ -158,10 +165,31 @@ quiet `✓ thought for 4.7s` marker afterwards.
 `~/.config/theta/config.toml` (written with defaults on first run):
 
 ```toml
+# Which harness drives sessions: "opencode" (default) or "local"
+# (Theta's own in-process agent loop).
+backend = "opencode"
+
 [opencode]
 binary = "opencode"      # server binary to launch
 port_base = 4310         # per-directory servers use ports [base, base+1500)
 keep_alive = true        # keep servers running after quit for instant reconnects
+
+# Settings for backend = "local": any OpenAI-compatible gateway.
+[ai]
+provider = "openai"      # openai | xai | groq | deepseek | openrouter | together | fireworks | ollama
+base_url = ""            # set for a custom/compatible endpoint (overrides provider)
+api_key_env = "OPENAI_API_KEY"
+model = "gpt-4o"         # xai → grok-2-latest, groq → llama-3.3-70b-versatile, …
+
+# Context compaction (local backend), Pi-style token budgets.
+[compaction]
+enabled = true
+reserve_tokens = 16384   # headroom left for the model's response
+keep_recent_tokens = 20000  # recent tokens kept verbatim, rest summarized
+
+# Optional per-model overrides (keyed provider/model or bare model).
+[compaction.model_overrides."openai/gpt-4o"]
+reserve_tokens = 400000
 
 [ui]
 restore = true           # restore last workspace on startup
@@ -170,18 +198,50 @@ explorer_width = 32
 [behavior]
 auto_approve_permissions = false
 confirm_quit = true
+notify = true            # bell + desktop notification when a run finishes
 ```
+
+## Headless mode, local backend & skills
+
+```sh
+theta --print "summarize this repo"       # one local turn, print the reply
+theta --print --json "list the files"     # stream neutral events as JSON lines
+```
+
+With `backend = "local"`, Theta runs its **own agent loop** (no `opencode serve`):
+an OpenAI-compatible provider plus built-in tools (`read`, `write`, `edit`,
+`bash`, `grep`, `glob`, `webfetch`), automatic context compaction, and the same
+event stream the UI renders. Any OpenAI-compatible gateway works — set
+`ai.provider` to a preset or point `ai.base_url` at a custom endpoint, so
+OpenAI, xAI/Grok, Groq, OpenRouter, DeepSeek, Together, Fireworks, Ollama and
+LM Studio are all supported without code changes.
+
+**Session history is a tree.** Every local turn is stored as linked entries
+(`~/.local/share/theta/sessions/<id>.jsonl`, override with `THETA_SESSION_DIR`).
+`/tree` opens a navigator; jumping to an earlier entry summarizes the
+abandoned branch with the model, injects that summary, and fans out a new
+branch while the old one is kept on disk. Compaction and branch summaries are
+first-class nodes that rebuild the model context (`id`/`parentId`, like Pi).
+
+**Skills and prompt packs** are discovered from `~/.config/theta/skills/`,
+`./.theta/skills/`, `.agents/skills/` (SKILL.md or `<name>.md`) and
+`…/prompts/<name>.md`; skills are indexed into the local agent's system prompt.
 
 ## Architecture
 
 ```text
 src/
-├── main.rs            terminal setup + event loop (select over keys/SSE/tick)
+├── main.rs            terminal setup + event loop; --print/--json headless
 ├── app.rs             state, key routing, commands, overlay state
 ├── events.rs          AppEvent: manager → UI channel
+├── harness/           provider-neutral HarnessEvent + transcript model
+├── providers/         AgentProvider + EventPump adapters (opencode, local)
+├── ai/                LLM layer: Provider trait, OpenAI-compatible, catalog
+├── agent/             local agent loop + tools + context compaction
+├── extensions.rs      skills / prompt-pack registry
 ├── panes.rs           weighted row/column grid: auto-tile, resize, swap
 ├── session.rs         per-session transcript, input, status, adoption
-├── manager.rs         per-directory opencode serve lifecycle + SSE pumps
+├── manager.rs         backend selection + server lifecycle + pump supervisor
 ├── opencode.rs        typed client for the OpenCode HTTP API
 ├── git.rs             async git CLI (branch/status/log/diff), cached
 ├── fsx.rs             gitignore-aware listing + local search fallback
