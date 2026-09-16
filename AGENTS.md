@@ -73,14 +73,18 @@ Key modules:
 ## Build and test
 
 ```sh
-cargo build            # must be warning-free
-cargo test             # 189 tests, offline and deterministic
-cargo clippy           # must be clean
-cargo build --release  # the artifact users run
+cargo build --release --locked   # the artifact users run
+cargo test --locked             # 211 tests, offline and deterministic
+cargo clippy --all-targets      # must be clean
 ```
 
-CI runs build, test and clippy on Linux and macOS. `RUSTFLAGS=-D warnings` is
-set, so a warning is a failure.
+Run exactly these before considering a change done. `cargo clippy` without
+`--all-targets` skips test code, so a lint can pass locally and still fail CI.
+
+Lints are denied in `Cargo.toml` (`[lints.rust] warnings = "deny"` and
+`[lints.clippy] all = "deny"`), scoped to this crate so a dependency's warning
+cannot break the build. CI runs the three commands above on Linux, macOS and
+Windows.
 
 The user runs the installed binary at `~/.local/bin/theta`. After a rebuild
 they either restart it or use `/refresh`, which re-execs the newest binary. The

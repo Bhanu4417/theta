@@ -5,9 +5,11 @@ on:
     branches: [main]
   pull_request:
 
+# Lints are denied in Cargo.toml ([lints]), scoped to this crate. Setting
+# RUSTFLAGS=-D warnings here would also fail the build on a dependency's
+# warnings, which we do not control.
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
 
 jobs:
   build:

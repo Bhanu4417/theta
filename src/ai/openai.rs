@@ -365,7 +365,6 @@ mod tests {
             temperature: None,
             max_tokens: None,
             reasoning_effort: Some("low".into()),
-            ..Default::default()
         };
         let body = build_body(&req, true);
         assert_eq!(body["reasoning_effort"], json!("low"));

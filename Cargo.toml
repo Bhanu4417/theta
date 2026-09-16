@@ -21,3 +21,12 @@ ignore = "0.4"
 [profile.release]
 lto = "thin"
 strip = true
+
+# Lints are scoped to this crate rather than set via RUSTFLAGS, so a warning
+# from a dependency cannot fail our build. CI runs clippy --all-targets, which
+# also covers test code.
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+all = "deny"

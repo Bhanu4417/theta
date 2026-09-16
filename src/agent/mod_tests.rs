@@ -1258,7 +1258,7 @@ async fn a_context_overflow_compacts_and_retries_instead_of_failing() {
     // Enough history that a compaction has something to fold.
     let mut history = vec![crate::ai::ChatMessage::system("sys")];
     for i in 0..8 {
-        history.push(crate::ai::ChatMessage::user(&format!("q{i} {}", "x".repeat(400))));
+        history.push(crate::ai::ChatMessage::user(format!("q{i} {}", "x".repeat(400))));
         history.push(crate::ai::ChatMessage::assistant("ok", vec![]));
     }
 
