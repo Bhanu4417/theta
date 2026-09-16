@@ -76,6 +76,25 @@ pub struct SessionSummary {
     pub entries: usize,
 }
 
+/// Test support for the session directory.
+///
+/// `THETA_SESSION_DIR` is process-global, but the test binary runs its tests on
+/// parallel threads. Without serialization, one test overwrites the variable
+/// while another is mid-run, and the suite fails intermittently — the directory
+/// a test resolves depends on whichever test ran last.
+#[cfg(test)]
+pub mod testenv {
+    use std::sync::Mutex;
+
+    /// Held for the duration of any test that sets `THETA_SESSION_DIR`.
+    pub static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Take the lock, ignoring poisoning so one failing test does not cascade.
+    pub fn lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionTree {
     pub entries: Vec<Entry>,
@@ -562,6 +581,8 @@ mod tests {
         tree.append(&ChatMessage::assistant("Done", vec![]));
         std::fs::write(&path, tree.to_jsonl()).unwrap();
 
+        // Serialized: the variable is process-global and tests run in parallel.
+        let _env = testenv::lock();
         std::env::set_var("THETA_SESSION_DIR", &temp_dir);
         let list = SessionTree::list_sessions();
         std::env::remove_var("THETA_SESSION_DIR");

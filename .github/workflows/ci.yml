@@ -39,7 +39,7 @@ jobs:
         run: cargo clippy --all-targets
 
   installer-unix:
-    name: installer (curl | sh)
+    name: install.sh
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -49,95 +49,20 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-
-      - name: Build
-        run: cargo build --release --locked
-
-      - name: Package a local release
-        shell: bash
-        run: |
-          set -euo pipefail
-          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          target=$(rustc -vV | sed -n 's/^host: //p')
-          mkdir -p "_rel/v$version" _stage
-          cp target/release/theta _stage/theta
-          (cd _stage && tar czf "../_rel/v$version/theta-$target.tar.gz" theta)
-          (cd "_rel/v$version" && shasum -a 256 "theta-$target.tar.gz" > "theta-$target.tar.gz.sha256")
-          echo "VERSION=$version" >> "$GITHUB_ENV"
-
-      - name: Serve the release
-        shell: bash
-        run: |
-          set -euo pipefail
-          (cd _rel && python3 -m http.server 8099 >/dev/null 2>&1 &)
-          sleep 2
-          curl -fsS -o /dev/null "http://127.0.0.1:8099/v$VERSION/theta-$(rustc -vV | sed -n 's/^host: //p').tar.gz"
-
-      # The installer is the first thing a new user runs, so it is exercised
-      # here rather than trusted.
-      - name: Install and verify
-        shell: bash
-        run: |
-          set -euo pipefail
-          out=$(THETA_BASE_URL=http://127.0.0.1:8099 \
-                THETA_INSTALL_DIR="$RUNNER_TEMP/bin" \
-                sh ./install.sh --version "$VERSION" 2>&1)
-          echo "$out"
-          "$RUNNER_TEMP/bin/theta" --version
-
-      - name: A tampered download must be refused
-        shell: bash
-        run: |
-          set -euo pipefail
-          target=$(rustc -vV | sed -n 's/^host: //p')
-          sumfile="_rel/v$VERSION/theta-$target.tar.gz.sha256"
-          cp "$sumfile" /tmp/good.sha256
-          printf 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef  theta-%s.tar.gz\n' "$target" > "$sumfile"
-          if THETA_BASE_URL=http://127.0.0.1:8099 \
-             THETA_INSTALL_DIR="$RUNNER_TEMP/tampered" \
-             sh ./install.sh --version "$VERSION" >/dev/null 2>&1; then
-            echo "::error::installer accepted a download with a bad checksum"
-            exit 1
-          fi
-          test ! -e "$RUNNER_TEMP/tampered/theta"
-          echo "refused as expected"
+      - run: cargo build --release --locked
+      # Serves a release from an in-process server and runs the real installer
+      # against it: happy path, tampered checksum, missing release, corrupt
+      # archive, flags, re-install.
+      - name: Test install.sh
+        run: python3 packaging/installer-tests/run.py --installer sh
 
   installer-windows:
-    name: installer (irm | iex)
+    name: install.ps1
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-
-      - name: Build
-        run: cargo build --release --locked
-
-      - name: Package a local release
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
-          $target  = (rustc -vV | Select-String '^host: ').ToString().Split(' ')[1]
-          New-Item -ItemType Directory -Force -Path "_rel/v$version", _stage | Out-Null
-          Copy-Item target/release/theta.exe _stage/theta.exe
-          Compress-Archive -Path _stage/theta.exe -DestinationPath "_rel/v$version/theta-$target.zip" -Force
-          $hash = (Get-FileHash "_rel/v$version/theta-$target.zip" -Algorithm SHA256).Hash.ToLower()
-          "$hash  theta-$target.zip" | Set-Content "_rel/v$version/theta-$target.zip.sha256"
-          "VERSION=$version" | Out-File -Append $env:GITHUB_ENV
-
-      - name: Serve the release
-        shell: pwsh
-        run: |
-          Start-Process -FilePath python -ArgumentList '-m','http.server','8099' `
-            -WorkingDirectory _rel -NoNewWindow
-          Start-Sleep -Seconds 3
-
-      - name: Install and verify
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $env:THETA_BASE_URL = 'http://127.0.0.1:8099'
-          $env:THETA_INSTALL_DIR = Join-Path $env:RUNNER_TEMP 'bin'
-          ./install.ps1 -Version $env:VERSION
-          & (Join-Path $env:THETA_INSTALL_DIR 'theta.exe') --version
+      - run: cargo build --release --locked
+      - name: Test install.ps1
+        run: python packaging/installer-tests/run.py --installer ps1

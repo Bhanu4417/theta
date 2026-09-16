@@ -38,6 +38,22 @@ pub fn list_dir(dir: &Path) -> Vec<Entry> {
     out
 }
 
+/// A path relative to `root`, always with `/` separators.
+///
+/// These strings are shown to the model and matched against globs, so they must
+/// not carry the platform's separators: on Windows the native form would be
+/// `src\\main.rs`, which no glob and no model-written path expects.
+pub fn rel_slash(path: &Path, root: &Path) -> String {
+    let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy();
+    // Only Windows needs translating: on Unix a backslash is a legal filename
+    // character, so rewriting it would corrupt a real path.
+    if cfg!(windows) {
+        rel.replace('\\', "/")
+    } else {
+        rel.into_owned()
+    }
+}
+
 pub fn find_files(root: &Path, query: &str, limit: usize) -> Vec<String> {
     let mut out = Vec::new();
     let q = query.to_lowercase();
@@ -60,13 +76,7 @@ pub fn find_files(root: &Path, query: &str, limit: usize) -> Vec<String> {
         if e.file_type().map(|t| t.is_file()).unwrap_or(false) {
             let name = e.file_name().to_string_lossy().to_lowercase();
             if name.contains(&q) {
-                let rel = e
-                    .path()
-                    .strip_prefix(root)
-                    .unwrap_or_else(|_| e.path())
-                    .to_string_lossy()
-                    .to_string();
-                out.push(rel);
+                out.push(rel_slash(e.path(), root));
             }
         }
     }

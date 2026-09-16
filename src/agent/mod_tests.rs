@@ -1089,6 +1089,33 @@ fn zero_max_turns_means_no_limit() {
     assert_eq!(agent.max_turns, 0, "0 is the documented 'no limit' value");
 }
 
+/// Returns a large, deterministic payload. Used instead of `bash` in tests that
+/// need bulk text in the transcript, so they behave identically on every
+/// platform (Windows has no `bash`).
+struct BulkTool;
+
+impl crate::agent::tools::Tool for BulkTool {
+    fn spec(&self) -> crate::ai::ToolSpec {
+        crate::ai::ToolSpec {
+            name: "read".into(),
+            description: "returns bulk content".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+    fn run<'a>(
+        &'a self,
+        input: &'a serde_json::Value,
+        _cwd: &'a std::path::Path,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = crate::agent::tools::ToolOutcome> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let n = input.get("n").and_then(|v| v.as_u64()).unwrap_or(1);
+            crate::agent::tools::ToolOutcome::ok(format!("payload-{n} {}", "x".repeat(20_000)))
+        })
+    }
+}
+
 /// Produces large tool output for a while, then answers plainly. Pruning only
 /// touches *completed* turns (the in-flight turn is protected), so a test must
 /// span at least two prompts.
@@ -1122,11 +1149,7 @@ impl Provider for BigOutputProvider {
             // never trips and the loop reaches the prune path.
             Ok(AssistantTurn {
                 text: String::new(),
-                tool_calls: vec![call(
-                    &format!("c{n}"),
-                    "bash",
-                    &format!(r#"{{"command":"echo {}"}}"#, "x".repeat(20_000)),
-                )],
+                tool_calls: vec![call(&format!("c{n}"), "read", &format!(r#"{{"n":{n}}}"#))],
                 finish: Some(FinishReason::ToolCalls),
             })
         })
@@ -1136,6 +1159,8 @@ impl Provider for BigOutputProvider {
 #[tokio::test]
 async fn old_tool_output_is_pruned_from_the_prompt() {
     let agent = AgentLoop::new(Box::new(BigOutputProvider { n: Mutex::new(0) }), "test")
+        .with_tools(vec![std::sync::Arc::new(BulkTool)
+            as std::sync::Arc<dyn crate::agent::tools::Tool>])
         .with_prune(crate::agent::context::PruneSettings {
             enabled: true,
             protect_tokens: 2_000,
@@ -1182,6 +1207,8 @@ async fn old_tool_output_is_pruned_from_the_prompt() {
 #[tokio::test]
 async fn pruning_can_be_turned_off() {
     let agent = AgentLoop::new(Box::new(BigOutputProvider { n: Mutex::new(0) }), "test")
+        .with_tools(vec![std::sync::Arc::new(BulkTool)
+            as std::sync::Arc<dyn crate::agent::tools::Tool>])
         .with_prune(crate::agent::context::PruneSettings {
             enabled: false,
             protect_tokens: 0,

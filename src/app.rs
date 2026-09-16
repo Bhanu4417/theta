@@ -864,7 +864,14 @@ impl App {
                     }
                     (o.status.success(), b)
                 }
-                Err(e) => (false, format!("spawn failed: {e}")),
+                Err(e) => {
+                    let hint = if cfg!(windows) {
+                        " (needs a `bash` on PATH: install Git for Windows or use WSL)"
+                    } else {
+                        ""
+                    };
+                    (false, format!("could not run bash: {e}{hint}"))
+                }
             };
             let mut body = body;
             if body.len() > 100 * 1024 {
@@ -2617,10 +2624,12 @@ impl App {
         }
         if std::env::var_os("THETA_KEYLOG").is_some() {
             use std::io::Write;
+            // The platform temp dir: a literal /tmp does not exist on Windows.
+            let log = std::env::temp_dir().join("theta-keys.log");
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open("/tmp/theta-keys.log")
+                .open(log)
             {
                 let _ = writeln!(f, "{:?} {:?} {:?}", key.code, key.modifiers, key.kind);
             }

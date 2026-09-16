@@ -518,7 +518,14 @@ impl EventPump for LocalProvider {
     }
 }
 
+// `THETA_SESSION_DIR` is process-global, so tests that set it take a mutex and
+// hold it for the test's duration — including across awaits. That is sound here:
+// `#[tokio::test]` defaults to a current-thread runtime, so the guard is never
+// sent between threads and cannot deadlock another task. `tree::testenv` holds
+// the one lock, which is why it is a std mutex that the non-async tests can use
+// too.
 #[cfg(test)]
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use crate::agent::AgentLoop;
@@ -554,7 +561,10 @@ mod tests {
     #[tokio::test]
     async fn local_provider_streams_a_turn_through_the_pump() {
         let dir = std::env::temp_dir().to_string_lossy().to_string();
-        let session_dir = std::env::temp_dir().join(format!("theta-sessions-{}", std::process::id()));
+        // Serialized: THETA_SESSION_DIR is process-global.
+        let _env = crate::tree::testenv::lock();
+        let session_dir = std::env::temp_dir()
+            .join(format!("theta-it-{}-{}", std::process::id(), 1));
         std::env::set_var("THETA_SESSION_DIR", &session_dir);
         let provider = OneShot {
             turns: Mutex::new(
@@ -638,8 +648,10 @@ mod tests {
         // Without the panic guard this task dies before emitting SessionIdle,
         // so the pane stays busy forever and only clears on a refresh.
         let dir = std::env::temp_dir().to_string_lossy().to_string();
-        let session_dir =
-            std::env::temp_dir().join(format!("theta-panic-{}", std::process::id()));
+        // Serialized: THETA_SESSION_DIR is process-global.
+        let _env = crate::tree::testenv::lock();
+        let session_dir = std::env::temp_dir()
+            .join(format!("theta-it-{}-{}", std::process::id(), 2));
         std::env::set_var("THETA_SESSION_DIR", &session_dir);
         let agent = Arc::new(AgentLoop::new(Box::new(PanicProvider), "m"));
         let local = Arc::new(LocalProvider::new(agent, &dir));
@@ -680,8 +692,10 @@ mod tests {
     async fn navigate_auto_injects_a_branch_summary() {
         use crate::tree::EntryKind;
         let dir = std::env::temp_dir().to_string_lossy().to_string();
-        let session_dir =
-            std::env::temp_dir().join(format!("theta-sessions-{}", std::process::id()));
+        // Serialized: THETA_SESSION_DIR is process-global.
+        let _env = crate::tree::testenv::lock();
+        let session_dir = std::env::temp_dir()
+            .join(format!("theta-it-{}-{}", std::process::id(), 3));
         std::env::set_var("THETA_SESSION_DIR", &session_dir);
 
         let provider = OneShot {
@@ -736,8 +750,10 @@ mod tests {
     #[tokio::test]
     async fn compact_session_folds_history_into_a_summary() {
         let dir = std::env::temp_dir().to_string_lossy().to_string();
-        let session_dir =
-            std::env::temp_dir().join(format!("theta-cs-{}", std::process::id()));
+        // Serialized: THETA_SESSION_DIR is process-global.
+        let _env = crate::tree::testenv::lock();
+        let session_dir = std::env::temp_dir()
+            .join(format!("theta-it-{}-{}", std::process::id(), 4));
         let _ = std::fs::remove_dir_all(&session_dir);
         std::env::set_var("THETA_SESSION_DIR", &session_dir);
 
@@ -847,8 +863,10 @@ mod tests {
     #[tokio::test]
     async fn picking_a_model_rebuilds_the_agent() {
         let dir = std::env::temp_dir().to_string_lossy().to_string();
-        let session_dir =
-            std::env::temp_dir().join(format!("theta-switch-{}", std::process::id()));
+        // Serialized: THETA_SESSION_DIR is process-global.
+        let _env = crate::tree::testenv::lock();
+        let session_dir = std::env::temp_dir()
+            .join(format!("theta-it-{}-{}", std::process::id(), 5));
         let _ = std::fs::remove_dir_all(&session_dir);
         std::env::set_var("THETA_SESSION_DIR", &session_dir);
 
@@ -902,7 +920,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("note.txt"), "SECRET-CONTENT").unwrap();
-        let session_dir = std::env::temp_dir().join(format!("theta-att-s-{}", std::process::id()));
+        // Serialized: THETA_SESSION_DIR is process-global.
+        let _env = crate::tree::testenv::lock();
+        let session_dir = std::env::temp_dir()
+            .join(format!("theta-it-{}-{}", std::process::id(), 6));
         std::env::set_var("THETA_SESSION_DIR", &session_dir);
 
         let local = Arc::new(LocalProvider::new(Arc::new(one_shot("ok")), dir.to_string_lossy()));
@@ -940,7 +961,10 @@ mod tests {
     #[tokio::test]
     async fn fork_copies_history_and_leaves_source_untouched() {
         let dir = std::env::temp_dir().to_string_lossy().to_string();
-        let session_dir = std::env::temp_dir().join(format!("theta-fork-{}", std::process::id()));
+        // Serialized: THETA_SESSION_DIR is process-global.
+        let _env = crate::tree::testenv::lock();
+        let session_dir = std::env::temp_dir()
+            .join(format!("theta-it-{}-{}", std::process::id(), 7));
         let _ = std::fs::remove_dir_all(&session_dir);
         std::env::set_var("THETA_SESSION_DIR", &session_dir);
 
@@ -981,7 +1005,10 @@ mod tests {
     #[tokio::test]
     async fn rewind_and_redo_move_the_active_leaf() {
         let dir = std::env::temp_dir().to_string_lossy().to_string();
-        let session_dir = std::env::temp_dir().join(format!("theta-rw-{}", std::process::id()));
+        // Serialized: THETA_SESSION_DIR is process-global.
+        let _env = crate::tree::testenv::lock();
+        let session_dir = std::env::temp_dir()
+            .join(format!("theta-it-{}-{}", std::process::id(), 8));
         let _ = std::fs::remove_dir_all(&session_dir);
         std::env::set_var("THETA_SESSION_DIR", &session_dir);
 
@@ -1030,7 +1057,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("theta-rwf-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let session_dir = std::env::temp_dir().join(format!("theta-rwf-s-{}", std::process::id()));
+        // Serialized: THETA_SESSION_DIR is process-global.
+        let _env = crate::tree::testenv::lock();
+        let session_dir = std::env::temp_dir()
+            .join(format!("theta-it-{}-{}", std::process::id(), 9));
         std::env::set_var("THETA_SESSION_DIR", &session_dir);
 
         let provider = OneShot {

@@ -491,7 +491,14 @@ impl Tool for BashTool {
                 .output();
             match tokio::time::timeout(Duration::from_millis(timeout), fut).await {
                 Err(_) => ToolOutcome::err(format!("command timed out after {timeout}ms")),
-                Ok(Err(e)) => ToolOutcome::err(format!("spawn failed: {e}")),
+                Ok(Err(e)) => {
+                    let hint = if cfg!(windows) {
+                        " (a `bash` is required on Windows: install Git for Windows or use WSL, or run commands with the `!cmd` escape)"
+                    } else {
+                        ""
+                    };
+                    ToolOutcome::err(format!("could not run bash: {e}{hint}"))
+                }
                 Ok(Ok(out)) => {
                     let mut s = String::from_utf8_lossy(&out.stdout).to_string();
                     let err = String::from_utf8_lossy(&out.stderr);
@@ -583,12 +590,7 @@ impl Tool for GlobTool {
                         break;
                     }
                     if e.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                        let rel = e
-                            .path()
-                            .strip_prefix(&root)
-                            .unwrap_or_else(|_| e.path())
-                            .to_string_lossy()
-                            .to_string();
+                        let rel = crate::fsx::rel_slash(e.path(), &root);
                         if glob_match(&pat, &rel) {
                             out.push(rel);
                         }
@@ -706,6 +708,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // The bash tool shells out to `bash`, which does not exist on Windows
+    // unless Git for Windows or WSL is installed. The tool itself is fine —
+    // there is simply nothing to run here.
+    #[cfg(unix)]
     #[tokio::test]
     async fn bash_runs_in_cwd_and_caps() {
         let dir = std::env::temp_dir();
