@@ -218,10 +218,13 @@ theta --print --json "list the files"     # stream neutral events as JSON lines
 
 With `backend = "local"`, Theta runs its **own agent loop** (no `opencode serve`):
 an OpenAI-compatible provider plus built-in tools (`read`, `write`, `edit`,
-`multiedit`, `bash`, `grep`, `glob`, `webfetch`), automatic context compaction,
-and the same event stream the UI renders. Native **Anthropic** (Messages API)
-and **Google Gemini** providers are built in; tool calls are gated by
-`behavior.local_permissions` (`ask` prompts with `a`/`A`/`r` in the UI). Any OpenAI-compatible gateway works — set
+`multiedit`, `bash`, `grep`, `glob`, `webfetch`, `ask`, `task`), automatic
+context compaction, and the same event stream the UI renders. Native
+**Anthropic** (Messages API) and **Google Gemini** providers are built in.
+Switching models in the UI rebuilds the local provider on demand, `@file` and
+pasted images are inlined into the prompt, `ask` questions and tool permissions
+surface as interactive prompts (`a`/`A`/`r`; `behavior.local_permissions`), and
+`task` delegates a focused sub-task to a nested, auto-approved sub-agent. Any OpenAI-compatible gateway works — set
 `ai.provider` to a preset or point `ai.base_url` at a custom endpoint, so
 OpenAI, xAI/Grok, Groq, OpenRouter, DeepSeek, Together, Fireworks, Ollama and
 LM Studio are all supported without code changes.
@@ -231,7 +234,14 @@ LM Studio are all supported without code changes.
 `/tree` opens a navigator; jumping to an earlier entry summarizes the
 abandoned branch with the model, injects that summary, and fans out a new
 branch while the old one is kept on disk. `/resume` lists saved local sessions,
-and `/compact` folds the current context into a summary on demand. Compaction and branch summaries are
+and `/compact` folds the current context into a summary on demand.
+
+**`/undo` rewinds like the agy CLI**: a picker pops up above the chatbox listing
+your prompts with per-turn diff stats (`+adds -dels`). Choosing one moves the
+history leaf before it (the branch is kept on disk), restores the files that
+turn changed from recorded pre-images, drops the turn's output from the view,
+and puts the prompt back in the chatbox; `/redo` restores it. `/fork` duplicates
+a session (optionally pinned to an earlier point) without touching the source. Compaction and branch summaries are
 first-class nodes that rebuild the model context (`id`/`parentId`, like Pi).
 
 **Skills and prompt packs** are discovered from `~/.config/theta/skills/`,

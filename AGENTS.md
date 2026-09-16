@@ -107,6 +107,20 @@ Design every new feature so it works for both the current OpenCode backend and
 a future in-process harness.
 
 ## Work log (recent, high-level)
+- **Local backend parity push**: per-session agents + an `AgentFactory`, so the
+  model picker rebuilds the provider on demand (`LocalProvider::with_factory`);
+  `@file`/image attachments inline into the prompt; an `ask` tool +
+  `QuestionBroker` for interactive questions; a `task` tool that runs an
+  auto-approved sub-agent (no recursion); local `fork` (with pinning),
+  `/undo`/`/redo` via the history tree, and graceful `share` degradation.
+- **agy-style `/undo` rewind**: `RewindRow`/`RewindState` + `Overlay::Rewind`
+  lists user turns with per-turn `+/-` diff stats, anchored over the chatbox.
+  Selecting a turn calls `SessionTree::restore_files_after` (reverse file
+  pre-images captured per turn by `tools::snapshot_paths` in the agent loop),
+  moves the leaf with `LocalProvider::rewind`, drops the transcript tail, and
+  restores the prompt to the input. `/redo` pops the abandoned leaf.
+
+
 - Native **Anthropic (Messages API)** and **Google Gemini** providers in
   `ai/anthropic.rs` / `ai/google.rs`; `build_agent` selects by `[ai].provider`
   (with per-provider default models) and falls back to the OpenAI-compatible

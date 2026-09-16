@@ -46,6 +46,9 @@ pub struct Entry {
     /// For compaction: token count before compaction.
     #[serde(default)]
     pub tokens_before: Option<u64>,
+    /// Pre-images of files this entry's turn mutated (for `/undo` restore).
+    #[serde(default)]
+    pub snapshots: Vec<crate::agent::tools::FileSnapshot>,
 }
 
 impl Entry {
@@ -134,6 +137,7 @@ impl SessionTree {
             tool_call_id: message.tool_call_id.clone(),
             first_kept: None,
             tokens_before: None,
+            snapshots: Vec::new(),
         })
     }
 
@@ -150,6 +154,7 @@ impl SessionTree {
             tool_call_id: None,
             first_kept,
             tokens_before: Some(tokens_before),
+            snapshots: Vec::new(),
         })
     }
 
@@ -167,6 +172,7 @@ impl SessionTree {
             tool_call_id: None,
             first_kept: None,
             tokens_before: None,
+            snapshots: Vec::new(),
         })
     }
 
@@ -267,6 +273,60 @@ impl SessionTree {
         } else {
             false
         }
+    }
+
+    /// Keep only entries whose id is in `keep`, re-pointing `leaf` at the last
+    /// surviving entry of the previous active path. Used to pin a fork.
+    pub fn retain_path(&mut self, keep: &std::collections::HashSet<&str>) {
+        let leaf_kept = self
+            .leaf
+            .as_deref()
+            .is_some_and(|l| keep.contains(l));
+        self.entries.retain(|e| keep.contains(e.id.as_str()));
+        if !leaf_kept {
+            self.leaf = self.entries.last().map(|e| e.id.clone());
+        }
+    }
+
+    /// Restore file pre-images for every entry after `ancestor` (newest first),
+    /// reversing each entry's snapshots then the entry order. Returns how many
+    /// files were touched. Best-effort: write failures are ignored.
+    pub fn restore_files_after(&self, ancestor: Option<&str>) -> usize {
+        let mut restored = 0;
+        for e in self.entries_after(ancestor) {
+            for snap in e.snapshots.iter().rev() {
+                match &snap.before {
+                    Some(content) => {
+                        if std::fs::write(&snap.path, content).is_ok() {
+                            restored += 1;
+                        }
+                    }
+                    None => {
+                        if std::fs::remove_file(&snap.path).is_ok() {
+                            restored += 1;
+                        }
+                    }
+                }
+            }
+        }
+        restored
+    }
+
+    /// Walk from the current leaf back to (not including) `ancestor`, returning
+    /// the abandoned entries newest-first. `ancestor = None` returns the whole
+    /// active path. Does not mutate.
+    pub fn entries_after(&self, ancestor: Option<&str>) -> Vec<Entry> {
+        let mut out = Vec::new();
+        let mut cur = self.leaf.clone();
+        while let Some(id) = cur {
+            if Some(id.as_str()) == ancestor {
+                break;
+            }
+            let Some(e) = self.node(&id) else { break };
+            out.push(e.clone());
+            cur = e.parent.clone();
+        }
+        out
     }
 
     /// Navigate to `id`, first appending a branch summary carrying the

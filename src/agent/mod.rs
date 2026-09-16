@@ -37,6 +37,8 @@ pub struct AgentLoop {
     compaction_enabled: bool,
     /// Answers interactive `Ask` permission decisions (local backend).
     broker: Option<std::sync::Arc<permissions::Broker>>,
+    /// Answers interactive `ask`-tool questions (local backend).
+    question_broker: Option<std::sync::Arc<permissions::QuestionBroker>>,
 }
 
 impl AgentLoop {
@@ -52,6 +54,7 @@ impl AgentLoop {
             compaction: context::CompactionSettings::default(),
             compaction_enabled: true,
             broker: None,
+            question_broker: None,
         }
     }
 
@@ -72,9 +75,24 @@ impl AgentLoop {
         self
     }
 
+    /// Append one tool (used to add the `task` sub-agent tool).
+    pub fn with_extra_tool(mut self, tool: Arc<dyn Tool>) -> Self {
+        self.tools.push(tool);
+        self
+    }
+
     /// Wire the interactive permission broker (local backend).
     pub fn with_broker(mut self, broker: std::sync::Arc<permissions::Broker>) -> Self {
         self.broker = Some(broker);
+        self
+    }
+
+    /// Wire the interactive question broker (local backend).
+    pub fn with_question_broker(
+        mut self,
+        broker: std::sync::Arc<permissions::QuestionBroker>,
+    ) -> Self {
+        self.question_broker = Some(broker);
         self
     }
 
@@ -146,6 +164,27 @@ impl AgentLoop {
         cancel: &std::sync::atomic::AtomicBool,
         emit: &mut F,
         journal: &mut Vec<ChatMessage>,
+    ) -> Result<(), ProviderError>
+    where
+        F: FnMut(HarnessEvent) + Send,
+    {
+        let mut snapshots = Vec::new();
+        self.run_turn_journaled_snapshots(history, user_text, cwd, cancel, emit, journal, &mut snapshots)
+            .await
+    }
+
+    /// Like [`Self::run_turn_journaled`], also returning the pre-images of files
+    /// each mutating tool changed, so a caller can support `/undo` file restore.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_turn_journaled_snapshots<F>(
+        &self,
+        history: &mut Vec<ChatMessage>,
+        user_text: &str,
+        cwd: &Path,
+        cancel: &std::sync::atomic::AtomicBool,
+        emit: &mut F,
+        journal: &mut Vec<ChatMessage>,
+        snapshots: &mut Vec<tools::FileSnapshot>,
     ) -> Result<(), ProviderError>
     where
         F: FnMut(HarnessEvent) + Send,
@@ -246,7 +285,7 @@ impl AgentLoop {
                     emit(HarnessEvent::SessionIdle);
                     return Ok(());
                 }
-                self.run_tool_call(&msg_id, call, cwd, history, emit, journal).await;
+                self.run_tool_call(&msg_id, call, cwd, history, emit, journal, snapshots).await;
             }
         }
 
@@ -328,6 +367,40 @@ impl AgentLoop {
         self.complete(context::SUMMARIZATION_SYSTEM_PROMPT, &user).await
     }
 
+    /// Present an `ask`-tool question to the UI and wait for an answer.
+    async fn run_ask<F>(
+        &self,
+        msg_id: &str,
+        call: &ToolCall,
+        input: &Value,
+        emit: &mut F,
+    ) -> tools::ToolOutcome
+    where
+        F: FnMut(HarnessEvent),
+    {
+        let Some((questions, prompt)) = parse_questions(input, msg_id, &call.id) else {
+            return tools::ToolOutcome::err("ask: expected a non-empty `questions` array");
+        };
+        let Some(broker) = &self.question_broker else {
+            return tools::ToolOutcome::err("ask: no interactive session available");
+        };
+        let rx = broker.register(prompt.id.clone());
+        emit(HarnessEvent::QuestionAsked(prompt));
+        match rx.await {
+            Ok(permissions::QuestionAnswer::Answered(answers)) => {
+                let payload = json!({ "answers": answers });
+                let mut out = tools::ToolOutcome::ok(payload.to_string());
+                out.output = format!(
+                    "User answered {} question(s): {}",
+                    questions.len(),
+                    payload["answers"]
+                );
+                out
+            }
+            _ => tools::ToolOutcome::err("ask: the user did not answer"),
+        }
+    }
+
     async fn complete(&self, system: &str, user: &str) -> Result<String, ProviderError> {
         let request = ChatRequest {
             model: self.model.clone(),
@@ -368,6 +441,7 @@ impl AgentLoop {
         Ok(acc)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_tool_call<F>(
         &self,
         msg_id: &str,
@@ -376,15 +450,28 @@ impl AgentLoop {
         history: &mut Vec<ChatMessage>,
         emit: &mut F,
         journal: &mut Vec<ChatMessage>,
+        snapshots: &mut Vec<tools::FileSnapshot>,
     ) where
         F: FnMut(HarnessEvent),
     {
         // (permission `Ask` is resolved inside via the broker)
         let input: Value = serde_json::from_str(&call.arguments).unwrap_or(json!({}));
         emit(HarnessEvent::ToolStarted { tool: call.name.clone(), title: call.name.clone() });
+        // Capture pre-images of files this tool may mutate, before it runs, so
+        // `/undo` can restore the working tree.
+        for path in tools::snapshot_paths(&call.name, &input, cwd) {
+            let before = tokio::fs::read_to_string(&path).await.ok();
+            snapshots.push(tools::FileSnapshot {
+                path: path.to_string_lossy().to_string(),
+                before,
+            });
+        }
 
-        let tool = self.tools.iter().find(|t| t.spec().name == call.name);
-        let outcome = match tool {
+        let outcome = if call.name == "ask" {
+            self.run_ask(msg_id, call, &input, emit).await
+        } else {
+            let tool = self.tools.iter().find(|t| t.spec().name == call.name);
+            match tool {
             None => tools::ToolOutcome::err(format!("unknown tool: {}", call.name)),
             Some(tool) => {
                 let mut decision = self.permission.check(&call.name, &input);
@@ -410,6 +497,7 @@ impl AgentLoop {
                         tools::ToolOutcome::err(format!("permission denied for {}", call.name))
                     }
                 }
+            }
             }
         };
 
@@ -459,6 +547,60 @@ fn part_reasoning(msg_id: &str, text: &str) -> HarnessEvent {
 
 fn truncate_detail(args: &str) -> String {
     args.chars().take(200).collect()
+}
+
+/// Parse an `ask`-tool payload into provider-neutral questions.
+fn parse_questions(
+    input: &Value,
+    msg_id: &str,
+    call_id: &str,
+) -> Option<(Vec<crate::harness::Question>, crate::harness::QuestionPrompt)> {
+    use crate::harness::{Question, QuestionChoice, QuestionPrompt};
+    let arr = input.get("questions")?.as_array()?;
+    let mut questions = Vec::new();
+    for q in arr {
+        let question = q.get("question").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if question.is_empty() {
+            continue;
+        }
+        let header: String = q
+            .get("header")
+            .and_then(|v| v.as_str())
+            .unwrap_or(question)
+            .chars()
+            .take(40)
+            .collect();
+        let options = q
+            .get("options")
+            .and_then(|v| v.as_array())
+            .map(|opts| {
+                opts.iter()
+                    .map(|o| QuestionChoice {
+                        label: o.get("label").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                        description: o
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        questions.push(Question {
+            question: question.to_string(),
+            header,
+            options,
+            multiple: q.get("multiple").and_then(|v| v.as_bool()).unwrap_or(false),
+            custom: q.get("custom").and_then(|v| v.as_bool()).unwrap_or(true),
+        });
+    }
+    if questions.is_empty() {
+        return None;
+    }
+    Some((
+        questions.clone(),
+        QuestionPrompt { id: format!("{msg_id}-ask-{call_id}"), questions },
+    ))
 }
 
 fn part_meta(msg_id: &str, input: u64, output: u64) -> HarnessEvent {

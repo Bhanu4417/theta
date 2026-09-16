@@ -336,6 +336,8 @@ pub struct SessionState {
     pub paste_parts: Vec<crate::paste::PastePart>,
     /// Counter for image/file paste placeholders.
     pub paste_seq: u64,
+    /// Messages removed by the last rewind, for `/redo`.
+    pub redo_snapshot: Option<Vec<Message>>,
     /// `@file` mention suggestions for the current input word.
     pub mention_results: Vec<String>,
     /// Selected row in the `@` mention popup.
@@ -381,6 +383,7 @@ impl SessionState {
             synthetic_seq: 0,
             paste_parts: Vec::new(),
             paste_seq: 0,
+            redo_snapshot: None,
             mention_results: Vec::new(),
             mention_selected: 0,
             dirty: true,

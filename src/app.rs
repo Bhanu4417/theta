@@ -46,6 +46,8 @@ pub enum Overlay {
     LayoutPicker,
     ResumeSession,
     Tree,
+    /// agy-style `/undo` rewind picker.
+    Rewind,
 }
 
 // ---------------------------------------------------------------------------
@@ -101,8 +103,8 @@ fn builtin_slash_items() -> Vec<SlashItem> {
         SlashItem { name: "resume".into(), args: "".into(), desc: "Resume a previous session".into(), kind: SlashKind::Resume },
         SlashItem { name: "clear".into(), args: "".into(), desc: "Clear transcript view (history kept)".into(), kind: SlashKind::Clear },
         SlashItem { name: "compact".into(), args: "".into(), desc: "Summarize the conversation".into(), kind: SlashKind::Compact },
-        SlashItem { name: "undo".into(), args: "".into(), desc: "Revert the last message".into(), kind: SlashKind::Undo },
-        SlashItem { name: "redo".into(), args: "".into(), desc: "Re-apply a reverted message".into(), kind: SlashKind::Redo },
+        SlashItem { name: "undo".into(), args: "".into(), desc: "Rewind to an earlier message (pick from a list)".into(), kind: SlashKind::Undo },
+        SlashItem { name: "redo".into(), args: "".into(), desc: "Re-apply the last rewind".into(), kind: SlashKind::Redo },
         SlashItem { name: "share".into(), args: "".into(), desc: "Share this session (get URL)".into(), kind: SlashKind::Share },
         SlashItem { name: "unshare".into(), args: "".into(), desc: "Stop sharing this session".into(), kind: SlashKind::Unshare },
         SlashItem { name: "init".into(), args: "[focus]".into(), desc: "Create/update AGENTS.md".into(), kind: SlashKind::Init },
@@ -243,6 +245,27 @@ pub struct TreeRow {
 #[derive(Default)]
 pub struct TreeUi {
     pub items: Vec<TreeRow>,
+    pub selected: usize,
+}
+
+/// One user turn offered by the `/undo` rewind picker.
+#[derive(Clone)]
+pub struct RewindRow {
+    /// Index into the session transcript where this user message starts.
+    pub index: usize,
+    pub text: String,
+    /// Local backend: the tree entry id to rewind before.
+    pub entry: Option<String>,
+    /// OpenCode backend: the message id to revert.
+    pub msg_id: Option<String>,
+    pub adds: u32,
+    pub dels: u32,
+    pub files: usize,
+}
+
+#[derive(Default)]
+pub struct RewindState {
+    pub rows: Vec<RewindRow>,
     pub selected: usize,
 }
 
@@ -465,6 +488,8 @@ pub struct App {
     pub resume_picker: ResumePickerState,
     /// History tree navigator state (`/tree`).
     pub tree_ui: TreeUi,
+    /// `/undo` rewind picker state.
+    pub rewind_ui: RewindState,
     /// Set when the TUI should suspend and open `$EDITOR` for a prompt.
     pub pending_editor: Option<(u32, String)>,
     pub keys: crate::keys::Keymap,
@@ -567,6 +592,7 @@ impl App {
             busy_choice: 0,
             resume_picker: ResumePickerState::default(),
             tree_ui: TreeUi::default(),
+            rewind_ui: RewindState::default(),
             pending_editor: None,
             keys: crate::keys::Keymap::load(&key_overrides),
             session_cache: HashMap::new(),
@@ -2401,34 +2427,8 @@ impl App {
                     self.flash("compacting…");
                 }
             }
-            "undo" => {
-                let req = {
-                    let Some(s) = self.session(sid) else { return };
-                    match (s.oc_sid.clone(), s.messages.iter().rev().find(|m| m.role == Role::User)) {
-                        (Some(oc), Some(m)) => Some((s.dir.clone(), oc, m.id.clone())),
-                        (Some(_), None) => {
-                            self.flash("nothing to undo");
-                            None
-                        }
-                        _ => {
-                            self.flash("session is still connecting…");
-                            None
-                        }
-                    }
-                };
-                if let Some((dir, oc, msg)) = req {
-                    self.manager.revert(dir, oc, msg);
-                }
-            }
-            "redo" => {
-                let req = {
-                    let Some(s) = self.session(sid) else { return };
-                    s.oc_sid.clone().map(|oc| (s.dir.clone(), oc))
-                };
-                if let Some((dir, oc)) = req {
-                    self.manager.unrevert(dir, oc);
-                }
-            }
+            "undo" => self.open_rewind(sid),
+            "redo" => self.redo(sid),
             "share" => {
                 let req = {
                     let Some(s) = self.session(sid) else { return };
@@ -3463,6 +3463,197 @@ impl App {
         self.manager.local_tree(oc);
     }
 
+    /// Build rewind rows (user turns + per-turn diff stats) from a transcript.
+    /// `tree_users` are `(entry_id, text)` for the local history tree.
+    fn build_rewind_rows(
+        msgs: &[Message],
+        tree_users: &[(String, String)],
+        local: bool,
+    ) -> Vec<RewindRow> {
+        let user_idx: Vec<usize> = msgs
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.role == Role::User)
+            .map(|(i, _)| i)
+            .collect();
+        let mut rows = Vec::new();
+        for (k, &i) in user_idx.iter().enumerate() {
+            let text = msgs[i]
+                .parts
+                .iter()
+                .filter_map(|p| match &p.kind {
+                    PartKind::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let end = user_idx.get(k + 1).copied().unwrap_or(msgs.len());
+            let (mut adds, mut dels) = (0u32, 0u32);
+            let mut files = std::collections::HashSet::new();
+            for m in &msgs[i + 1..end] {
+                for p in &m.parts {
+                    if let PartKind::Tool(t) = &p.kind {
+                        if let Some(path) = t.file_path() {
+                            files.insert(path);
+                        }
+                        if let Some(d) = t.diff() {
+                            for line in d.lines() {
+                                if line.starts_with('+') && !line.starts_with("+++") {
+                                    adds += 1;
+                                } else if line.starts_with('-') && !line.starts_with("---") {
+                                    dels += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let (entry, msg_id) = if local {
+                (tree_users.get(k).map(|(e, _)| e.clone()), None)
+            } else {
+                (None, Some(msgs[i].id.clone()))
+            };
+            rows.push(RewindRow {
+                index: i,
+                text,
+                entry,
+                msg_id,
+                adds,
+                dels,
+                files: files.len(),
+            });
+        }
+        rows
+    }
+
+    /// Open the agy-style rewind picker for session `sid`.
+    pub fn open_rewind(&mut self, sid: u32) {
+        let Some((oc, local)) = self
+            .session(sid)
+            .map(|s| (s.oc_sid.clone(), self.manager.is_local()))
+        else {
+            return;
+        };
+        let Some(oc) = oc else {
+            self.flash("session is still connecting…");
+            return;
+        };
+        // Local sessions: map each user turn to its history-tree entry (the
+        // active path preserves transcript order, so index alignment holds).
+        let tree_users: Vec<(String, String)> = if local {
+            self.manager
+                .local_tree_snapshot(&oc)
+                .map(|t| {
+                    t.active_path()
+                        .into_iter()
+                        .filter(|e| e.kind == crate::tree::EntryKind::User)
+                        .map(|e| (e.id.clone(), e.text.clone()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let msgs = self
+            .session(sid)
+            .map(|s| s.messages.clone())
+            .unwrap_or_default();
+        // Entry ids only map 1:1 when the tree and transcript agree.
+        let aligned: Vec<(String, String)> = if local
+            && tree_users.len()
+                != msgs.iter().filter(|m| m.role == Role::User).count()
+        {
+            Vec::new()
+        } else {
+            tree_users
+        };
+        let rows = Self::build_rewind_rows(&msgs, &aligned, local);
+        if rows.is_empty() {
+            self.flash("nothing to rewind");
+            return;
+        }
+        let selected = rows.len() - 1;
+        self.rewind_ui = RewindState { rows, selected };
+        self.overlay = Overlay::Rewind;
+        self.dirty = true;
+    }
+
+    /// Apply the highlighted rewind: drop the turn's output, put the prompt
+    /// back in the chatbox, and move the local history leaf before it.
+    pub fn rewind_selected(&mut self) {
+        let sid = self.focus;
+        let Some(row) = self.rewind_ui.rows.get(self.rewind_ui.selected).cloned() else {
+            return;
+        };
+        let Some((dir, oc, local)) = self
+            .session(sid)
+            .map(|s| (s.dir.clone(), s.oc_sid.clone(), self.manager.is_local()))
+        else {
+            return;
+        };
+        let Some(oc) = oc else { return };
+        if local {
+            let Some(entry) = &row.entry else {
+                self.flash("history tree out of sync — use /tree");
+                return;
+            };
+            self.manager.local_rewind(oc, entry.clone());
+        } else if let Some(mid) = &row.msg_id {
+            self.manager.revert(dir, oc, mid.clone());
+        }
+        if let Some(s) = self.session_mut(sid) {
+            let removed: Vec<Message> = s.messages.split_off(row.index.min(s.messages.len()));
+            s.redo_snapshot = Some(removed);
+            s.input.clear();
+            s.input.buf = row.text.clone();
+            s.input.cursor = s.input.buf.chars().count();
+            s.status = SessStatus::Idle;
+            s.stick_bottom = true;
+            s.dirty = true;
+        }
+        self.overlay = Overlay::None;
+        let first: String = row.text.lines().next().unwrap_or("").chars().take(48).collect();
+        self.flash(format!("rewound: {first}"));
+        self.dirty = true;
+    }
+
+    /// `/redo`: restore the turn dropped by the last local rewind.
+    pub fn redo(&mut self, sid: u32) {
+        if !self.manager.is_local() {
+            let req = {
+                let Some(s) = self.session(sid) else { return };
+                s.oc_sid.clone().map(|oc| (s.dir.clone(), oc))
+            };
+            if let Some((dir, oc)) = req {
+                self.manager.unrevert(dir, oc);
+            }
+            return;
+        }
+        let Some((oc, removed)) = self
+            .session(sid)
+            .map(|s| (s.oc_sid.clone(), s.redo_snapshot.clone()))
+        else {
+            return;
+        };
+        let (Some(oc), Some(removed)) = (oc, removed) else {
+            self.flash("nothing to redo");
+            return;
+        };
+        if self.manager.local_redo(oc) {
+            if let Some(s) = self.session_mut(sid) {
+                s.messages.extend(removed);
+                s.redo_snapshot = None;
+                s.recompute_metrics();
+                s.stick_bottom = true;
+                s.dirty = true;
+            }
+            self.flash("redone");
+            self.dirty = true;
+        } else {
+            self.flash("nothing to redo");
+        }
+    }
+
     /// Flatten a session tree into indented rows (depth-first).
     fn tree_rows(tree: &crate::tree::SessionTree) -> Vec<TreeRow> {
         use std::collections::HashSet;
@@ -4387,6 +4578,29 @@ impl App {
                     _ => {}
                 }
             }
+            Overlay::Rewind => match key.code {
+                KeyCode::Esc => self.overlay = Overlay::None,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.rewind_ui.selected = self.rewind_ui.selected.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let n = self.rewind_ui.rows.len();
+                    if n > 0 {
+                        self.rewind_ui.selected = (self.rewind_ui.selected + 1).min(n - 1);
+                    }
+                }
+                KeyCode::PageUp => {
+                    self.rewind_ui.selected = self.rewind_ui.selected.saturating_sub(10);
+                }
+                KeyCode::PageDown => {
+                    let n = self.rewind_ui.rows.len();
+                    if n > 0 {
+                        self.rewind_ui.selected = (self.rewind_ui.selected + 10).min(n - 1);
+                    }
+                }
+                KeyCode::Enter => self.rewind_selected(),
+                _ => {}
+            },
             Overlay::None => {}
         }
         self.dirty = true;
@@ -5436,6 +5650,57 @@ mod harness_tests {
             },
         });
         m
+    }
+
+    #[test]
+    fn rewind_rows_carry_diff_stats_and_entry_mapping() {
+        use crate::harness::transcript::{Part, PartKind, ToolInfo, ToolStatus};
+        let mut u1 = text_msg("msg_u1", Role::User, Some(1), "first request");
+        u1.parts.clear();
+        u1.parts.push(Part {
+            id: "u1p".into(),
+            message_id: "msg_u1".into(),
+            kind: PartKind::Text { text: "first request".into(), synthetic: false },
+        });
+        let mut a1 = text_msg("msg_a1", Role::Assistant, Some(2), "did it");
+        a1.parts.push(Part {
+            id: "t1".into(),
+            message_id: "msg_a1".into(),
+            kind: PartKind::Tool(ToolInfo {
+                tool: "edit".into(),
+                call_id: "c1".into(),
+                status: ToolStatus::Completed,
+                title: Some("edit".into()),
+                input: serde_json::json!({"path": "src/lib.rs"}),
+                output: Some("ok".into()),
+                error: None,
+                metadata: serde_json::json!({
+                    "diff": "--- a/src/lib.rs\n+++ b/src/lib.rs\n+added one\n+added two\n-removed one\n",
+                    "path": "src/lib.rs"
+                }),
+                start_ms: None,
+            }),
+        });
+        let u2 = text_msg("msg_u2", Role::User, Some(3), "second request");
+        let msgs = vec![u1, a1, u2];
+
+        let tree_users = vec![("e2".to_string(), "first request".to_string())];
+        let rows = App::build_rewind_rows(&msgs, &tree_users, true);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].text, "first request");
+        assert_eq!(rows[0].adds, 2);
+        assert_eq!(rows[0].dels, 1);
+        assert_eq!(rows[0].files, 1);
+        assert_eq!(rows[0].entry.as_deref(), Some("e2"));
+        assert_eq!(rows[0].index, 0);
+        assert_eq!(rows[1].text, "second request");
+        assert_eq!(rows[1].adds, 0);
+        assert_eq!(rows[1].index, 2);
+
+        // Non-local rows expose the message id for OpenCode revert.
+        let rows = App::build_rewind_rows(&msgs, &[], false);
+        assert_eq!(rows[0].msg_id.as_deref(), Some("msg_u1"));
+        assert!(rows[0].entry.is_none());
     }
 
     #[test]

@@ -1362,3 +1362,87 @@ pub fn render_tree(f: &mut ratatui::Frame, app: &App, area: Rect) {
     }
     f.render_widget(Paragraph::new(lines), inner);
 }
+
+
+/// The agy-style `/undo` rewind picker: user turns with per-turn diff stats.
+pub fn render_rewind(f: &mut ratatui::Frame, app: &App, screen: Rect, anchor: Option<Rect>) {
+    let rows = &app.rewind_ui.rows;
+    let visible = rows.len().min(12).max(1);
+    let h = (visible + 2) as u16;
+    let rect = match anchor {
+        Some(r) => Rect {
+            x: r.x,
+            y: r.y.saturating_sub(h).max(screen.y + 1),
+            width: r.width.min(76),
+            height: h,
+        },
+        None => centered_rect(60, h, screen),
+    };
+    if rect.width < 24 || rect.height < 3 {
+        return;
+    }
+    let inner = surface(
+        f,
+        rect,
+        title_line(vec![
+            Span::styled("Rewind", theme::bold(pal().fg)),
+            Span::styled("  revert to an earlier message", theme::mute()),
+        ]),
+    );
+    if inner.width < 20 || inner.height == 0 {
+        return;
+    }
+    if rows.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled("  nothing to rewind", theme::dim()))),
+            inner,
+        );
+        return;
+    }
+    let w = inner.width as usize;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "  ↑/↓ move · Enter rewind · Esc cancel",
+        theme::mute(),
+    )));
+    let offset = window_offset(app.rewind_ui.selected, rows.len(), visible);
+    for (i, row) in rows.iter().enumerate().skip(offset) {
+        if lines.len() + 1 >= inner.height as usize {
+            break;
+        }
+        let is_sel = i == app.rewind_ui.selected;
+        let stats = if row.adds == 0 && row.dels == 0 {
+            if row.files > 0 {
+                format!("{} file(s)", row.files)
+            } else {
+                "no changes".to_string()
+            }
+        } else {
+            format!("+{} -{}", row.adds, row.dels)
+        };
+        let text_width = w.saturating_sub(stats.chars().count() + 4).max(8);
+        let label = truncate(
+            row.text.lines().next().unwrap_or("").trim(),
+            text_width,
+        );
+        let mut spans = vec![
+            Span::styled("  ".to_string(), Style::default()),
+            Span::styled(
+                stats,
+                if row.dels > 0 { theme::fg(pal().red) } else { theme::fg(pal().green) },
+            ),
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                label,
+                if is_sel { theme::bold(pal().fg) } else { theme::fg(pal().fg_soft) },
+            ),
+        ];
+        if is_sel {
+            for s in &mut spans {
+                s.style = s.style.bg(pal().selection);
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}

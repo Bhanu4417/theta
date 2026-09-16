@@ -84,14 +84,14 @@ impl ProviderCapabilities {
         filesystem: true,
     };
 
-    /// Theta's own loop: streams and has file tools, but no provider-native
-    /// resume/fork/permissions/questions yet.
+    /// Theta's own loop: streaming, file tools, permissions/questions, resume
+    /// and fork are all handled in-process.
     pub const LOCAL: Self = Self {
-        native_resume: false,
-        native_fork: false,
+        native_resume: true,
+        native_fork: true,
         streaming: true,
-        permissions: false,
-        questions: false,
+        permissions: true,
+        questions: true,
         filesystem: true,
     };
 }

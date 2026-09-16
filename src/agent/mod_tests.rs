@@ -130,6 +130,74 @@ async fn ask_gate_denied_blocks_the_tool() {
 }
 
 #[tokio::test]
+async fn ask_tool_round_trips_a_question() {
+    let dir = std::env::temp_dir().join(format!("theta-ask-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let provider = Box::new(ScriptedProvider::new(vec![
+        AssistantTurn {
+            text: String::new(),
+            tool_calls: vec![call(
+                "c1",
+                "ask",
+                r#"{"questions":[{"question":"Pick one","header":"pick","options":[{"label":"A"},{"label":"B"}]}]}"#,
+            )],
+            finish: Some(FinishReason::ToolCalls),
+        },
+        AssistantTurn { text: "thanks".into(), tool_calls: vec![], finish: Some(FinishReason::Stop) },
+    ]));
+    let broker = std::sync::Arc::new(crate::agent::permissions::QuestionBroker::new());
+    let agent = AgentLoop::new(provider, "m").with_question_broker(broker.clone());
+
+    let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
+    let run_dir = dir.clone();
+    let handle = tokio::spawn(async move {
+        let mut history = Vec::new();
+        let mut emit = move |e: HarnessEvent| {
+            let _ = etx.send(e);
+        };
+        let result = agent.run_turn(&mut history, "go", &run_dir, &mut emit).await;
+        (result, history)
+    });
+
+    let qid = loop {
+        match erx.recv().await.unwrap() {
+            HarnessEvent::QuestionAsked(p) => break p.id,
+            _ => continue,
+        }
+    };
+    assert!(broker.reply(&qid, vec![vec!["A".to_string()]]));
+
+    let (result, history) = handle.await.unwrap();
+    assert!(result.is_ok());
+    assert!(
+        history.iter().any(|m| m.role == crate::ai::Role::Tool && m.text.contains('A')),
+        "the answer reaches the model: {history:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn ask_tool_without_a_broker_errors_instead_of_hanging() {
+    let dir = std::env::temp_dir();
+    let provider = Box::new(ScriptedProvider::new(vec![
+        AssistantTurn {
+            text: String::new(),
+            tool_calls: vec![call("c1", "ask", r#"{"questions":[{"question":"Pick"}]}"#)],
+            finish: Some(FinishReason::ToolCalls),
+        },
+        AssistantTurn { text: "done".into(), tool_calls: vec![], finish: Some(FinishReason::Stop) },
+    ]));
+    let agent = AgentLoop::new(provider, "m");
+    let mut history = Vec::new();
+    let mut emit = |_e: HarnessEvent| {};
+    // No broker: the tool returns an error rather than blocking forever.
+    agent.run_turn(&mut history, "go", &dir, &mut emit).await.unwrap();
+    assert!(history.iter().any(|m| m.text.contains("no interactive session")));
+}
+
+#[tokio::test]
 async fn loop_runs_a_tool_then_finishes() {
     let dir = std::env::temp_dir().join(format!("theta-loop-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

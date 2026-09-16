@@ -169,6 +169,26 @@ pub fn render(f: &mut ratatui::Frame, app: &mut App) {
         Overlay::ResumeSession => overlays::render_resume_picker(f, app, area),
         Overlay::LayoutPicker => overlays::render_layout_picker(f, app, area),
         Overlay::Tree => overlays::render_tree(f, app, area),
+        Overlay::Rewind => {
+            let anchor = app.focused().and_then(|sess| {
+                let rects = app.layout_rects(app.last_body_area)?;
+                let (_, pr) = rects.iter().find(|(sid, _)| *sid == sess.id)?;
+                let inner = Rect {
+                    x: pr.x + 1,
+                    y: pr.y + 1,
+                    width: pr.width.saturating_sub(2),
+                    height: pr.height.saturating_sub(2),
+                };
+                let ih = pane::input_height(sess, inner.width as usize, inner.height as usize);
+                Some(Rect {
+                    x: inner.x + 1,
+                    y: inner.y + inner.height.saturating_sub(ih),
+                    width: inner.width.saturating_sub(2),
+                    height: ih,
+                })
+            });
+            overlays::render_rewind(f, app, area, anchor);
+        }
         Overlay::None => {}
     }
 }

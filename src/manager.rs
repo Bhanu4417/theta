@@ -48,8 +48,15 @@ struct ManagerRef {
     children: Arc<Mutex<Vec<u32>>>,
     /// Present when `cfg.backend == "local"`: the in-process agent backend.
     local: Option<Arc<LocalProvider>>,
-    /// Interactive permission broker for the local backend.
-    local_broker: Option<Arc<crate::agent::permissions::Broker>>,
+    /// Interactive gates (permissions + questions) for the local backend.
+    local_gates: Option<LocalGates>,
+}
+
+/// Shared interactive gates wired into every locally-built agent.
+#[derive(Clone)]
+pub struct LocalGates {
+    pub permissions: Arc<crate::agent::permissions::Broker>,
+    pub questions: Arc<crate::agent::permissions::QuestionBroker>,
 }
 
 impl ManagerRef {
@@ -126,12 +133,12 @@ pub struct Manager {
 
 impl Manager {
     pub fn new(tx: tokio::sync::mpsc::UnboundedSender<AppEvent>, cfg: Config) -> Self {
-        let mut local_broker = None;
+        let mut local_gates = None;
         let local = if cfg.backend == "local" {
             match build_local_provider(&cfg) {
-                Ok((provider, broker)) => {
+                Ok((provider, gates)) => {
                     let local = Arc::new(provider);
-                    local_broker = broker;
+                    local_gates = gates;
                     // Local events carry no workspace; routing is by session id
                     // (an empty dir is a wildcard in `App::route_session`).
                     spawn_event_pump(local.clone(), PathBuf::new(), tx.clone());
@@ -154,7 +161,7 @@ impl Manager {
                 inner: Arc::new(Mutex::new(Inner::default())),
                 children: Arc::new(Mutex::new(Vec::new())),
                 local,
-                local_broker,
+                local_gates,
             },
             req_seq: AtomicU64::new(1),
         }
@@ -232,6 +239,21 @@ impl Manager {
         }
     }
 
+    /// Synchronously read a local session's history tree (for `/undo`).
+    pub fn local_tree_snapshot(&self, oc_sid: &str) -> Option<crate::tree::SessionTree> {
+        self.ref_.local.as_ref()?.tree_snapshot(oc_sid)
+    }
+
+    /// Rewind a local session to just before `entry`; returns the user text.
+    pub fn local_rewind(&self, oc_sid: String, entry: String) -> Option<String> {
+        self.ref_.local.as_ref()?.rewind(&oc_sid, &entry)
+    }
+
+    /// Restore the leaf most recently abandoned by [`Self::local_rewind`].
+    pub fn local_redo(&self, oc_sid: String) -> bool {
+        self.ref_.local.as_ref().is_some_and(|l| l.redo(&oc_sid))
+    }
+
     /// Force compaction of a local session (`/compact`).
     pub fn local_compact(&self, oc_sid: String) {
         let Some(local) = self.ref_.local.clone() else {
@@ -251,9 +273,9 @@ impl Manager {
 
     /// Answer an interactive permission request for the local backend.
     pub fn local_permission_reply(&self, _oc_sid: String, id: String, response: String) {
-        if let Some(broker) = &self.ref_.local_broker {
+        if let Some(gates) = &self.ref_.local_gates {
             let decision = crate::agent::permissions::decision_for(&response);
-            if !broker.reply(&id, decision) {
+            if !gates.permissions.reply(&id, decision) {
                 crate::tlog!("PERM local reply for unknown request {id}");
             }
         }
@@ -580,9 +602,6 @@ impl Manager {
     }
 
     pub fn reply_permission(&self, dir: PathBuf, oc_sid: String, pid: String, response: String) {
-        if self.local_unsupported("permissions") {
-            return;
-        }
         let m = self.ref_.clone();
         tokio::spawn(async move {
             let Ok((_, client)) = m.ensure_server(&dir).await else {
@@ -702,10 +721,21 @@ impl Manager {
         source: u32,
         at: Option<String>,
     ) {
-        if self.ref_.local.is_some() {
-            self.ref_.emit(AppEvent::OcForkFailed {
-                source,
-                error: "fork is not supported by the local backend yet".into(),
+        if let Some(local) = self.ref_.local.clone() {
+            let m = self.ref_.clone();
+            tokio::spawn(async move {
+                let session = ProviderSession {
+                    provider: ProviderKind::Local,
+                    id: oc_sid.clone(),
+                    directory: dir.to_string_lossy().to_string(),
+                };
+                match local.fork(&session, at.as_deref()).await {
+                    Ok(new) => m.emit(AppEvent::OcForked { dir, session: new, source }),
+                    Err(e) => m.emit(AppEvent::OcForkFailed {
+                        source,
+                        error: format!("fork failed: {e}"),
+                    }),
+                }
             });
             return;
         }
@@ -742,7 +772,12 @@ impl Manager {
 
     /// Answer a pending agent question.
     pub fn reply_question(&self, dir: PathBuf, id: String, answers: Vec<Vec<String>>) {
-        if self.local_unsupported("questions") {
+        if let Some(gates) = &self.ref_.local_gates {
+            let ok = gates.questions.reply(&id, answers);
+            self.ref_.emit(AppEvent::OpResult {
+                ok,
+                message: if ok { "answer sent".into() } else { "answer expired".into() },
+            });
             return;
         }
         let m = self.ref_.clone();
@@ -760,7 +795,12 @@ impl Manager {
 
     /// Reject a pending agent question.
     pub fn reject_question(&self, dir: PathBuf, id: String) {
-        if self.local_unsupported("questions") {
+        if let Some(gates) = &self.ref_.local_gates {
+            let ok = gates.questions.reject(&id);
+            self.ref_.emit(AppEvent::OpResult {
+                ok,
+                message: if ok { "question rejected".into() } else { "question expired".into() },
+            });
             return;
         }
         let m = self.ref_.clone();
@@ -862,7 +902,12 @@ impl Manager {
     }
 
     pub fn revert(&self, dir: PathBuf, oc_sid: String, message_id: String) {
-        if self.local_unsupported("undo") {
+        if let Some(local) = self.ref_.local.clone() {
+            // Best effort: OpenCode message ids are meaningless locally, so we
+            // fall back to rewinding to the matching user entry when possible.
+            if local.rewind_user(&oc_sid, &message_id) {
+                self.ref_.emit(AppEvent::OpResult { ok: true, message: "rewound".into() });
+            }
             return;
         }
         let m = self.ref_.clone();
@@ -883,7 +928,10 @@ impl Manager {
     }
 
     pub fn unrevert(&self, dir: PathBuf, oc_sid: String) {
-        if self.local_unsupported("redo") {
+        if let Some(local) = self.ref_.local.clone() {
+            if local.redo(&oc_sid) {
+                self.ref_.emit(AppEvent::OpResult { ok: true, message: "redone".into() });
+            }
             return;
         }
         let m = self.ref_.clone();
@@ -904,7 +952,15 @@ impl Manager {
     }
 
     pub fn share(&self, dir: PathBuf, oc_sid: String, want: bool) {
-        if self.local_unsupported("share") {
+        if self.ref_.local.is_some() {
+            self.ref_.emit(AppEvent::OpResult {
+                ok: false,
+                message: if want {
+                    "the local backend has no share links; use /export instead".into()
+                } else {
+                    "nothing to unshare on the local backend".into()
+                },
+            });
             return;
         }
         let m = self.ref_.clone();
@@ -1077,22 +1133,69 @@ async fn spawn_server(cfg: &Config, dir: &Path) -> Result<(String, Option<tokio:
 
 /// Build the local backend from config: an OpenAI-compatible LLM provider
 /// wrapped in an agent loop (tools + permission policy + catalog).
-fn build_local_provider(
-    cfg: &Config,
-) -> Result<(LocalProvider, Option<Arc<crate::agent::permissions::Broker>>), ProviderError> {
-    let (agent, broker) = build_agent(cfg, true)?;
+fn build_local_provider(cfg: &Config) -> Result<(LocalProvider, Option<LocalGates>), ProviderError> {
+    let (agent, gates) = build_agent(cfg, true)?;
+    // Picking a different model rebuilds the provider adapter on demand, so
+    // the local backend honours the model picker.
+    let broker = gates.clone();
+    let base_cfg = cfg.clone();
+    let factory: crate::providers::local::AgentFactory = Arc::new(move |provider, model| {
+        let mut c = base_cfg.clone();
+        if !provider.is_empty() {
+            c.ai.provider = provider.to_string();
+        }
+        if !model.is_empty() {
+            c.ai.model = model.to_string();
+        }
+        build_agent_with(&c, true, broker.clone(), true).map(Arc::new)
+    });
+    let provider_id = cfg.ai.provider.to_ascii_lowercase();
+    let default_model = resolved_model(cfg, &provider_id);
     let dir = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .to_string_lossy()
         .to_string();
-    Ok((LocalProvider::new(Arc::new(agent), dir), broker))
+    let local = LocalProvider::with_factory(
+        factory,
+        Arc::new(agent),
+        (cfg.ai.provider.clone(), default_model),
+        dir,
+    );
+    Ok((local, gates))
+}
+
+/// The model a provider config resolves to (`ai.model`, else the preset default).
+fn resolved_model(cfg: &Config, provider_id: &str) -> String {
+    if cfg.ai.model.trim().is_empty() {
+        default_model_for(provider_id).to_string()
+    } else {
+        cfg.ai.model.clone()
+    }
 }
 
 /// Build the in-process agent from config (also used by headless modes).
 pub fn build_agent(
     cfg: &Config,
     interactive: bool,
-) -> Result<(crate::agent::AgentLoop, Option<Arc<crate::agent::permissions::Broker>>), ProviderError>
+) -> Result<(crate::agent::AgentLoop, Option<LocalGates>), ProviderError> {
+    let gates = if interactive && cfg.behavior.local_permissions == "ask" {
+        Some(LocalGates {
+            permissions: Arc::new(crate::agent::permissions::Broker::new()),
+            questions: Arc::new(crate::agent::permissions::QuestionBroker::new()),
+        })
+    } else {
+        None
+    };
+    let agent = build_agent_with(cfg, interactive, gates.clone(), true)?;
+    Ok((agent, gates))
+}
+
+fn build_agent_with(
+    cfg: &Config,
+    interactive: bool,
+    gates: Option<LocalGates>,
+    allow_task: bool,
+) -> Result<crate::agent::AgentLoop, ProviderError>
 {
     let ai = &cfg.ai;
     let provider_id = ai.provider.to_ascii_lowercase();
@@ -1141,14 +1244,29 @@ pub fn build_agent(
         .with_compaction(settings, cfg.compaction.enabled)
         .with_system_appendix(appendix);
     // Permissions: interactive `ask` for the TUI, auto-allow for headless.
-    let mut broker = None;
-    agent = agent.with_permission(gate_for(&cfg.behavior.local_permissions, interactive));
-    if interactive && cfg.behavior.local_permissions == "ask" {
-        let b = Arc::new(crate::agent::permissions::Broker::new());
-        agent = agent.with_broker(b.clone());
-        broker = Some(b);
+    let ask = interactive
+        && cfg.behavior.local_permissions == "ask"
+        && gates.is_some();
+    agent = agent.with_permission(if ask {
+        Box::new(crate::agent::tools::AskGate)
+    } else if interactive || gates.is_some() {
+        gate_for(&cfg.behavior.local_permissions, interactive)
+    } else {
+        Box::new(crate::agent::tools::AllowAll)
+    });
+    if let Some(g) = &gates {
+        agent = agent
+            .with_broker(g.permissions.clone())
+            .with_question_broker(g.questions.clone());
     }
-    Ok((agent, broker))
+    if allow_task {
+        // Sub-agents run with the same model but auto-approved and without a
+        // `task` tool of their own, so spawning cannot recurse.
+        let sub_cfg = cfg.clone();
+        let builder = Arc::new(move || build_agent_with(&sub_cfg, false, None, false));
+        agent = agent.with_extra_tool(Arc::new(crate::agent::tools::TaskTool::new(builder)));
+    }
+    Ok(agent)
 }
 
 fn gate_for(mode: &str, interactive: bool) -> Box<dyn crate::agent::tools::PermissionGate> {

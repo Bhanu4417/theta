@@ -315,6 +315,152 @@ impl Tool for MultiEditTool {
     }
 }
 
+/// A pre-image of a file a mutating tool is about to change. `before = None`
+/// means the file did not exist (rewind deletes it).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct FileSnapshot {
+    pub path: String,
+    pub before: Option<String>,
+}
+
+/// Paths a tool call is about to mutate, so the loop can snapshot them first.
+/// Unknown tools and `bash` return nothing (their effects are opaque).
+pub fn snapshot_paths(tool_name: &str, input: &Value, cwd: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    match tool_name {
+        "write" | "edit" => {
+            if let Some(p) = str_arg(input, &["path", "file_path", "filePath"]) {
+                out.push(resolve(cwd, &p));
+            }
+        }
+        "multiedit" => {
+            if let Some(edits) = input.get("edits").and_then(|e| e.as_array()) {
+                for e in edits {
+                    if let Some(p) = str_arg(e, &["path", "file_path", "filePath"]) {
+                        out.push(resolve(cwd, &p));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Delegate a focused sub-task to a nested agent loop and return its report.
+/// The builder is supplied by the provider so the sub-agent shares the same
+/// model/credentials but runs with a fresh, auto-approved context.
+pub struct TaskTool {
+    build: Arc<dyn Fn() -> Result<crate::agent::AgentLoop, crate::providers::ProviderError> + Send + Sync>,
+}
+
+impl TaskTool {
+    pub fn new(
+        build: Arc<
+            dyn Fn() -> Result<crate::agent::AgentLoop, crate::providers::ProviderError>
+                + Send
+                + Sync,
+        >,
+    ) -> Self {
+        Self { build }
+    }
+}
+
+impl Tool for TaskTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "task".into(),
+            description: "Delegate a self-contained sub-task to a sub-agent and get its report. \
+                          The sub-agent has the same tools but no interactive prompts."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "description": { "type": "string", "description": "Short 3-5 word description" },
+                    "prompt": { "type": "string", "description": "Self-contained instructions for the sub-agent" }
+                },
+                "required": ["prompt"]
+            }),
+        }
+    }
+    fn run<'a>(&'a self, input: &'a Value, cwd: &'a Path) -> Pin<Box<dyn Future<Output = ToolOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(prompt) = str_arg(input, &["prompt", "description"]) else {
+                return ToolOutcome::err("task: `prompt` is required");
+            };
+            if prompt.trim().is_empty() {
+                return ToolOutcome::err("task: `prompt` is empty");
+            }
+            let agent = match (self.build)() {
+                Ok(a) => a,
+                Err(e) => return ToolOutcome::err(format!("task: could not start sub-agent: {e}")),
+            };
+            let mut history = Vec::new();
+            let mut emit = |_e: crate::harness::HarnessEvent| {};
+            if let Err(e) = agent.run_turn(&mut history, &prompt, cwd, &mut emit).await {
+                return ToolOutcome::err(format!("task: sub-agent failed: {e}"));
+            }
+            let report = history
+                .iter()
+                .filter(|m| m.role == crate::ai::Role::Assistant && !m.text.trim().is_empty())
+                .map(|m| m.text.trim().to_string())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            if report.is_empty() {
+                ToolOutcome::err("task: sub-agent produced no output")
+            } else {
+                ToolOutcome::ok(cap(report, MAX_TOOL_BYTES))
+            }
+        })
+    }
+}
+
+/// Ask the user one or more multiple-choice questions. Execution is handled by
+/// the agent loop (it needs the event stream + question broker), so `run` is
+/// only a fallback that should never be reached.
+pub struct AskTool;
+impl Tool for AskTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "ask".into(),
+            description: "Ask the user a question with selectable options.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "questions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "question": { "type": "string" },
+                                "header": { "type": "string" },
+                                "options": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "label": { "type": "string" },
+                                            "description": { "type": "string" }
+                                        },
+                                        "required": ["label"]
+                                    }
+                                },
+                                "multiple": { "type": "boolean" },
+                                "custom": { "type": "boolean" }
+                            },
+                            "required": ["question"]
+                        }
+                    }
+                },
+                "required": ["questions"]
+            }),
+        }
+    }
+    fn run<'a>(&'a self, _input: &'a Value, _cwd: &'a Path) -> Pin<Box<dyn Future<Output = ToolOutcome> + Send + 'a>> {
+        Box::pin(async move { ToolOutcome::err("ask is handled by the agent loop") })
+    }
+}
+
 pub struct BashTool;
 impl Tool for BashTool {
     fn spec(&self) -> ToolSpec {
@@ -525,6 +671,7 @@ pub fn default_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(GrepTool),
         Arc::new(GlobTool),
         Arc::new(WebFetchTool),
+        Arc::new(AskTool),
     ]
 }
 
@@ -594,6 +741,68 @@ mod tests {
         assert!(r.ok, "{r:?}");
         assert_eq!(ReadTool.run(&json!({"path": "a.txt"}), &dir).await.output, "1 two 3");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn task_tool_runs_a_subagent_and_returns_its_report() {
+        use crate::ai::{AssistantTurn, ChatRequest, FinishReason, Provider, ProviderEvent};
+        struct Reply(String);
+        impl Provider for Reply {
+            fn id(&self) -> &'static str {
+                "reply"
+            }
+            fn stream<'a>(
+                &'a self,
+                _r: ChatRequest,
+                on: &'a mut (dyn FnMut(ProviderEvent) + Send),
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<AssistantTurn, crate::providers::ProviderError>> + Send + 'a>,
+            > {
+                Box::pin(async move {
+                    on(ProviderEvent::TextDelta(self.0.clone()));
+                    Ok(AssistantTurn {
+                        text: self.0.clone(),
+                        tool_calls: vec![],
+                        finish: Some(FinishReason::Stop),
+                    })
+                })
+            }
+        }
+        let builder = Arc::new(|| {
+            Ok(crate::agent::AgentLoop::new(Box::new(Reply("SUBAGENT-REPORT".into())), "m"))
+        });
+        let dir = std::env::temp_dir();
+        let out = TaskTool::new(builder)
+            .run(&json!({"description": "look", "prompt": "investigate"}), &dir)
+            .await;
+        assert!(out.ok, "{out:?}");
+        assert!(out.output.contains("SUBAGENT-REPORT"), "{}", out.output);
+
+        // Empty prompt is a clean error.
+        assert!(!TaskTool::new(Arc::new(|| {
+            Ok(crate::agent::AgentLoop::new(Box::new(Reply("x".into())), "m"))
+        }))
+        .run(&json!({"prompt": "   "}), &dir)
+        .await
+        .ok);
+    }
+
+    #[test]
+    fn snapshot_paths_finds_mutation_targets() {
+        let cwd = Path::new("/tmp/theta-snap");
+        assert_eq!(snapshot_paths("write", &json!({"path": "a.txt"}), cwd).len(), 1);
+        assert_eq!(snapshot_paths("edit", &json!({"filePath": "b.txt"}), cwd).len(), 1);
+        assert_eq!(
+            snapshot_paths(
+                "multiedit",
+                &json!({"edits": [{"path": "a"}, {"path": "b"}]}),
+                cwd
+            )
+            .len(),
+            2
+        );
+        assert!(snapshot_paths("bash", &json!({"command": "rm -rf x"}), cwd).is_empty());
+        assert!(snapshot_paths("read", &json!({"path": "a"}), cwd).is_empty());
     }
 
     #[test]
