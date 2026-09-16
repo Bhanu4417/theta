@@ -20,6 +20,7 @@ mod harness;
 mod highlight;
 mod keys;
 mod logging;
+mod mcp;
 mod manager;
 mod mentions;
 mod opencode;
@@ -61,6 +62,8 @@ struct Args {
     json: bool,
     /// Prompt / positional arguments.
     prompt: Vec<String>,
+    /// Live-verify LLM providers (positional args are provider ids).
+    check_ai: bool,
 }
 
 fn usage() -> &'static str {
@@ -77,6 +80,7 @@ OPTIONS:
     --log              Write a verbose debug log (works from any directory)
     -p, --print        Run one prompt headlessly and print the reply
     --json             With --print, emit events as JSON lines
+    --check-ai [PROV…] Live-verify provider credentials (default: [ai].provider)
     --help             Show this help
     --version          Show version
 
@@ -96,6 +100,7 @@ fn parse_args() -> Args {
         print: false,
         json: false,
         prompt: Vec::new(),
+        check_ai: false,
     };
     let mut positional: Vec<String> = Vec::new();
     for a in std::env::args().skip(1) {
@@ -106,10 +111,11 @@ fn parse_args() -> Args {
             "--version" | "-V" => args.version = true,
             "--print" | "-p" => args.print = true,
             "--json" => args.json = true,
+            "--check-ai" => args.check_ai = true,
             _ => positional.push(a),
         }
     }
-    if args.print || args.json {
+    if args.print || args.json || args.check_ai {
         args.prompt = positional;
     } else {
         args.dir = positional.into_iter().next().map(PathBuf::from);
@@ -132,6 +138,10 @@ async fn main() -> Result<()> {
     config::Config::save_default_if_missing()?;
     let cfg = config::Config::load()?;
     theme::set_theme(&cfg.theme);
+
+    if args.check_ai {
+        return run_check_ai(cfg, args.prompt).await;
+    }
 
     // Headless modes do not need a TTY (print / JSON event stream).
     if args.print || args.json {
@@ -200,6 +210,71 @@ async fn main() -> Result<()> {
             Err(e)
         }
     }
+}
+
+/// Live-verify providers by sending a tiny request to each and reporting the
+/// result. Missing credentials are skipped, not failed.
+async fn run_check_ai(cfg: config::Config, providers: Vec<String>) -> Result<()> {
+    let list = if providers.is_empty() {
+        vec![cfg.ai.provider.clone()]
+    } else {
+        providers
+    };
+    for id in list {
+        let mut c = cfg.clone();
+        c.ai.provider = id.clone();
+        if c.ai.model.trim().is_empty() {
+            c.ai.model = manager::default_model_for(&id.to_ascii_lowercase()).to_string();
+        }
+        if c.ai.model.is_empty() {
+            c.ai.model = "gpt-4o".to_string();
+        }
+        let creds = credentials::Credentials::load();
+        let pid = id.to_ascii_lowercase();
+        let has_local = !c.ai.base_url.trim().is_empty();
+        if !has_local && creds.resolve(&pid, &c.ai.api_key_env).is_none() {
+            println!("{id}: skipped (no credentials — set a key via /login or ${})", c.ai.api_key_env);
+            continue;
+        }
+        let provider = match manager::make_provider(&c) {
+            Ok(p) => p,
+            Err(e) => {
+                println!("{id}: unsupported — {e}");
+                continue;
+            }
+        };
+        let req = ai::ChatRequest {
+            model: c.ai.model.clone(),
+            messages: vec![ai::ChatMessage::user("Reply with the single word OK.")],
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: Some(96),
+        };
+        let start = std::time::Instant::now();
+        let mut got = String::new();
+        let mut reasoning = String::new();
+        let mut on_event = |ev: ai::ProviderEvent| match ev {
+            ai::ProviderEvent::TextDelta(t) => got.push_str(&t),
+            ai::ProviderEvent::ReasoningDelta(t) => reasoning.push_str(&t),
+            _ => {}
+        };
+        match ai::stream_with_retry(provider.as_ref(), req, &mut on_event, c.ai.max_retries, c.ai.retry_base_ms).await {
+            Ok(turn) => {
+                let mut text = if turn.text.trim().is_empty() { got } else { turn.text };
+                if text.trim().is_empty() && !reasoning.trim().is_empty() {
+                    text = format!("(reasoning-only) {}", reasoning);
+                }
+                println!(
+                    "{id}: OK ✓ (model {}, {} ms) — {:?}",
+                    c.ai.model,
+                    start.elapsed().as_millis(),
+                    text.trim().chars().take(60).collect::<String>()
+                );
+            }
+            Err(e) => println!("{id}: FAIL (model {}) — {e}", c.ai.model),
+        }
+    }
+    Ok(())
 }
 
 /// Run one prompt through the local agent and print the result. `--json`

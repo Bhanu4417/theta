@@ -29,22 +29,22 @@ struct LocalSession {
     /// The agent currently serving this session (may change when the user
     /// picks a different model).
     agent: Arc<AgentLoop>,
-    /// `(provider, model)` the session's agent was built for.
-    agent_key: (String, String),
+    /// `(provider, model, agent)` the session's agent was built for.
+    agent_key: (String, String, String),
     /// Leaves abandoned by `/undo`, newest last, for `/redo`.
     redo: Vec<String>,
 }
 
-/// Builds an agent for a `(provider, model)` pair. The manager supplies a
-/// factory so picking a model rebuilds the provider adapter on demand.
+/// Builds an agent for a `(provider, model, agent)` triple. The manager supplies
+/// a factory so picking a model or agent rebuilds the adapter on demand.
 pub type AgentFactory =
-    Arc<dyn Fn(&str, &str) -> Result<Arc<AgentLoop>, ProviderError> + Send + Sync>;
+    Arc<dyn Fn(&str, &str, &str) -> Result<Arc<AgentLoop>, ProviderError> + Send + Sync>;
 
 /// Everything the adapter needs, shared across its (async) methods.
 struct Inner {
     factory: AgentFactory,
     default_agent: Arc<AgentLoop>,
-    default_key: (String, String),
+    default_key: (String, String, String),
     sessions: Mutex<HashMap<String, LocalSession>>,
 }
 
@@ -60,16 +60,16 @@ impl LocalProvider {
     /// Fixed-agent provider (tests, single-model use).
     pub fn new(agent: Arc<AgentLoop>, default_dir: impl Into<String>) -> Self {
         let fixed = agent.clone();
-        let factory: AgentFactory = Arc::new(move |_provider, _model| Ok(fixed.clone()));
+        let factory: AgentFactory = Arc::new(move |_p, _m, _a| Ok(fixed.clone()));
         let model = agent.model().to_string();
-        Self::with_factory(factory, agent, ("".into(), model), default_dir)
+        Self::with_factory(factory, agent, ("".into(), model, String::new()), default_dir)
     }
 
     /// Provider whose agent can be rebuilt per `(provider, model)` selection.
     pub fn with_factory(
         factory: AgentFactory,
         default_agent: Arc<AgentLoop>,
-        default_key: (String, String),
+        default_key: (String, String, String),
         default_dir: impl Into<String>,
     ) -> Self {
         let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -89,12 +89,15 @@ impl LocalProvider {
 
     /// Choose (building if needed) the agent for a session keyed by
     /// `(provider, model)`. Caller must hold no lock on `sessions`.
-    fn agent_for(&self, desired: &(String, String)) -> Result<Arc<AgentLoop>, ProviderError> {
+    fn agent_for(
+        &self,
+        desired: &(String, String, String),
+    ) -> Result<Arc<AgentLoop>, ProviderError> {
         // Fast path: the default agent already matches.
         if desired == &self.inner.default_key {
             return Ok(self.inner.default_agent.clone());
         }
-        (self.inner.factory)(&desired.0, &desired.1)
+        (self.inner.factory)(&desired.0, &desired.1, &desired.2)
     }
 
     /// Pre-create a session id without sending anything (used by connect).
@@ -390,23 +393,39 @@ impl AgentProvider for LocalProvider {
         session: &ProviderSession,
         text: &str,
         model: Option<ModelId>,
-        _agent: Option<String>,
+        agent: Option<String>,
         attachments: &[crate::mentions::Attachment],
     ) -> Result<(), ProviderError> {
-        // A text-only backend: inline `@file`/pasted content into the prompt.
-        // (The manager also inlines; doing it here keeps the adapter correct
-        // when called directly.)
-        let text = if attachments.is_empty() {
+        // Split attachments: images become vision content parts; everything
+        // else is inlined as text into the prompt.
+        let mut text_atts = Vec::new();
+        let mut images = Vec::new();
+        for a in attachments {
+            if let Some(img) = crate::ai::image_from_url(&a.mime, &a.url) {
+                images.push(img);
+            } else if !a.mime.starts_with("image/") {
+                text_atts.push(a.clone());
+            }
+        }
+        let text = if text_atts.is_empty() {
             text.to_string()
         } else {
-            crate::mentions::inline_attachments(text, attachments, 20_000)
+            crate::mentions::inline_attachments(text, &text_atts, 20_000)
         };
         // Resolve the model the user picked and rebuild the session's agent if
         // it changed. This is what makes the model picker work on the local
         // backend.
-        let desired = model
-            .map(|m| (m.provider, m.model))
-            .unwrap_or_else(|| self.inner.default_key.clone());
+        let mut desired = match model {
+            Some(m) => (m.provider, m.model, String::new()),
+            None => self.inner.default_key.clone(),
+        };
+        // Fall back to the session's default agent when the caller didn't pick.
+        if desired.2.is_empty() {
+            desired.2 = self.inner.default_key.2.clone();
+        }
+        if let Some(a) = agent.filter(|a| !a.trim().is_empty()) {
+            desired.2 = a;
+        }
         let new_agent = self.agent_for(&desired)?;
         let (mut tree, cancel, dir, agent) = {
             let mut sessions = self.inner.sessions.lock().unwrap();
@@ -418,10 +437,11 @@ impl AgentProvider for LocalProvider {
                 entry.agent = new_agent;
                 entry.agent_key = desired.clone();
                 crate::tlog!(
-                    "LOCAL session {} switched to {}/{}",
+                    "LOCAL session {} switched to {}/{} agent={}",
                     session.id,
                     desired.0,
-                    desired.1
+                    desired.1,
+                    desired.2
                 );
             }
             (
@@ -454,6 +474,7 @@ impl AgentProvider for LocalProvider {
                 .run_turn_journaled_snapshots(
                     &mut history,
                     &text,
+                    &images,
                     &cwd,
                     &cancel,
                     &mut emit,
@@ -803,6 +824,7 @@ mod tests {
             tool_calls: vec![],
             tool_call_id: None,
             tokens: None,
+            images: vec![],
         });
         local.replay("theta-old-1", &tree);
 
@@ -849,14 +871,14 @@ mod tests {
 
         let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let calls_c = calls.clone();
-        let factory: AgentFactory = Arc::new(move |provider, model| {
-            calls_c.lock().unwrap().push(format!("{provider}/{model}"));
+        let factory: AgentFactory = Arc::new(move |provider, model, agent| {
+            calls_c.lock().unwrap().push(format!("{provider}/{model}/{agent}"));
             Ok(Arc::new(one_shot(&format!("ran {provider}/{model}"))))
         });
         let local = Arc::new(LocalProvider::with_factory(
             factory,
             Arc::new(one_shot("default")),
-            ("openai".into(), "gpt-4o".into()),
+            ("openai".into(), "gpt-4o".into(), "build".into()),
             &dir,
         ));
         let session = local
@@ -884,7 +906,7 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        assert_eq!(calls.lock().unwrap().as_slice(), ["anthropic/claude-x"]);
+        assert_eq!(calls.lock().unwrap().as_slice(), ["anthropic/claude-x/build"]);
         let ctx = local.tree_snapshot(&session.id).unwrap().context();
         assert!(ctx.iter().any(|m| m.text.contains("ran anthropic/claude-x")));
 

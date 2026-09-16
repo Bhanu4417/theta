@@ -129,6 +129,82 @@ async fn ask_gate_denied_blocks_the_tool() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Fails the first `fail_times` attempts with a transient error, then replies.
+struct FlakyProvider {
+    fail_times: u32,
+    attempts: std::sync::Arc<Mutex<u32>>,
+    error: fn() -> ProviderError,
+}
+
+impl Provider for FlakyProvider {
+    fn id(&self) -> &'static str {
+        "flaky"
+    }
+    fn stream<'a>(
+        &'a self,
+        _request: ChatRequest,
+        on_event: &'a mut (dyn FnMut(ProviderEvent) + Send),
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<AssistantTurn, ProviderError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let n = {
+                let mut a = self.attempts.lock().unwrap();
+                *a += 1;
+                *a
+            };
+            if n <= self.fail_times {
+                return Err((self.error)());
+            }
+            let text = "recovered".to_string();
+            on_event(ProviderEvent::TextDelta(text.clone()));
+            Ok(AssistantTurn {
+                text,
+                tool_calls: Vec::new(),
+                finish: Some(FinishReason::Stop),
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn retries_transient_provider_errors() {
+    let dir = std::env::temp_dir();
+    let attempts = std::sync::Arc::new(Mutex::new(0));
+    let provider = Box::new(FlakyProvider {
+        fail_times: 2,
+        attempts: attempts.clone(),
+        error: || ProviderError::Transport("connection reset".into()),
+    });
+    let agent = AgentLoop::new(provider, "m").with_retry(3, 1);
+    let mut events = Vec::new();
+    let mut history = Vec::new();
+    let mut emit = |e: HarnessEvent| events.push(e);
+    agent.run_turn(&mut history, "hi", &dir, &mut emit).await.unwrap();
+    assert_eq!(*attempts.lock().unwrap(), 3, "two failures then success");
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, HarnessEvent::SessionRetrying(_))));
+    assert!(history.iter().any(|m| m.text == "recovered" && m.role == crate::ai::Role::Assistant));
+}
+
+#[tokio::test]
+async fn does_not_retry_auth_errors() {
+    let dir = std::env::temp_dir();
+    let attempts = std::sync::Arc::new(Mutex::new(0));
+    let provider = Box::new(FlakyProvider {
+        fail_times: 99,
+        attempts: attempts.clone(),
+        error: || ProviderError::Auth("bad key".into()),
+    });
+    let agent = AgentLoop::new(provider, "m").with_retry(3, 1);
+    let mut history = Vec::new();
+    let mut emit = |_e: HarnessEvent| {};
+    let err = agent.run_turn(&mut history, "hi", &dir, &mut emit).await;
+    assert!(err.is_err());
+    assert_eq!(*attempts.lock().unwrap(), 1, "auth errors are not retried");
+}
+
 #[tokio::test]
 async fn ask_tool_round_trips_a_question() {
     let dir = std::env::temp_dir().join(format!("theta-ask-{}", std::process::id()));

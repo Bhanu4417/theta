@@ -358,10 +358,10 @@ impl Manager {
                 });
                 m.emit(AppEvent::AgentsListed {
                     dir: dir_c,
-                    agents: vec![crate::opencode::AgentInfo {
-                        name: "theta".into(),
-                        description: "Theta local agent".into(),
-                    }],
+                    agents: crate::agent::agents::names()
+                        .into_iter()
+                        .map(|(name, description)| crate::opencode::AgentInfo { name, description })
+                        .collect(),
                 });
                 let _ = (history_limit, model);
             });
@@ -509,14 +509,8 @@ impl Manager {
                     provider: m.provider_id,
                     model: m.model_id,
                 });
-                // Text-only backend: inline `@file` contents into the prompt.
-                let inlined = if attachments.is_empty() {
-                    text
-                } else {
-                    crate::mentions::inline_attachments(&text, &attachments, 20_000)
-                };
                 if let Err(e) = local
-                    .send_message(&session, &inlined, model_id, agent, &[])
+                    .send_message(&session, &text, model_id, agent, &attachments)
                     .await
                 {
                     m.emit(AppEvent::SendFailed {
@@ -1134,12 +1128,26 @@ async fn spawn_server(cfg: &Config, dir: &Path) -> Result<(String, Option<tokio:
 /// Build the local backend from config: an OpenAI-compatible LLM provider
 /// wrapped in an agent loop (tools + permission policy + catalog).
 fn build_local_provider(cfg: &Config) -> Result<(LocalProvider, Option<LocalGates>), ProviderError> {
-    let (agent, gates) = build_agent(cfg, true)?;
-    // Picking a different model rebuilds the provider adapter on demand, so
-    // the local backend honours the model picker.
+    let gates = local_gates(cfg, true);
+    // MCP servers are connected once and their tools shared across every agent
+    // we build (model/agent switches included).
+    let mcp_tools: Arc<Vec<Arc<dyn crate::agent::tools::Tool>>> =
+        Arc::new(crate::mcp::connect_all(&cfg.mcp));
+    if !mcp_tools.is_empty() {
+        crate::tlog!("LOCAL loaded {} MCP tool(s)", mcp_tools.len());
+    }
+    let agent = build_agent_with(
+        cfg,
+        true,
+        gates.clone(),
+        true,
+        crate::agent::agents::default_name(),
+        &mcp_tools,
+    )?;
+    // Picking a different model or agent rebuilds the adapter on demand.
     let broker = gates.clone();
     let base_cfg = cfg.clone();
-    let factory: crate::providers::local::AgentFactory = Arc::new(move |provider, model| {
+    let factory: crate::providers::local::AgentFactory = Arc::new(move |provider, model, agent| {
         let mut c = base_cfg.clone();
         if !provider.is_empty() {
             c.ai.provider = provider.to_string();
@@ -1147,7 +1155,7 @@ fn build_local_provider(cfg: &Config) -> Result<(LocalProvider, Option<LocalGate
         if !model.is_empty() {
             c.ai.model = model.to_string();
         }
-        build_agent_with(&c, true, broker.clone(), true).map(Arc::new)
+        build_agent_with(&c, true, broker.clone(), true, agent, &mcp_tools).map(Arc::new)
     });
     let provider_id = cfg.ai.provider.to_ascii_lowercase();
     let default_model = resolved_model(cfg, &provider_id);
@@ -1155,10 +1163,11 @@ fn build_local_provider(cfg: &Config) -> Result<(LocalProvider, Option<LocalGate
         .unwrap_or_else(|_| PathBuf::from("."))
         .to_string_lossy()
         .to_string();
+    let default_agent = crate::agent::agents::default_name().to_string();
     let local = LocalProvider::with_factory(
         factory,
         Arc::new(agent),
-        (cfg.ai.provider.clone(), default_model),
+        (cfg.ai.provider.clone(), default_model, default_agent),
         dir,
     );
     Ok((local, gates))
@@ -1178,16 +1187,55 @@ pub fn build_agent(
     cfg: &Config,
     interactive: bool,
 ) -> Result<(crate::agent::AgentLoop, Option<LocalGates>), ProviderError> {
-    let gates = if interactive && cfg.behavior.local_permissions == "ask" {
+    let gates = local_gates(cfg, interactive);
+    let mcp_tools = crate::mcp::connect_all(&cfg.mcp);
+    let agent = build_agent_with(
+        cfg,
+        interactive,
+        gates.clone(),
+        true,
+        crate::agent::agents::default_name(),
+        &mcp_tools,
+    )?;
+    Ok((agent, gates))
+}
+
+/// Construct the LLM provider selected by `[ai]` (Anthropic/Google native, or
+/// an OpenAI-compatible preset / custom `base_url`).
+pub fn make_provider(
+    cfg: &Config,
+) -> Result<Box<dyn crate::ai::Provider>, ProviderError> {
+    let ai = &cfg.ai;
+    let provider_id = ai.provider.to_ascii_lowercase();
+    let creds = crate::credentials::Credentials::load();
+    let key = creds.resolve(&provider_id, &ai.api_key_env);
+    if !ai.base_url.trim().is_empty() {
+        return Ok(Box::new(crate::ai::openai::OpenAiCompat::new(ai.base_url.clone(), key)));
+    }
+    match provider_id.as_str() {
+        "anthropic" | "claude" => Ok(Box::new(crate::ai::anthropic::Anthropic::new(key))),
+        "google" | "gemini" => Ok(Box::new(crate::ai::google::Google::new(key))),
+        _ => Ok(Box::new(crate::ai::openai::OpenAiCompat::preset(&provider_id, key).ok_or_else(
+            || {
+                ProviderError::Unsupported(format!(
+                    "unknown ai.provider '{}' (use anthropic/google/openai/xai/… or set ai.base_url)",
+                    ai.provider
+                ))
+            },
+        )?)),
+    }
+}
+
+/// Interactive gates are shared across every agent when permissions are `ask`.
+fn local_gates(cfg: &Config, interactive: bool) -> Option<LocalGates> {
+    if interactive && cfg.behavior.local_permissions == "ask" {
         Some(LocalGates {
             permissions: Arc::new(crate::agent::permissions::Broker::new()),
             questions: Arc::new(crate::agent::permissions::QuestionBroker::new()),
         })
     } else {
         None
-    };
-    let agent = build_agent_with(cfg, interactive, gates.clone(), true)?;
-    Ok((agent, gates))
+    }
 }
 
 fn build_agent_with(
@@ -1195,28 +1243,15 @@ fn build_agent_with(
     interactive: bool,
     gates: Option<LocalGates>,
     allow_task: bool,
+    agent_name: &str,
+    extra_tools: &[Arc<dyn crate::agent::tools::Tool>],
 ) -> Result<crate::agent::AgentLoop, ProviderError>
 {
+    let def = crate::agent::agents::find(agent_name)
+        .unwrap_or_else(|| crate::agent::agents::find(crate::agent::agents::default_name()).unwrap());
     let ai = &cfg.ai;
     let provider_id = ai.provider.to_ascii_lowercase();
-    let creds = crate::credentials::Credentials::load();
-    let key = creds.resolve(&provider_id, &ai.api_key_env);
-    let provider: Box<dyn crate::ai::Provider> = if !ai.base_url.trim().is_empty() {
-        Box::new(crate::ai::openai::OpenAiCompat::new(ai.base_url.clone(), key))
-    } else {
-        match provider_id.as_str() {
-            "anthropic" | "claude" => Box::new(crate::ai::anthropic::Anthropic::new(key)),
-            "google" | "gemini" => Box::new(crate::ai::google::Google::new(key)),
-            _ => Box::new(
-                crate::ai::openai::OpenAiCompat::preset(&provider_id, key).ok_or_else(|| {
-                    ProviderError::Unsupported(format!(
-                        "unknown ai.provider '{}' (use anthropic/google/openai/xai/… or set ai.base_url)",
-                        ai.provider
-                    ))
-                })?,
-            ),
-        }
-    };
+    let provider = make_provider(cfg)?;
     let model = if ai.model.trim().is_empty() {
         default_model_for(&provider_id).to_string()
     } else {
@@ -1225,8 +1260,9 @@ fn build_agent_with(
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let registry =
         crate::extensions::Registry::discover(&crate::extensions::Registry::default_roots(&cwd));
-    // System prompt = base + project context files (AGENTS.md) + skill index.
-    let mut appendix = crate::extensions::load_context_files(&cwd);
+    // System prompt = base + agent prompt + project context files + skills.
+    let mut appendix = format!("\n\n{}", def.system_prompt);
+    appendix.push_str(&crate::extensions::load_context_files(&cwd));
     appendix.push_str(&registry.system_appendix());
     let base = crate::agent::context::CompactionSettings {
         reserve_tokens: cfg.compaction.reserve_tokens,
@@ -1240,17 +1276,30 @@ fn build_agent_with(
         .map(|(k, v)| (k.clone(), (v.reserve_tokens, v.keep_recent_tokens)))
         .collect();
     let settings = crate::agent::context::resolve_settings(base, &overrides, &model);
+    // Named agents restrict the tool set (plan/explore are read-only).
+    let all_tools = crate::agent::tools::default_tools();
+    let mut tools = crate::agent::agents::tools_for(&def, all_tools);
+    // MCP tools follow the same read-only rule as built-ins.
+    if def.tools == crate::agent::agents::ToolSet::All {
+        tools.extend(extra_tools.iter().cloned());
+    }
     let mut agent = crate::agent::AgentLoop::new(provider, model)
+        .with_tools(tools)
         .with_compaction(settings, cfg.compaction.enabled)
+        .with_retry(cfg.ai.max_retries, cfg.ai.retry_base_ms)
         .with_system_appendix(appendix);
-    // Permissions: interactive `ask` for the TUI, auto-allow for headless.
-    let ask = interactive
-        && cfg.behavior.local_permissions == "ask"
-        && gates.is_some();
+    // Permissions: an agent preset (e.g. read-only) wins; otherwise the
+    // config mode, with interactive `ask` for the TUI and auto-allow headless.
+    let mode = if def.permission != "inherit" {
+        def.permission
+    } else {
+        cfg.behavior.local_permissions.as_str()
+    };
+    let ask = interactive && mode == "ask" && gates.is_some();
     agent = agent.with_permission(if ask {
         Box::new(crate::agent::tools::AskGate)
     } else if interactive || gates.is_some() {
-        gate_for(&cfg.behavior.local_permissions, interactive)
+        gate_for(mode, interactive)
     } else {
         Box::new(crate::agent::tools::AllowAll)
     });
@@ -1259,11 +1308,14 @@ fn build_agent_with(
             .with_broker(g.permissions.clone())
             .with_question_broker(g.questions.clone());
     }
-    if allow_task {
+    if allow_task && def.can_delegate {
         // Sub-agents run with the same model but auto-approved and without a
         // `task` tool of their own, so spawning cannot recurse.
         let sub_cfg = cfg.clone();
-        let builder = Arc::new(move || build_agent_with(&sub_cfg, false, None, false));
+        let sub_extra = extra_tools.to_vec();
+        let builder = Arc::new(move |ty: &str| {
+            build_agent_with(&sub_cfg, false, None, false, ty, &sub_extra)
+        });
         agent = agent.with_extra_tool(Arc::new(crate::agent::tools::TaskTool::new(builder)));
     }
     Ok(agent)
@@ -1281,7 +1333,7 @@ fn gate_for(mode: &str, interactive: bool) -> Box<dyn crate::agent::tools::Permi
 }
 
 /// Sensible default model per provider when `ai.model` is unset.
-fn default_model_for(provider: &str) -> &'static str {
+pub(crate) fn default_model_for(provider: &str) -> &'static str {
     match provider {
         "anthropic" | "claude" => "claude-3-7-sonnet-20250219",
         "google" | "gemini" => "gemini-2.0-flash",

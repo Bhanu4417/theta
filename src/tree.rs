@@ -67,6 +67,7 @@ impl Entry {
                 tool_calls: self.tool_calls.clone(),
                 tool_call_id: None,
                 tokens: None,
+                images: Vec::new(),
             },
             EntryKind::Tool => ChatMessage::tool_result(
                 self.tool_call_id.clone().unwrap_or_default(),

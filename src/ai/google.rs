@@ -51,7 +51,15 @@ pub fn build_body(req: &ChatRequest) -> Value {
     for m in &req.messages {
         match m.role {
             Role::System => system = Some(m.text.clone()),
-            Role::User => contents.push(json!({ "role": "user", "parts": [{ "text": m.text }] })),
+            Role::User => {
+                let mut parts = vec![json!({ "text": m.text })];
+                for img in &m.images {
+                    parts.push(json!({
+                        "inlineData": { "mimeType": img.mime, "data": img.data }
+                    }));
+                }
+                contents.push(json!({ "role": "user", "parts": parts }));
+            }
             Role::Assistant => {
                 let mut parts: Vec<Value> = Vec::new();
                 if !m.text.is_empty() {

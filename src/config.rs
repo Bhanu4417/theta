@@ -32,6 +32,9 @@ pub struct Config {
     /// (Tokyo Night); only a user change rewrites it.
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// stdio MCP servers, keyed by name (local backend).
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub mcp: HashMap<String, McpServerConfig>,
 }
 
 /// LLM provider settings for the local backend. Any OpenAI-compatible gateway
@@ -44,6 +47,32 @@ pub struct AiConfig {
     pub base_url: String,
     pub api_key_env: String,
     pub model: String,
+    /// Retry transport/5xx failures this many times with exponential backoff.
+    pub max_retries: u32,
+    /// Base backoff delay in milliseconds (doubled per attempt).
+    pub retry_base_ms: u64,
+    /// Per-request timeout in seconds (0 = no timeout).
+    pub timeout_secs: u64,
+}
+
+/// One stdio MCP server (Model Context Protocol).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpServerConfig {
+    /// Executable to spawn.
+    pub command: String,
+    pub args: Vec<String>,
+    /// Extra environment variables for the child process.
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub env: HashMap<String, String>,
+    /// Set false to keep the definition but not launch it.
+    pub enabled: bool,
+}
+
+impl Default for McpServerConfig {
+    fn default() -> Self {
+        Self { command: String::new(), args: Vec::new(), env: HashMap::new(), enabled: true }
+    }
 }
 
 /// Context-compaction tuning, mirroring Pi's reserve/keep token budgets.
@@ -169,6 +198,9 @@ impl Default for AiConfig {
             base_url: String::new(),
             api_key_env: "OPENAI_API_KEY".into(),
             model: "gpt-4o".into(),
+            max_retries: 3,
+            retry_base_ms: 500,
+            timeout_secs: 300,
         }
     }
 }
@@ -190,6 +222,7 @@ impl Default for Config {
             theme: "theta-night".into(),
             agy_model: "gemini-3.8-flash-medium".into(),
             last_model: None,
+            mcp: HashMap::new(),
         }
     }
 }
@@ -206,7 +239,28 @@ impl Config {
                 cfg = toml::from_str(&text).unwrap_or(Config::default());
             }
         }
+        cfg.apply_env_overrides();
         Ok(cfg)
+    }
+
+    /// `THETA_AI_*` environment overrides (useful for testing and CI).
+    fn apply_env_overrides(&mut self) {
+        if let Ok(v) = std::env::var("THETA_AI_PROVIDER") {
+            if !v.trim().is_empty() {
+                self.ai.provider = v;
+            }
+        }
+        if let Ok(v) = std::env::var("THETA_AI_MODEL") {
+            if !v.trim().is_empty() {
+                self.ai.model = v;
+            }
+        }
+        if let Ok(v) = std::env::var("THETA_AI_BASE_URL") {
+            self.ai.base_url = v;
+        }
+        if std::env::var("THETA_AI_API_KEY").map(|v| !v.trim().is_empty()).unwrap_or(false) {
+            self.ai.api_key_env = "THETA_AI_API_KEY".into();
+        }
     }
 
     pub fn save_default_if_missing() -> Result<()> {

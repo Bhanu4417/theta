@@ -95,7 +95,7 @@ impl PermissionGate for ReadOnly {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn str_arg(input: &Value, keys: &[&str]) -> Option<String> {
+pub(crate) fn str_arg(input: &Value, keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|k| input.get(*k).and_then(|v| v.as_str()).map(|s| s.to_string()))
 }
 
@@ -351,13 +351,17 @@ pub fn snapshot_paths(tool_name: &str, input: &Value, cwd: &Path) -> Vec<PathBuf
 /// The builder is supplied by the provider so the sub-agent shares the same
 /// model/credentials but runs with a fresh, auto-approved context.
 pub struct TaskTool {
-    build: Arc<dyn Fn() -> Result<crate::agent::AgentLoop, crate::providers::ProviderError> + Send + Sync>,
+    build: Arc<
+        dyn Fn(&str) -> Result<crate::agent::AgentLoop, crate::providers::ProviderError>
+            + Send
+            + Sync,
+    >,
 }
 
 impl TaskTool {
     pub fn new(
         build: Arc<
-            dyn Fn() -> Result<crate::agent::AgentLoop, crate::providers::ProviderError>
+            dyn Fn(&str) -> Result<crate::agent::AgentLoop, crate::providers::ProviderError>
                 + Send
                 + Sync,
         >,
@@ -377,7 +381,12 @@ impl Tool for TaskTool {
                 "type": "object",
                 "properties": {
                     "description": { "type": "string", "description": "Short 3-5 word description" },
-                    "prompt": { "type": "string", "description": "Self-contained instructions for the sub-agent" }
+                    "prompt": { "type": "string", "description": "Self-contained instructions for the sub-agent" },
+                    "subagent_type": {
+                        "type": "string",
+                        "description": "Which sub-agent to run (default general)",
+                        "enum": crate::agent::agents::subagent_names()
+                    }
                 },
                 "required": ["prompt"]
             }),
@@ -391,7 +400,12 @@ impl Tool for TaskTool {
             if prompt.trim().is_empty() {
                 return ToolOutcome::err("task: `prompt` is empty");
             }
-            let agent = match (self.build)() {
+            let ty = str_arg(input, &["subagent_type", "subagentType"])
+                .unwrap_or_else(|| "general".to_string());
+            if crate::agent::agents::find(&ty).is_none() {
+                return ToolOutcome::err(format!("task: unknown subagent_type '{ty}'"));
+            }
+            let agent = match (self.build)(&ty) {
                 Ok(a) => a,
                 Err(e) => return ToolOutcome::err(format!("task: could not start sub-agent: {e}")),
             };
@@ -768,7 +782,7 @@ mod tests {
                 })
             }
         }
-        let builder = Arc::new(|| {
+        let builder = Arc::new(|_ty: &str| {
             Ok(crate::agent::AgentLoop::new(Box::new(Reply("SUBAGENT-REPORT".into())), "m"))
         });
         let dir = std::env::temp_dir();
@@ -779,7 +793,7 @@ mod tests {
         assert!(out.output.contains("SUBAGENT-REPORT"), "{}", out.output);
 
         // Empty prompt is a clean error.
-        assert!(!TaskTool::new(Arc::new(|| {
+        assert!(!TaskTool::new(Arc::new(|_ty: &str| {
             Ok(crate::agent::AgentLoop::new(Box::new(Reply("x".into())), "m"))
         }))
         .run(&json!({"prompt": "   "}), &dir)

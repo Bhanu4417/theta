@@ -207,7 +207,27 @@ local_permissions = "ask"  # local backend tools: ask | allow | deny | read-only
 API keys for the local backend are stored in
 `~/.config/theta/keys.toml` (chmod `0600`) with `/login <provider> <api-key>`
 (`/login <provider>` reports whether one is set); the matching
-`ai.api_key_env` variable is used as a fallback.
+`ai.api_key_env` variable is used as a fallback. `THETA_AI_PROVIDER`,
+`THETA_AI_MODEL`, `THETA_AI_BASE_URL` and `THETA_AI_API_KEY` override `[ai]`
+for a single run (handy for testing). `theta --check-ai [provider…]` sends a
+tiny live request per provider and reports OK/FAIL.
+
+Transient provider failures are retried with exponential backoff
+(`ai.max_retries`, `ai.retry_base_ms`). **Named agents** (`build`, `plan`,
+`general`, `explore`) select their own tool set and prompt — `plan`/`explore`
+are read-only — and `plan`/`explore`/`general` are available as `task`
+sub-agent types. **MCP** stdio servers can be declared and their tools are
+exposed to the agent:
+
+```toml
+[mcp.files]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/some/dir"]
+
+[mcp.git]
+command = "uvx"
+args = ["mcp-server-git"]
+```
 
 ## Headless mode, local backend & skills
 

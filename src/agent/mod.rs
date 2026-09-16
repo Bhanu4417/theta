@@ -4,6 +4,7 @@
 //! emits the *same* provider-neutral [`HarnessEvent`]s the OpenCode adapter
 //! emits — so the UI renders local turns with no changes.
 
+pub mod agents;
 pub mod context;
 pub mod permissions;
 pub mod tools;
@@ -39,6 +40,9 @@ pub struct AgentLoop {
     broker: Option<std::sync::Arc<permissions::Broker>>,
     /// Answers interactive `ask`-tool questions (local backend).
     question_broker: Option<std::sync::Arc<permissions::QuestionBroker>>,
+    /// Retry transport/5xx failures with exponential backoff.
+    max_retries: u32,
+    retry_base_ms: u64,
 }
 
 impl AgentLoop {
@@ -55,6 +59,8 @@ impl AgentLoop {
             compaction_enabled: true,
             broker: None,
             question_broker: None,
+            max_retries: 0,
+            retry_base_ms: 500,
         }
     }
 
@@ -78,6 +84,13 @@ impl AgentLoop {
     /// Append one tool (used to add the `task` sub-agent tool).
     pub fn with_extra_tool(mut self, tool: Arc<dyn Tool>) -> Self {
         self.tools.push(tool);
+        self
+    }
+
+    /// Retry provider transport failures (`max_retries` attempts, base delay in ms).
+    pub fn with_retry(mut self, max_retries: u32, base_ms: u64) -> Self {
+        self.max_retries = max_retries;
+        self.retry_base_ms = base_ms;
         self
     }
 
@@ -169,7 +182,7 @@ impl AgentLoop {
         F: FnMut(HarnessEvent) + Send,
     {
         let mut snapshots = Vec::new();
-        self.run_turn_journaled_snapshots(history, user_text, cwd, cancel, emit, journal, &mut snapshots)
+        self.run_turn_journaled_snapshots(history, user_text, &[], cwd, cancel, emit, journal, &mut snapshots)
             .await
     }
 
@@ -180,6 +193,7 @@ impl AgentLoop {
         &self,
         history: &mut Vec<ChatMessage>,
         user_text: &str,
+        images: &[crate::ai::ImagePart],
         cwd: &Path,
         cancel: &std::sync::atomic::AtomicBool,
         emit: &mut F,
@@ -192,7 +206,7 @@ impl AgentLoop {
         if history.is_empty() {
             history.push(ChatMessage::system(self.system_prompt.clone()));
         }
-        history.push(ChatMessage::user(user_text));
+        history.push(ChatMessage::user_with_images(user_text, images.to_vec()));
         emit(HarnessEvent::SessionWorking);
 
         for turn in 0..self.max_turns {
@@ -243,25 +257,48 @@ impl AgentLoop {
             let mut acc_text = String::new();
             let mut turn_usage: Option<crate::harness::transcript::TokenUsage> = None;
             let turn_result = {
-                let mut on_event = |ev: ProviderEvent| match ev {
-                    ProviderEvent::TextDelta(t) => {
-                        acc_text.push_str(&t);
-                        emit(part_text(&msg_id, &acc_text));
+                let mut attempt = 0u32;
+                loop {
+                    let result = {
+                        let mut on_event = |ev: ProviderEvent| match ev {
+                            ProviderEvent::TextDelta(t) => {
+                                acc_text.push_str(&t);
+                                emit(part_text(&msg_id, &acc_text));
+                            }
+                            ProviderEvent::ReasoningDelta(t) => {
+                                emit(part_reasoning(&msg_id, &t));
+                            }
+                            ProviderEvent::Usage { input, output } => {
+                                turn_usage = Some(crate::harness::transcript::TokenUsage {
+                                    input,
+                                    output,
+                                    ..Default::default()
+                                });
+                                emit(part_meta(&msg_id, input, output));
+                            }
+                            ProviderEvent::Done(_) | ProviderEvent::ToolCall(_) => {}
+                        };
+                        self.provider.stream(request.clone(), &mut on_event).await
+                    };
+                    match result {
+                        Ok(turn) => break turn,
+                        Err(e) => {
+                            if attempt < self.max_retries && is_retryable(&e) {
+                                attempt += 1;
+                                let delay = self.retry_base_ms.saturating_mul(1u64 << (attempt - 1).min(6));
+                                emit(HarnessEvent::SessionRetrying(format!(
+                                    "retrying {attempt}/{} after {e}",
+                                    self.max_retries
+                                )));
+                                acc_text.clear();
+                                turn_usage = None;
+                                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                                continue;
+                            }
+                            return Err(e);
+                        }
                     }
-                    ProviderEvent::ReasoningDelta(t) => {
-                        emit(part_reasoning(&msg_id, &t));
-                    }
-                    ProviderEvent::Usage { input, output } => {
-                        turn_usage = Some(crate::harness::transcript::TokenUsage {
-                            input,
-                            output,
-                            ..Default::default()
-                        });
-                        emit(part_meta(&msg_id, input, output));
-                    }
-                    ProviderEvent::Done(_) | ProviderEvent::ToolCall(_) => {}
-                };
-                self.provider.stream(request, &mut on_event).await?
+                }
             };
 
             let mut assistant_msg = ChatMessage::assistant(
@@ -415,17 +452,38 @@ impl AgentLoop {
         let mut acc = String::new();
         let mut finish: Option<FinishReason> = None;
         {
-            let mut on_event = |ev: ProviderEvent| match ev {
-                ProviderEvent::TextDelta(t) => acc.push_str(&t),
-                ProviderEvent::Done(f) => finish = Some(f),
-                _ => {}
-            };
-            let turn = self.provider.stream(request, &mut on_event).await?;
-            if !turn.text.is_empty() {
-                acc = turn.text;
-            }
-            if finish.is_none() {
-                finish = turn.finish;
+            let mut attempt = 0u32;
+            loop {
+                acc.clear();
+                let result = {
+                    let mut on_event = |ev: ProviderEvent| match ev {
+                        ProviderEvent::TextDelta(t) => acc.push_str(&t),
+                        ProviderEvent::Done(f) => finish = Some(f),
+                        _ => {}
+                    };
+                    self.provider.stream(request.clone(), &mut on_event).await
+                };
+                match result {
+                    Ok(turn) => {
+                        if !turn.text.is_empty() {
+                            acc = turn.text;
+                        }
+                        if finish.is_none() {
+                            finish = turn.finish;
+                        }
+                        break;
+                    }
+                    Err(e) => {
+                        if attempt < self.max_retries && is_retryable(&e) {
+                            attempt += 1;
+                            let delay =
+                                self.retry_base_ms.saturating_mul(1u64 << (attempt - 1).min(6));
+                            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                            continue;
+                        }
+                        return Err(e);
+                    }
+                }
             }
         }
         // A truncated summary must not become a checkpoint (Pi's
@@ -543,6 +601,11 @@ fn part_reasoning(msg_id: &str, text: &str) -> HarnessEvent {
         message_id: msg_id.to_string(),
         kind: PartKind::Reasoning { text: text.to_string(), running: true, start: None, end: None },
     }))
+}
+
+/// Transient failures worth retrying.
+fn is_retryable(e: &ProviderError) -> bool {
+    crate::ai::is_retryable_provider_error(e)
 }
 
 fn truncate_detail(args: &str) -> String {

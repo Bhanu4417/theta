@@ -107,6 +107,21 @@ Design every new feature so it works for both the current OpenCode backend and
 a future in-process harness.
 
 ## Work log (recent, high-level)
+- **Pi-level parity push**: named agents (`agent::agents` — build/plan/general/
+  explore with per-agent tool sets, prompts, permission presets and delegation);
+  the `task` tool takes a `subagent_type`; provider retry/backoff
+  (`ai::stream_with_retry`, `is_retryable_provider_error`, `[ai] max_retries`);
+  **vision** via `ChatMessage.images`/`ImagePart` mapped to OpenAI `image_url`,
+  Anthropic `image` blocks and Gemini `inlineData`; **MCP** stdio client
+  (`src/mcp.rs`) with dynamic `mcp__<server>__<tool>` tools from `[mcp.*]`;
+  `THETA_AI_*` env overrides and `theta --check-ai`.
+- Live-verified the local loop end to end against an OpenAI-compatible gateway
+  (`https://opencode.ai/zen/go/v1`, model `deepseek-v4.1-flash`): `--check-ai`
+  returns OK and a headless turn executes the `bash` tool for real. The zen
+  gateway needs an `x-opencode-session` header, added automatically for that
+  host. Anthropic/Gemini native providers remain unit-tested only (no keys).
+
+
 - **Local backend parity push**: per-session agents + an `AgentFactory`, so the
   model picker rebuilds the provider on demand (`LocalProvider::with_factory`);
   `@file`/image attachments inline into the prompt; an `ask` tool +

@@ -21,6 +21,8 @@ pub struct OpenAiCompat {
     base_url: String,
     api_key: Option<String>,
     client: reqwest::Client,
+    /// Extra request headers (e.g. a gateway session id).
+    headers: Vec<(String, String)>,
 }
 
 impl OpenAiCompat {
@@ -29,7 +31,19 @@ impl OpenAiCompat {
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
             .expect("reqwest client");
-        Self { base_url: base_url.into().trim_end_matches('/').to_string(), api_key, client }
+        let base_url = base_url.into().trim_end_matches('/').to_string();
+        let mut headers = Vec::new();
+        // The OpenCode "zen" gateway routes per session and requires this.
+        if base_url.contains("opencode.ai/zen") {
+            headers.push(("x-opencode-session".to_string(), session_id()));
+        }
+        Self { base_url, api_key, client, headers }
+    }
+
+    /// Add/replace an extra request header.
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
     }
 
     /// Standard preset for a well-known provider id, or `None` if unknown.
@@ -62,6 +76,16 @@ pub(crate) fn build_body(req: &ChatRequest, stream: bool) -> Value {
                 Role::Tool => "tool",
             };
             let mut obj = json!({ "role": role, "content": m.text });
+            if !m.images.is_empty() {
+                let mut parts = vec![json!({ "type": "text", "text": m.text })];
+                for img in &m.images {
+                    parts.push(json!({
+                        "type": "image_url",
+                        "image_url": { "url": format!("data:{};base64,{}", img.mime, img.data) }
+                    }));
+                }
+                obj["content"] = Value::Array(parts);
+            }
             if !m.tool_calls.is_empty() {
                 obj["tool_calls"] = Value::Array(
                     m.tool_calls
@@ -223,6 +247,9 @@ impl Provider for OpenAiCompat {
             if let Some(key) = &self.api_key {
                 rb = rb.bearer_auth(key);
             }
+            for (k, v) in &self.headers {
+                rb = rb.header(k.as_str(), v.as_str());
+            }
             let resp = rb.send().await.map_err(net)?;
             let status = resp.status();
             if !status.is_success() {
@@ -256,6 +283,18 @@ impl Provider for OpenAiCompat {
     }
 }
 
+/// A process-unique session id for gateways that require one.
+pub(crate) fn session_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    format!("theta-{t}-{n}")
+}
+
 fn net(e: reqwest::Error) -> ProviderError {
     ProviderError::Transport(e.to_string())
 }
@@ -266,6 +305,22 @@ mod tests {
     use crate::ai::{ChatMessage, ToolSpec, ProviderEvent};
 
     #[test]
+    fn body_includes_image_parts_for_vision() {
+        let req = ChatRequest {
+            model: "gpt-4o".into(),
+            messages: vec![ChatMessage::user_with_images(
+                "what is this?",
+                vec![crate::ai::ImagePart { mime: "image/png".into(), data: "AAAA".into() }],
+            )],
+            ..Default::default()
+        };
+        let b = build_body(&req, true);
+        let content = &b["messages"][0]["content"];
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,AAAA");
+    }
+
     fn body_serializes_messages_tools_and_tool_results() {
         let req = ChatRequest {
             model: "gpt-4o".into(),
