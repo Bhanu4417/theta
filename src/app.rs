@@ -5582,13 +5582,10 @@ mod harness_tests {
         app.sessions.push(sess);
         app.focus = 1;
 
-        let cache = crate::ui::conversation::Cache {
-            width: 80,
-            lines: (0..50).map(|_| ratatui::text::Line::from("line")).collect(),
-            blocks: Vec::new(),
-            animating: false,
-            built_at_tick: 0,
-        };
+        let cache = crate::ui::conversation::Cache::synthetic(
+            80,
+            (0..50).map(|_| ratatui::text::Line::from("line")).collect(),
+        );
         app.conv_cache.insert(1, cache);
         app.last_body_area = ratatui::layout::Rect::new(0, 0, 80, 20);
 

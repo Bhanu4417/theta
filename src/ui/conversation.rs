@@ -1,5 +1,6 @@
-use crate::harness::transcript::{PartKind, Role, ToolInfo, ToolStatus};
+use crate::harness::transcript::{Message, PartKind, Role, ToolInfo, ToolStatus};
 use crate::session::{SessionState, ToolRef};
+use std::collections::HashMap;
 use crate::theme::{pal, self};
 
 use ratatui::style::Color;
@@ -53,22 +54,98 @@ pub struct Cache {
     pub blocks: Vec<BlockSpan>,
     pub animating: bool,
     pub built_at_tick: u64,
+    /// Per-message render output, reused across rebuilds. Without this, every
+    /// streamed token re-rendered the entire transcript.
+    renders: HashMap<String, RenderedMessage>,
 }
 
-pub fn build_cache(sess: &SessionState, width: u16, tick: u64) -> Cache {
-    let w = width.max(12) as usize;
+/// One message's rendered lines and blocks, with a cheap signature used to
+/// decide whether it can be reused instead of re-rendered.
+#[derive(Debug, Clone)]
+struct RenderedMessage {
+    rev: u64,
+    lines: Vec<Line<'static>>,
+    blocks: Vec<BlockSpan>,
+    animating: bool,
+}
+
+fn mix(h: &mut u64, v: u64) {
+    *h ^= v;
+    *h = h.wrapping_mul(0x0000_0100_0000_01b3);
+}
+
+/// A signature that changes whenever this message would render differently.
+/// Lengths are used instead of the text itself so the check stays O(parts).
+fn message_rev(sess: &SessionState, mi: usize, msg: &Message) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    mix(&mut h, msg.role as u8 as u64);
+    mix(&mut h, msg.completed.is_some() as u64);
+    mix(&mut h, msg.parts.len() as u64);
+    for (pi, part) in msg.parts.iter().enumerate() {
+        let selected = sess
+            .tool_cursor
+            .as_ref()
+            .map(|t| t.msg == mi && t.part == pi)
+            .unwrap_or(false);
+        mix(&mut h, selected as u64);
+        match &part.kind {
+            PartKind::Text { text, synthetic } => {
+                mix(&mut h, 1);
+                mix(&mut h, text.len() as u64);
+                mix(&mut h, *synthetic as u64);
+            }
+            PartKind::Reasoning { text, running, end, .. } => {
+                mix(&mut h, 2);
+                mix(&mut h, text.len() as u64);
+                mix(&mut h, *running as u64);
+                mix(&mut h, end.unwrap_or(0) as u64);
+            }
+            PartKind::Tool(t) => {
+                mix(&mut h, 3);
+                mix(
+                    &mut h,
+                    match t.status {
+                        ToolStatus::Pending => 0,
+                        ToolStatus::Running => 1,
+                        ToolStatus::Completed => 2,
+                        ToolStatus::Error => 3,
+                    },
+                );
+                mix(&mut h, t.output.as_ref().map(|o| o.len()).unwrap_or(0) as u64);
+                mix(&mut h, t.title.as_ref().map(|s| s.len()).unwrap_or(0) as u64);
+                mix(&mut h, sess.is_expanded(&part.id) as u64);
+            }
+            PartKind::Compaction { tokens_before } => {
+                mix(&mut h, 4);
+                mix(&mut h, *tokens_before);
+            }
+            PartKind::StepStart | PartKind::StepFinish | PartKind::Other => mix(&mut h, 9),
+        }
+    }
+    h
+}
+
+/// Render a single message into its own line/block buffer, with block offsets
+/// relative to that buffer. The caller shifts them when assembling.
+#[allow(clippy::too_many_arguments)]
+fn render_message(
+    sess: &SessionState,
+    mi: usize,
+    msg: &Message,
+    w: usize,
+    tick: u64,
+    now_ms: i64,
+    busy: bool,
+    live_msg: Option<usize>,
+    last_user: Option<usize>,
+) -> RenderedMessage {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut blocks: Vec<BlockSpan> = Vec::new();
     let mut animating = false;
 
     let start_block = |kind: BlockKind, text: String, lines: &mut Vec<Line<'static>>, blocks: &mut Vec<BlockSpan>| {
         let start = lines.len();
-        blocks.push(BlockSpan {
-            kind,
-            start,
-            end: start,
-            text,
-        });
+        blocks.push(BlockSpan { kind, start, end: start, text });
     };
 
     let finish_block = |lines: &mut Vec<Line<'static>>, blocks: &mut Vec<BlockSpan>| {
@@ -76,6 +153,263 @@ pub fn build_cache(sess: &SessionState, width: u16, tick: u64) -> Cache {
             last.end = lines.len();
         }
     };
+
+    let mut rendered_any = false;
+    let mut block_kind = match msg.role {
+        Role::User => BlockKind::User,
+        Role::Assistant => BlockKind::Assistant,
+    };
+    let mut block_text = String::new();
+
+    for (pi, part) in msg.parts.iter().enumerate() {
+        match &part.kind {
+            PartKind::Text { text, synthetic } if !synthetic && !text.trim().is_empty() => {
+                if busy
+                    && msg.role == Role::Assistant
+                    && last_user.map(|u| mi > u).unwrap_or(false)
+                {
+                    continue;
+                }
+                if !rendered_any {
+                    start_block(block_kind.clone(), String::new(), &mut lines, &mut blocks);
+                    rendered_any = true;
+                }
+                match msg.role {
+                    Role::User => {
+                        lines.push(pad_bg_line(Line::from(""), w, user_bg(), 0));
+                        let in_flight = busy && Some(mi) == last_user;
+                        let mut spans = if in_flight {
+                            vec![
+                                Span::styled(
+                                    format!("{} ", theme::spin(tick)),
+                                    Style::default().fg(theme::spin_rgb(tick)),
+                                ),
+                                Span::styled(text.clone(), theme::fg(pal().fg)),
+                            ]
+                        } else {
+                            vec![
+                                Span::styled("Θ ".to_string(), theme::bold(pal().cyan)),
+                                Span::styled(text.clone(), theme::fg(pal().fg)),
+                            ]
+                        };
+                        if in_flight {
+                            if let Some(t0) = msg.created {
+                                let secs = (now_ms - t0).max(0) as f64 / 1000.0;
+                                spans.push(Span::styled(
+                                    format!("  · {secs:.1}s"),
+                                    theme::dim(),
+                                ));
+                            }
+                        }
+                        for chunk in wrap_spans(&spans, w.saturating_sub(2)) {
+                            lines.push(pad_bg_line(Line::from(chunk), w, user_bg(), 1));
+                        }
+                        lines.push(pad_bg_line(Line::from(""), w, user_bg(), 0));
+                    }
+                    Role::Assistant => {
+                        let base = theme::fg(pal().fg);
+                        for l in render_markdown(text, w.saturating_sub(1), base) {
+                            let mut sp = vec![Span::raw(" ")];
+                            sp.extend(l.spans);
+                            lines.push(Line::from(sp));
+                        }
+                    }
+                }
+                block_text.push_str(text);
+                block_text.push('\n');
+            }
+            PartKind::Reasoning { text, running, start, end } => {
+                if *running && live_msg == Some(mi) {
+                    if !rendered_any {
+                        start_block(BlockKind::Thinking, String::new(), &mut lines, &mut blocks);
+                        rendered_any = true;
+                        animating = true;
+                    }
+                    let elapsed = start
+                        .map(|s| (now_ms - s).max(0) as f64 / 1000.0)
+                        .unwrap_or(0.0);
+                    let spin_style = Style::default().fg(theme::spin_rgb(tick));
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("{} ", theme::spin(tick)),
+                            spin_style,
+                        ),
+                        Span::styled("Thinking…", spin_style),
+                        Span::styled(
+                            format!(" {elapsed:.1}s"),
+                            theme::fg(pal().fg_dim),
+                        ),
+                    ]));
+                    block_text.push_str(text);
+                } else if let Some(e) = end {
+                    let start_ms = start.unwrap_or(*e);
+                    let secs = (*e - start_ms).max(0) as f64 / 1000.0;
+                    if secs >= 1.0 {
+                        if !rendered_any {
+                            start_block(BlockKind::Thinking, String::new(), &mut lines, &mut blocks);
+                            rendered_any = true;
+                        }
+                        lines.push(Line::from(vec![
+                            Span::styled("✓ ", theme::fg(pal().fg_mute)),
+                            Span::styled(
+                                format!("thought for {secs:.1}s"),
+                                theme::fg(pal().fg_mute),
+                            ),
+                        ]));
+                    }
+                }
+            }
+            PartKind::Tool(t) => {
+                let expanded = sess.is_expanded(&part.id);
+                let selected = sess.tool_cursor == Some(ToolRef { msg: mi, part: pi });
+                if matches!(t.status, ToolStatus::Pending | ToolStatus::Running) {
+                    animating = true;
+                }
+                finish_block(&mut lines, &mut blocks);
+                let has_diff = t.diff().is_some();
+                start_block(
+                    BlockKind::Tool {
+                        tool_ref: ToolRef { msg: mi, part: pi },
+                        part_id: part.id.clone(),
+                        status: t.status,
+                        expanded,
+                        has_diff,
+                    },
+                    format!("{} {}", t.tool, t.display_title()),
+                    &mut lines,
+                    &mut blocks,
+                );
+
+
+                let (glyph, glyph_style, title_style) = match t.status {
+                    ToolStatus::Pending => ("◦", theme::fg(pal().fg_dim), theme::fg(pal().fg_dim)),
+                    ToolStatus::Running => (theme::spin(tick), theme::fg(pal().cyan), theme::fg(pal().fg_soft)),
+                    ToolStatus::Completed => ("✓", theme::fg(pal().green), theme::fg(pal().fg_soft)),
+                    ToolStatus::Error => ("✗", theme::fg(pal().red), theme::fg(pal().fg_soft)),
+                };
+                let title = t.display_title();
+                let max_title = w.saturating_sub(4);
+                let title = truncate(&title, max_title);
+                let mut spans = vec![
+                    Span::styled(" ", Style::default()),
+                    Span::styled(glyph.to_string(), glyph_style),
+                    Span::styled(" ", Style::default()),
+                    Span::styled(title, title_style),
+                ];
+                if selected {
+                    for s in &mut spans {
+                        s.style = s.style.bg(pal().selection);
+                    }
+                }
+                lines.push(Line::from(spans));
+
+                if matches!(t.status, ToolStatus::Pending | ToolStatus::Running)
+                    && t.tool == "bash"
+                {
+                    let label = activity_label(t);
+                    let pct = t
+                        .output
+                        .as_deref()
+                        .and_then(parse_percent)
+                        .or_else(|| synth_progress(t, now_ms));
+                    lines.push(Line::from(vec![
+                        Span::styled("   ".to_string(), Style::default()),
+                        Span::styled(label, theme::fg(pal().fg_soft)),
+                        Span::styled("…".to_string(), theme::dim()),
+                    ]));
+                    lines.push(activity_bar_line(w, pct));
+                }
+
+                let show_detail = expanded || has_diff;
+                if show_detail {
+                    let cap = if expanded { 80 } else { 24 };
+                    for l in tool_detail_lines(t, w, cap) {
+                        lines.push(l);
+                    }
+                }
+                finish_block(&mut lines, &mut blocks);
+                block_kind = match msg.role {
+                    Role::User => BlockKind::User,
+                    Role::Assistant => BlockKind::Assistant,
+                };
+                rendered_any = false;
+            }
+            PartKind::Compaction { tokens_before } => {
+                finish_block(&mut lines, &mut blocks);
+                start_block(
+                    BlockKind::Assistant,
+                    format!("conversation compacted ({tokens_before} tokens)"),
+                    &mut lines,
+                    &mut blocks,
+                );
+                lines.push(Line::from(""));
+                lines.push(centered_divider("conversation compacted", w, theme::dim()));
+                lines.push(Line::from(""));
+                finish_block(&mut lines, &mut blocks);
+                rendered_any = false;
+            }
+            _ => {}
+        }
+    }
+
+    if rendered_any {
+        finish_block(&mut lines, &mut blocks);
+        if let Some(b) = blocks.last_mut() {
+            b.text = block_text;
+        }
+    }
+
+    if let Some(err) = &msg.error {
+        start_block(BlockKind::Error, err.clone(), &mut lines, &mut blocks);
+        if err.contains("Aborted") {
+            lines.push(Line::from(Span::styled(
+                " · interrupted",
+                theme::dim(),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                format!(" ✗ {err}"),
+                theme::fg(pal().red),
+            )));
+        }
+        finish_block(&mut lines, &mut blocks);
+    }
+
+    lines.push(Line::from(""));
+    finish_block(&mut lines, &mut blocks);
+
+    RenderedMessage { rev: 0, lines, blocks, animating }
+}
+
+impl Cache {
+    /// A cache with no per-message renders — used by tests to stage a specific
+    /// transcript without going through [`rebuild`].
+    #[cfg(test)]
+    pub fn synthetic(width: u16, lines: Vec<Line<'static>>) -> Self {
+        Self {
+            width,
+            lines,
+            blocks: Vec::new(),
+            animating: false,
+            built_at_tick: 0,
+            renders: HashMap::new(),
+        }
+    }
+}
+
+pub fn build_cache(sess: &SessionState, width: u16, tick: u64) -> Cache {
+    rebuild(None, sess, width, tick)
+}
+
+/// Rebuild the transcript cache, reusing every message whose content did not
+/// change. Streaming a reply touches one message; everything before it is
+/// already rendered, so a long transcript stays cheap to update.
+pub fn rebuild(prev: Option<&Cache>, sess: &SessionState, width: u16, tick: u64) -> Cache {
+    let w = width.max(12) as usize;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut blocks: Vec<BlockSpan> = Vec::new();
+    let mut animating = false;
+    let mut renders: HashMap<String, RenderedMessage> = HashMap::new();
 
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -94,235 +428,57 @@ pub fn build_cache(sess: &SessionState, width: u16, tick: u64) -> Cache {
         None
     };
 
+    // Reuse is only valid at the same width: wrapping depends on it.
+    let reusable = prev.filter(|c| c.width == width);
+
     for (mi, msg) in sess.messages.iter().enumerate() {
-        let mut rendered_any = false;
-        let mut block_kind = match msg.role {
-            Role::User => BlockKind::User,
-            Role::Assistant => BlockKind::Assistant,
+        let rev = message_rev(sess, mi, msg);
+        // Any message that draws a spinner has to be re-rendered each tick,
+        // otherwise a reused frame would freeze the animation. That is the
+        // in-flight turn, the last prompt while busy, and any running tool —
+        // one or two messages, never the whole transcript.
+        let animates = (busy && live_msg == Some(mi))
+            || (busy && Some(mi) == last_user)
+            || msg
+                .parts
+                .iter()
+                .any(|p| matches!(&p.kind, PartKind::Tool(t) if t.status == ToolStatus::Running));
+        let cached = reusable
+            .and_then(|c| c.renders.get(&msg.id))
+            .filter(|r| r.rev == rev && !animates);
+
+        let mut rendered = match cached {
+            Some(r) => r.clone(),
+            None => {
+                let mut r = render_message(sess, mi, msg, w, tick, now_ms, busy, live_msg, last_user);
+                r.rev = rev;
+                r
+            }
         };
-        let mut block_text = String::new();
 
-        for (pi, part) in msg.parts.iter().enumerate() {
-            match &part.kind {
-                PartKind::Text { text, synthetic } if !synthetic && !text.trim().is_empty() => {
-                    if busy
-                        && msg.role == Role::Assistant
-                        && last_user.map(|u| mi > u).unwrap_or(false)
-                    {
-                        continue;
-                    }
-                    if !rendered_any {
-                        start_block(block_kind.clone(), String::new(), &mut lines, &mut blocks);
-                        rendered_any = true;
-                    }
-                    match msg.role {
-                        Role::User => {
-                            lines.push(pad_bg_line(Line::from(""), w, user_bg(), 0));
-                            let in_flight = busy && Some(mi) == last_user;
-                            let mut spans = if in_flight {
-                                vec![
-                                    Span::styled(
-                                        format!("{} ", theme::spin(tick)),
-                                        Style::default().fg(theme::spin_rgb(tick)),
-                                    ),
-                                    Span::styled(text.clone(), theme::fg(pal().fg)),
-                                ]
-                            } else {
-                                vec![
-                                    Span::styled("Θ ".to_string(), theme::bold(pal().cyan)),
-                                    Span::styled(text.clone(), theme::fg(pal().fg)),
-                                ]
-                            };
-                            if in_flight {
-                                if let Some(t0) = msg.created {
-                                    let secs = (now_ms - t0).max(0) as f64 / 1000.0;
-                                    spans.push(Span::styled(
-                                        format!("  · {secs:.1}s"),
-                                        theme::dim(),
-                                    ));
-                                }
-                            }
-                            for chunk in wrap_spans(&spans, w.saturating_sub(2)) {
-                                lines.push(pad_bg_line(Line::from(chunk), w, user_bg(), 1));
-                            }
-                            lines.push(pad_bg_line(Line::from(""), w, user_bg(), 0));
-                        }
-                        Role::Assistant => {
-                            let base = theme::fg(pal().fg);
-                            for l in render_markdown(text, w.saturating_sub(1), base) {
-                                let mut sp = vec![Span::raw(" ")];
-                                sp.extend(l.spans);
-                                lines.push(Line::from(sp));
-                            }
-                        }
-                    }
-                    block_text.push_str(text);
-                    block_text.push('\n');
-                }
-                PartKind::Reasoning { text, running, start, end } => {
-                    if *running && live_msg == Some(mi) {
-                        if !rendered_any {
-                            start_block(BlockKind::Thinking, String::new(), &mut lines, &mut blocks);
-                            rendered_any = true;
-                            animating = true;
-                        }
-                        let elapsed = start
-                            .map(|s| (now_ms - s).max(0) as f64 / 1000.0)
-                            .unwrap_or(0.0);
-                        let spin_style = Style::default().fg(theme::spin_rgb(tick));
-                        lines.push(Line::from(vec![
-                            Span::styled(
-                                format!("{} ", theme::spin(tick)),
-                                spin_style,
-                            ),
-                            Span::styled("Thinking…", spin_style),
-                            Span::styled(
-                                format!(" {elapsed:.1}s"),
-                                theme::fg(pal().fg_dim),
-                            ),
-                        ]));
-                        block_text.push_str(text);
-                    } else if let Some(e) = end {
-                        let start_ms = start.unwrap_or(*e);
-                        let secs = (*e - start_ms).max(0) as f64 / 1000.0;
-                        if secs >= 1.0 {
-                            if !rendered_any {
-                                start_block(BlockKind::Thinking, String::new(), &mut lines, &mut blocks);
-                                rendered_any = true;
-                            }
-                            lines.push(Line::from(vec![
-                                Span::styled("✓ ", theme::fg(pal().fg_mute)),
-                                Span::styled(
-                                    format!("thought for {secs:.1}s"),
-                                    theme::fg(pal().fg_mute),
-                                ),
-                            ]));
-                        }
-                    }
-                }
-                PartKind::Tool(t) => {
-                    let expanded = sess.is_expanded(&part.id);
-                    let selected = sess.tool_cursor == Some(ToolRef { msg: mi, part: pi });
-                    if matches!(t.status, ToolStatus::Pending | ToolStatus::Running) {
-                        animating = true;
-                    }
-                    finish_block(&mut lines, &mut blocks);
-                    let has_diff = t.diff().is_some();
-                    start_block(
-                        BlockKind::Tool {
-                            tool_ref: ToolRef { msg: mi, part: pi },
-                            part_id: part.id.clone(),
-                            status: t.status,
-                            expanded,
-                            has_diff,
-                        },
-                        format!("{} {}", t.tool, t.display_title()),
-                        &mut lines,
-                        &mut blocks,
-                    );
-
-
-                    let (glyph, glyph_style, title_style) = match t.status {
-                        ToolStatus::Pending => ("◦", theme::fg(pal().fg_dim), theme::fg(pal().fg_dim)),
-                        ToolStatus::Running => (theme::spin(tick), theme::fg(pal().cyan), theme::fg(pal().fg_soft)),
-                        ToolStatus::Completed => ("✓", theme::fg(pal().green), theme::fg(pal().fg_soft)),
-                        ToolStatus::Error => ("✗", theme::fg(pal().red), theme::fg(pal().fg_soft)),
-                    };
-                    let title = t.display_title();
-                    let max_title = w.saturating_sub(4);
-                    let title = truncate(&title, max_title);
-                    let mut spans = vec![
-                        Span::styled(" ", Style::default()),
-                        Span::styled(glyph.to_string(), glyph_style),
-                        Span::styled(" ", Style::default()),
-                        Span::styled(title, title_style),
-                    ];
-                    if selected {
-                        for s in &mut spans {
-                            s.style = s.style.bg(pal().selection);
-                        }
-                    }
-                    lines.push(Line::from(spans));
-
-                    if matches!(t.status, ToolStatus::Pending | ToolStatus::Running)
-                        && t.tool == "bash"
-                    {
-                        let label = activity_label(t);
-                        let pct = t
-                            .output
-                            .as_deref()
-                            .and_then(parse_percent)
-                            .or_else(|| synth_progress(t, now_ms));
-                        lines.push(Line::from(vec![
-                            Span::styled("   ".to_string(), Style::default()),
-                            Span::styled(label, theme::fg(pal().fg_soft)),
-                            Span::styled("…".to_string(), theme::dim()),
-                        ]));
-                        lines.push(activity_bar_line(w, pct));
-                    }
-
-                    let show_detail = expanded || has_diff;
-                    if show_detail {
-                        let cap = if expanded { 80 } else { 24 };
-                        for l in tool_detail_lines(t, w, cap) {
-                            lines.push(l);
-                        }
-                    }
-                    finish_block(&mut lines, &mut blocks);
-                    block_kind = match msg.role {
-                        Role::User => BlockKind::User,
-                        Role::Assistant => BlockKind::Assistant,
-                    };
-                    rendered_any = false;
-                }
-                PartKind::Compaction { tokens_before } => {
-                    finish_block(&mut lines, &mut blocks);
-                    start_block(
-                        BlockKind::Assistant,
-                        format!("conversation compacted ({tokens_before} tokens)"),
-                        &mut lines,
-                        &mut blocks,
-                    );
-                    lines.push(Line::from(""));
-                    lines.push(centered_divider("conversation compacted", w, theme::dim()));
-                    lines.push(Line::from(""));
-                    finish_block(&mut lines, &mut blocks);
-                    rendered_any = false;
-                }
-                _ => {}
-            }
+        // Shift this message's blocks into the assembled transcript.
+        let base = lines.len();
+        for b in &mut rendered.blocks {
+            b.start += base;
+            b.end += base;
         }
+        lines.extend(rendered.lines.iter().cloned());
+        blocks.extend(rendered.blocks.iter().cloned());
 
-        if rendered_any {
-            finish_block(&mut lines, &mut blocks);
-            if let Some(b) = blocks.last_mut() {
-                b.text = block_text;
-            }
+        // Store with relative offsets so the entry stays reusable.
+        let mut stored = rendered;
+        for b in &mut stored.blocks {
+            b.start -= base;
+            b.end -= base;
         }
-
-        if let Some(err) = &msg.error {
-            start_block(BlockKind::Error, err.clone(), &mut lines, &mut blocks);
-            if err.contains("Aborted") {
-                lines.push(Line::from(Span::styled(
-                    " · interrupted",
-                    theme::dim(),
-                )));
-            } else {
-                lines.push(Line::from(Span::styled(
-                    format!(" ✗ {err}"),
-                    theme::fg(pal().red),
-                )));
-            }
-            finish_block(&mut lines, &mut blocks);
-        }
-
-        lines.push(Line::from(""));
-        finish_block(&mut lines, &mut blocks);
+        animating |= stored.animating;
+        renders.insert(msg.id.clone(), stored);
     }
 
     if let Some(err) = &sess.last_error {
         if blocks.last().map(|b| b.kind != BlockKind::Error).unwrap_or(true) {
-            start_block(BlockKind::Error, err.clone(), &mut lines, &mut blocks);
+            let start = lines.len();
+            blocks.push(BlockSpan { kind: BlockKind::Error, start, end: start, text: err.clone() });
             if err.contains("Aborted") {
                 lines.push(Line::from(Span::styled("· interrupted", theme::dim())));
             } else {
@@ -331,7 +487,9 @@ pub fn build_cache(sess: &SessionState, width: u16, tick: u64) -> Cache {
                     theme::fg(pal().red),
                 )));
             }
-            finish_block(&mut lines, &mut blocks);
+            if let Some(last) = blocks.last_mut() {
+                last.end = lines.len();
+            }
         }
     }
 
@@ -341,6 +499,7 @@ pub fn build_cache(sess: &SessionState, width: u16, tick: u64) -> Cache {
         blocks,
         animating,
         built_at_tick: tick,
+        renders,
     }
 }
 
@@ -1005,6 +1164,160 @@ mod tests {
         assert!(text
             .lines()
             .any(|l| l.contains("conversation compacted") && l.starts_with('─')), "{text}");
+    }
+
+
+    #[test]
+    fn incremental_rebuild_matches_a_full_one() {
+        // The optimization is only valid if reusing per-message renders yields
+        // exactly what a from-scratch render would, in every state.
+        fn plain(c: &Cache) -> String {
+            c.lines
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        let mut s = SessionState::new(1, "s".into(), std::path::PathBuf::from("."));
+        s.status = crate::session::SessStatus::Working;
+        for i in 0..6 {
+            let u = Message {
+                id: format!("u{i}"),
+                role: TRole::User,
+                error: None,
+                completed: Some(i),
+                created: Some(i),
+                cost: None,
+                tokens: None,
+                parts: vec![Part {
+                    id: format!("u{i}-p"),
+                    message_id: format!("u{i}"),
+                    kind: PartKind::Text {
+                        text: format!("question {i} {}", "x".repeat(300)),
+                        synthetic: false,
+                    },
+                }],
+            };
+            s.upsert_message_meta(&u);
+            s.upsert_part(&u, u.parts[0].clone());
+
+            let a = Message {
+                id: format!("a{i}"),
+                role: TRole::Assistant,
+                error: None,
+                completed: Some(i),
+                created: Some(i),
+                cost: Some(0.01),
+                tokens: None,
+                parts: vec![
+                    Part {
+                        id: format!("a{i}-t"),
+                        message_id: format!("a{i}"),
+                        kind: PartKind::Text {
+                            text: format!("answer {i} {}", "y".repeat(400)),
+                            synthetic: false,
+                        },
+                    },
+                    Part {
+                        id: format!("a{i}-tool"),
+                        message_id: format!("a{i}"),
+                        kind: PartKind::Tool(ToolInfo {
+                            tool: "read".into(),
+                            call_id: format!("c{i}"),
+                            status: ToolStatus::Completed,
+                            title: None,
+                            input: serde_json::json!({"path": format!("/f{i}.rs")}),
+                            output: Some("z".repeat(200)),
+                            error: None,
+                            metadata: serde_json::json!({}),
+                            start_ms: None,
+                        }),
+                    },
+                ],
+            };
+            s.upsert_message_meta(&a);
+            for part in &a.parts {
+                s.upsert_part(&a, part.clone());
+            }
+        }
+
+        // At every step, the incremental result must equal a full rebuild of
+        // the same state at the same width.
+        let check = |s: &SessionState, prev: &Cache, width: u16, tick: u64| -> Cache {
+            let inc = rebuild(Some(prev), s, width, tick);
+            let full = rebuild(None, s, width, tick);
+            assert_eq!(plain(&inc), plain(&full), "width={width} tick={tick}");
+            assert_eq!(inc.blocks.len(), full.blocks.len(), "block count at tick={tick}");
+            for (a, b) in inc.blocks.iter().zip(full.blocks.iter()) {
+                assert_eq!((a.start, a.end, &a.kind), (b.start, b.end, &b.kind), "block ranges");
+            }
+            inc
+        };
+
+        let mut cache = check(&s, &rebuild(None, &s, 80, 0), 80, 0);
+
+        // Appending a part to the last message.
+        let last = s.messages.last().unwrap().id.clone();
+        if let Some(m) = s.messages.iter_mut().find(|m| m.id == last) {
+            m.parts.push(Part {
+                id: "extra".into(),
+                message_id: last.clone(),
+                kind: PartKind::Text { text: "more".into(), synthetic: false },
+            });
+        }
+        cache = check(&s, &cache, 80, 1);
+
+        // Expanding a tool entry.
+        s.expanded.insert("a2-tool".into());
+        cache = check(&s, &cache, 80, 2);
+
+        // Moving the tool cursor must invalidate its message.
+        s.tool_cursor = Some(crate::session::ToolRef { msg: 3, part: 1 });
+        cache = check(&s, &cache, 80, 3);
+
+        // A width change must re-render everything.
+        cache = check(&s, &cache, 60, 4);
+
+        // And a live message is never reused while it animates.
+        s.status = crate::session::SessStatus::Working;
+        if let Some(m) = s.messages.last_mut() {
+            m.completed = None;
+        }
+        check(&s, &cache, 60, 5);
+    }
+
+    #[test]
+    fn reusing_a_cache_across_identical_rebuilds_is_stable() {
+        let mut s = SessionState::new(1, "s".into(), std::path::PathBuf::from("."));
+        let m = Message {
+            id: "m1".into(),
+            role: TRole::User,
+            error: None,
+            completed: Some(1),
+            created: Some(1),
+            cost: None,
+            tokens: None,
+            parts: vec![Part {
+                id: "p1".into(),
+                message_id: "m1".into(),
+                kind: PartKind::Text { text: "hello".into(), synthetic: false },
+            }],
+        };
+        s.upsert_message_meta(&m);
+        s.upsert_part(&m, m.parts[0].clone());
+
+        let a = build_cache(&s, 80, 0);
+        let b = rebuild(Some(&a), &s, 80, 1);
+        let c = rebuild(Some(&b), &s, 80, 2);
+        let plain = |x: &Cache| {
+            x.lines
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(plain(&a), plain(&c), "repeated rebuilds must be identical");
     }
 
     #[test]

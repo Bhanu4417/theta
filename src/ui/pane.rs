@@ -63,8 +63,12 @@ pub fn render(f: &mut ratatui::Frame, app: &mut App, area: Rect, sid: u32, focus
         }
     };
     if stale {
+        // Rebuild incrementally: hand the previous cache over so only the
+        // messages that changed are re-rendered. Streaming a reply changes one
+        // message, so a long transcript no longer re-renders on every token.
+        let prev = app.conv_cache.get(&sid).cloned();
         if let Some(s) = app.session(sid) {
-            let cache = conversation::build_cache(s, width, app.tick);
+            let cache = conversation::rebuild(prev.as_ref(), s, width, app.tick);
             app.conv_cache.insert(sid, cache);
         }
         if let Some(s) = app.session_mut(sid) {
