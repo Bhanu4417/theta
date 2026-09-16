@@ -1,3 +1,7 @@
 /target
 **/*.rs.bk
 .DS_Store
+
+# Python bytecode (the installer test harness is Python)
+__pycache__/
+*.py[cod]
