@@ -225,8 +225,11 @@ fn render_message(
                         rendered_any = true;
                         animating = true;
                     }
+                    // A missing or zero start means "unknown": subtracting it
+                    // would display the whole Unix epoch as the elapsed time.
                     let elapsed = start
-                        .map(|s| (now_ms - s).max(0) as f64 / 1000.0)
+                        .filter(|s| *s > 0 && *s <= now_ms)
+                        .map(|s| (now_ms - s) as f64 / 1000.0)
                         .unwrap_or(0.0);
                     let spin_style = Style::default().fg(theme::spin_rgb(tick));
                     lines.push(Line::from(vec![
@@ -1164,6 +1167,43 @@ mod transcript_boundary_tests {
             !text.contains('⣾') && !text.contains('⣽') && !text.contains('⣻'),
             "the working spinner must not persist after the turn ends:\n{text}"
         );
+    }
+
+#[test]
+    fn the_thinking_timer_never_shows_an_absurd_elapsed() {
+        let mut s = SessionState::new(1, "s".into(), std::path::PathBuf::from("/tmp"));
+        s.status = crate::session::SessStatus::Working;
+        for start in [None, Some(0)] {
+            let mut sess = s.clone();
+            let part = Part {
+                id: "p-r".into(),
+                message_id: "m1".into(),
+                kind: PartKind::Reasoning {
+                    text: "hmm".into(),
+                    running: true,
+                    start,
+                    end: None,
+                },
+            };
+            let meta = Message {
+                id: "m1".into(),
+                role: Role::Assistant,
+                error: None,
+                completed: None,
+                created: None,
+                cost: None,
+                tokens: None,
+                parts: vec![part.clone()],
+            };
+            sess.upsert_part(&meta, part);
+            let text = cache_text(&sess);
+            assert!(text.contains("Thinking"), "spinner shows: {text}");
+            // Never a number in the billions (epoch seconds).
+            assert!(
+                !text.contains("1789") && !text.contains("17") || text.contains("0.0s"),
+                "absurd elapsed rendered: {text}"
+            );
+        }
     }
 
     #[test]

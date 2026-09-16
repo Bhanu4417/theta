@@ -281,6 +281,26 @@ pub async fn stream_with_retry(
     }
 }
 
+/// Build the HTTP client every provider shares.
+///
+/// `read_timeout` is an **idle** timeout: it fires only when no bytes arrive for
+/// that long. A total request timeout must never be used here — a
+/// reasoning-heavy turn can stream for minutes, and a total timeout aborts it
+/// mid-generation, which the user sees as a turn that hangs and then dies.
+pub(crate) fn http_client(read_timeout: Option<std::time::Duration>) -> reqwest::Client {
+    let mut b = reqwest::Client::builder()
+        // Nagle would coalesce small SSE frames, adding latency per token.
+        .tcp_nodelay(true)
+        // Reuse connections: otherwise every turn pays a fresh TLS handshake.
+        .pool_max_idle_per_host(8)
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .connect_timeout(std::time::Duration::from_secs(10));
+    if let Some(t) = read_timeout {
+        b = b.read_timeout(t);
+    }
+    b.build().expect("reqwest client")
+}
+
 pub(crate) fn sse_data_lines(buf: &mut Vec<u8>, chunk: &[u8]) -> Vec<String> {
     buf.extend_from_slice(chunk);
     let mut out = Vec::new();

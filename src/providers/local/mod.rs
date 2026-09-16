@@ -380,18 +380,38 @@ impl AgentProvider for LocalProvider {
             };
             let mut journal: Vec<ChatMessage> = Vec::new();
             let mut snapshots: Vec<crate::agent::tools::FileSnapshot> = Vec::new();
-            let result = agent
-                .run_turn_journaled_snapshots(
-                    &mut history,
-                    &text,
-                    &images,
-                    &cwd,
-                    &cancel,
-                    &mut emit,
-                    &mut journal,
-                    &mut snapshots,
-                )
-                .await;
+            // A panic inside a turn would otherwise kill this task before it
+            // emits SessionIdle, leaving the pane busy — a spinner that never
+            // stops and only clears on a refresh. Catch it and finish cleanly.
+            let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+                agent
+                    .run_turn_journaled_snapshots(
+                        &mut history,
+                        &text,
+                        &images,
+                        &cwd,
+                        &cancel,
+                        &mut emit,
+                        &mut journal,
+                        &mut snapshots,
+                    )
+                    .await
+            }))
+            .await;
+            let result = match result {
+                Ok(r) => r,
+                Err(panic) => {
+                    let msg = panic
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_string())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".into());
+                    crate::tlog!("PANIC turn panicked: {msg}");
+                    Err(ProviderError::Protocol(format!(
+                        "the turn failed internally ({msg}); the session was kept"
+                    )))
+                }
+            };
             if let Err(e) = result {
                 let _ = tx.send(RoutedEvent {
                     session_id: Some(sid.clone()),
@@ -588,6 +608,72 @@ mod tests {
         let first = tree.entries[0].id.clone();
         assert!(local.navigate(&session.id, &first, None));
         assert_eq!(local.tree_snapshot(&session.id).unwrap().leaf.as_deref(), Some(first.as_str()));
+    }
+
+/// A provider that panics, to prove a broken turn cannot wedge the UI.
+    struct PanicProvider;
+
+    impl crate::ai::Provider for PanicProvider {
+        fn id(&self) -> &'static str {
+            "panic"
+        }
+        fn stream<'a>(
+            &'a self,
+            _request: crate::ai::ChatRequest,
+            _on_event: &'a mut (dyn FnMut(crate::ai::ProviderEvent) + Send),
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<crate::ai::AssistantTurn, ProviderError>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move { panic!("simulated tool failure") })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicking_turn_still_finishes_and_goes_idle() {
+        // Without the panic guard this task dies before emitting SessionIdle,
+        // so the pane stays busy forever and only clears on a refresh.
+        let dir = std::env::temp_dir().to_string_lossy().to_string();
+        let session_dir =
+            std::env::temp_dir().join(format!("theta-panic-{}", std::process::id()));
+        std::env::set_var("THETA_SESSION_DIR", &session_dir);
+        let agent = Arc::new(AgentLoop::new(Box::new(PanicProvider), "m"));
+        let local = Arc::new(LocalProvider::new(agent, &dir));
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let pump_local = local.clone();
+        let pump_task = tokio::spawn(async move {
+            let _ = pump_local.pump(tx).await;
+        });
+
+        let session = local
+            .create_session(SessionConfig { directory: dir, title: "t".into() })
+            .await
+            .unwrap();
+        local.send_message(&session, "hi", None, None, &[]).await.unwrap();
+
+        let mut idle = false;
+        let mut errored = false;
+        for _ in 0..50 {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
+                Ok(Some(ev)) => match &ev.event {
+                    crate::harness::HarnessEvent::SessionIdle => {
+                        idle = true;
+                        break;
+                    }
+                    crate::harness::HarnessEvent::SessionError(_) => errored = true,
+                    _ => {}
+                },
+                _ => break,
+            }
+        }
+        pump_task.abort();
+        assert!(errored, "the failure should be reported, not swallowed");
+        assert!(idle, "a panicking turn must still go idle so the UI cannot hang");
     }
 
     #[tokio::test]

@@ -18,17 +18,7 @@ pub struct Google {
 
 impl Google {
     pub fn new(api_key: Option<String>) -> Self {
-        let client = reqwest::Client::builder()
-            // Nagle's algorithm would coalesce small SSE frames, adding latency
-            // to every streamed token.
-            .tcp_nodelay(true)
-            // Reuse connections aggressively: a multi-turn session otherwise
-            // pays a fresh TLS handshake per request.
-            .pool_max_idle_per_host(8)
-            .pool_idle_timeout(std::time::Duration::from_secs(90))
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .build()
-            .expect("reqwest client");
+        let client = crate::ai::http_client(None);
         Self {
             api_key,
             base_url: "https://generativelanguage.googleapis.com".into(),
@@ -224,6 +214,8 @@ impl Provider for Google {
 
     fn set_timeout(&mut self, secs: u64) {
         self.timeout = (secs > 0).then(|| std::time::Duration::from_secs(secs));
+        // Rebuild so the timeout applies as an idle read timeout.
+        self.client = crate::ai::http_client(self.timeout);
     }
 
     fn list_models<'a>(
@@ -253,9 +245,6 @@ impl Provider for Google {
                 .post(url)
                 .header("Accept", "text/event-stream")
                 .json(&body);
-            if let Some(t) = self.timeout {
-                rb = rb.timeout(t);
-            }
             if let Some(key) = &self.api_key {
                 rb = rb.query(&[("key", key)]);
             }
