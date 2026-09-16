@@ -203,6 +203,24 @@ pub fn needs_responses_api(provider_id: &str, model: &str) -> bool {
     m.starts_with("muse-spark") || m.starts_with("gpt-5") || m.starts_with("grok-4")
 }
 
+/// The conventional environment variable for a provider's key. Used to make
+/// "no credentials" errors concrete.
+pub fn env_hint(provider_id: &str) -> String {
+    format!("{}_API_KEY", provider_id.to_ascii_uppercase().replace('-', "_"))
+}
+
+/// True when this provider id maps to a hosted endpoint we ship for, and so
+/// needs credentials unless a custom `base_url` is set.
+///
+/// Must cover the native adapters as well as the OpenAI-compatible presets:
+/// checking only the preset table would let an Anthropic or Gemini user with no
+/// key reach the network and be shown raw JSON again.
+pub fn is_hosted_preset(provider_id: &str) -> bool {
+    let id = provider_id.to_ascii_lowercase();
+    matches!(id.as_str(), "anthropic" | "claude" | "google" | "gemini")
+        || openai::OpenAiCompat::preset_base(&id).is_some()
+}
+
 pub fn provider_for_model(
     provider_id: &str,
     base_url: &str,
@@ -406,5 +424,36 @@ mod tests {
         let got = sse_data_lines(&mut buf, b":1}\ndata: [DONE]\n");
         assert_eq!(got, vec!["{\"a\":1}".to_string(), "[DONE]".to_string()]);
         assert!(sse_data_lines(&mut buf, b"\n: ping\n\n").is_empty());
+    }
+
+    #[test]
+    fn env_hint_follows_the_provider_id() {
+        assert_eq!(env_hint("openai"), "OPENAI_API_KEY");
+        assert_eq!(env_hint("opencode-go"), "OPENCODE_GO_API_KEY");
+    }
+
+    #[test]
+    fn hosted_presets_are_recognized_but_unknown_ids_are_not() {
+        assert!(is_hosted_preset("openai"));
+        assert!(is_hosted_preset("opencode-go"));
+        assert!(is_hosted_preset("OPENCODE-GO"), "case-insensitive");
+        // Native adapters have no OpenAI preset, so they need explicit coverage.
+        for native in ["anthropic", "claude", "google", "gemini"] {
+            assert!(is_hosted_preset(native), "{native} needs credentials too");
+        }
+        // An arbitrary id is treated as a custom endpoint, not a hosted preset.
+        assert!(!is_hosted_preset("my-self-hosted-thing"));
+    }
+
+    #[test]
+    fn a_custom_base_url_may_omit_the_key() {
+        // A local or self-hosted endpoint often needs no credentials, so the
+        // check must not fire when base_url is set.
+        assert!(provider_for_model("openai", "http://localhost:11434/v1", None, "llama3").is_ok());
+    }
+
+    #[test]
+    fn a_supplied_key_is_accepted() {
+        assert!(provider_for_model("openai", "", Some("sk-test".into()), "gpt-4o").is_ok());
     }
 }

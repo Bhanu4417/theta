@@ -484,6 +484,18 @@ pub fn make_provider_for_model(
     let provider_id = ai.provider.to_ascii_lowercase();
     let creds = crate::credentials::Credentials::load();
     let key = creds.resolve(&provider_id, &ai.api_key_env);
+
+    // Refuse here, with something actionable, rather than sending an
+    // unauthenticated request: the provider's raw 401 JSON does not tell the
+    // user how to fix it. A custom base_url is exempt, since a local or
+    // self-hosted endpoint may deliberately need no key.
+    if key.is_none() && ai.base_url.trim().is_empty() && crate::ai::is_hosted_preset(&provider_id) {
+        return Err(crate::providers::ProviderError::Auth(format!(
+            "no API key configured for `{provider_id}`. Run `/login` to add one, or set \
+             `${}`, or point `[ai].base_url` at a local endpoint.",
+            crate::ai::env_hint(&provider_id)
+        )));
+    }
     let mut provider = crate::ai::provider_for_model(&provider_id, &ai.base_url, key, model)?;
     provider.set_timeout(ai.timeout_secs);
     Ok(provider)
@@ -675,11 +687,17 @@ mod tests {
     fn local_provider_builds_for_preset_and_custom_base() {
         let mut cfg = Config::default();
         cfg.ai.provider = "openai".into();
+        // A hosted preset needs credentials; this test is about which base URL
+        // is chosen, so satisfy the credential check.
+        std::env::set_var("THETA_BASE_TEST_KEY", "sk-test");
+        cfg.ai.api_key_env = "THETA_BASE_TEST_KEY".into();
         let shared = Arc::new(Mutex::new(cfg.clone()));
         assert!(build_local_provider(&shared).is_ok(), "preset providers build");
 
+        // An explicit base_url needs no key.
         cfg.ai.provider = "compat".into();
         cfg.ai.base_url = "http://localhost:1234/v1".into();
+        cfg.ai.api_key_env = "THETA_DEFINITELY_UNSET_KEY".into();
         let shared = Arc::new(Mutex::new(cfg.clone()));
         assert!(build_local_provider(&shared).is_ok(), "explicit base_url builds");
 
@@ -689,6 +707,7 @@ mod tests {
             matches!(build_local_provider(&shared), Err(ProviderError::Unsupported(_))),
             "unknown provider without base_url is a clean error"
         );
+        std::env::remove_var("THETA_BASE_TEST_KEY");
     }
 
     #[tokio::test]
@@ -715,9 +734,58 @@ mod tests {
         cfg.ai.provider = "opencode-go".into();
         cfg.ai.model = String::new();
         assert_eq!(resolved_model(&cfg, "opencode-go"), "deepseek-v4.1-flash");
+        // A key is required for any hosted preset, so supply one: this test is
+        // about which preset resolves, not about the missing-credential path.
+        std::env::set_var("THETA_PRESET_TEST_KEY", "sk-test");
+        cfg.ai.api_key_env = "THETA_PRESET_TEST_KEY".into();
         assert!(make_provider(&cfg).is_ok(), "opencode-go builds from its preset");
         cfg.ai.provider = "opencode".into();
         assert!(make_provider(&cfg).is_ok(), "opencode zen builds from its preset");
+        std::env::remove_var("THETA_PRESET_TEST_KEY");
+    }
+
+
+    #[test]
+    fn a_hosted_provider_without_a_key_is_refused_with_guidance() {
+        // Before this check the request went out unauthenticated and the user
+        // was shown the provider's raw 401 JSON, which never mentioned /login.
+        let mut cfg = Config::default();
+        cfg.ai.provider = "openai".into();
+        cfg.ai.base_url = String::new();
+        cfg.ai.api_key_env = "THETA_DEFINITELY_UNSET_KEY".into();
+        std::env::remove_var("THETA_DEFINITELY_UNSET_KEY");
+
+        let msg = match make_provider(&cfg) {
+            Err(crate::providers::ProviderError::Auth(m)) => m,
+            Err(_) => panic!("expected an Auth error"),
+            Ok(_) => panic!("a hosted provider with no key must be refused"),
+        };
+        assert!(msg.contains("/login"), "must point at /login: {msg}");
+        assert!(msg.contains("OPENAI_API_KEY"), "must name the env var: {msg}");
+    }
+
+    #[test]
+    fn a_custom_base_url_may_omit_the_key() {
+        // A local or self-hosted endpoint often needs no credentials, so the
+        // check must not fire when base_url is set.
+        let mut cfg = Config::default();
+        cfg.ai.provider = "openai".into();
+        cfg.ai.base_url = "http://localhost:11434/v1".into();
+        cfg.ai.api_key_env = "THETA_DEFINITELY_UNSET_KEY".into();
+        std::env::remove_var("THETA_DEFINITELY_UNSET_KEY");
+        assert!(make_provider(&cfg).is_ok());
+    }
+
+    #[test]
+    fn a_supplied_key_is_accepted() {
+        let mut cfg = Config::default();
+        cfg.ai.provider = "openai".into();
+        cfg.ai.base_url = String::new();
+        cfg.ai.api_key_env = "THETA_TEST_PRESENT_KEY".into();
+        std::env::set_var("THETA_TEST_PRESENT_KEY", "sk-test");
+        let ok = make_provider(&cfg).is_ok();
+        std::env::remove_var("THETA_TEST_PRESENT_KEY");
+        assert!(ok);
     }
 
 }
