@@ -156,6 +156,15 @@ pub(crate) fn build_body(req: &ChatRequest, stream: bool) -> Value {
     if let Some(m) = req.max_tokens {
         body["max_tokens"] = json!(m);
     }
+    // Reasoning effort was previously sent only on the `/responses` path, so a
+    // configured effort was silently ignored for every model reaching
+    // `/chat/completions` — which run at their own (usually higher) default and
+    // take far longer to answer.
+    if let Some(e) = &req.reasoning_effort {
+        if !e.trim().is_empty() {
+            body["reasoning_effort"] = json!(e);
+        }
+    }
     body
 }
 
@@ -336,6 +345,31 @@ fn net(e: reqwest::Error) -> ProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasoning_effort_reaches_the_chat_completions_body() {
+        // This was the cause of a real latency bug: the effort was honoured on
+        // the /responses path only, so every /chat/completions model ran at its
+        // own higher default.
+        let mut req = ChatRequest {
+            model: "m".into(),
+            messages: vec![ChatMessage::user("hi")],
+            tools: vec![],
+            temperature: None,
+            max_tokens: None,
+            reasoning_effort: Some("low".into()),
+            ..Default::default()
+        };
+        let body = build_body(&req, true);
+        assert_eq!(body["reasoning_effort"], json!("low"));
+
+        // Unset or blank effort must not be sent, so the provider default
+        // applies rather than an empty string being rejected.
+        req.reasoning_effort = None;
+        assert!(build_body(&req, true).get("reasoning_effort").is_none());
+        req.reasoning_effort = Some("  ".into());
+        assert!(build_body(&req, true).get("reasoning_effort").is_none());
+    }
     use crate::ai::{ChatMessage, ToolSpec, ProviderEvent};
 
     #[test]

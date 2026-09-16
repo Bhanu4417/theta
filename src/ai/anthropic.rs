@@ -136,7 +136,27 @@ pub fn build_body(req: &ChatRequest, stream: bool) -> Value {
     if let Some(temp) = req.temperature {
         body["temperature"] = json!(temp);
     }
+    // Extended thinking, sized from the configured effort. A disabled budget is
+    // the fast path, so an unset effort sends nothing and leaves the model's
+    // default alone.
+    if let Some(budget) = thinking_budget(req.reasoning_effort.as_deref()) {
+        // The API requires the reply budget to exceed the thinking budget.
+        if req.max_tokens.map(|m| m > budget).unwrap_or(true) {
+            body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+        }
+    }
     body
+}
+
+/// Map a reasoning effort onto Anthropic's thinking budget, in tokens.
+fn thinking_budget(effort: Option<&str>) -> Option<u32> {
+    match effort.map(|e| e.trim().to_ascii_lowercase()).as_deref() {
+        Some("minimal") => Some(1024),
+        Some("low") => Some(2048),
+        Some("medium") => Some(8192),
+        Some("high") => Some(16384),
+        _ => None,
+    }
 }
 
 #[derive(Default)]
@@ -367,5 +387,26 @@ mod tests {
         assert_eq!(turn.tool_calls.len(), 1);
         assert_eq!(turn.tool_calls[0].name, "bash");
         assert_eq!(turn.tool_calls[0].arguments, "{\"cmd\":\"ls\"}");
+    }
+}
+
+#[cfg(test)]
+mod reasoning_tests {
+    use super::thinking_budget;
+
+    #[test]
+    fn effort_maps_onto_a_sized_thinking_budget() {
+        assert_eq!(thinking_budget(Some("minimal")), Some(1024));
+        assert_eq!(thinking_budget(Some("low")), Some(2048));
+        assert_eq!(thinking_budget(Some("HIGH")), Some(16384));
+        // Unset or unknown leaves the model's own default alone.
+        assert_eq!(thinking_budget(None), None);
+        assert_eq!(thinking_budget(Some("")), None);
+        assert_eq!(thinking_budget(Some("bogus")), None);
+        // Ordering holds, so "higher effort" never means a smaller budget.
+        let l = thinking_budget(Some("low")).unwrap();
+        let m = thinking_budget(Some("medium")).unwrap();
+        let h = thinking_budget(Some("high")).unwrap();
+        assert!(l < m && m < h);
     }
 }

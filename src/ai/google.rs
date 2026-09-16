@@ -129,6 +129,11 @@ pub fn build_body(req: &ChatRequest) -> Value {
     if let Some(m) = req.max_tokens {
         gen["maxOutputTokens"] = json!(m);
     }
+    // Gemini takes a thinking token budget; 0 disables thinking entirely, which
+    // is the fastest setting and the point of `minimal`.
+    if let Some(budget) = thinking_budget(req.reasoning_effort.as_deref()) {
+        gen["thinkingConfig"] = json!({ "thinkingBudget": budget });
+    }
     if gen.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
         body["generationConfig"] = gen;
     }
@@ -336,5 +341,30 @@ mod tests {
         assert_eq!(turn.tool_calls.len(), 1);
         assert_eq!(turn.tool_calls[0].name, "bash");
         assert_eq!(turn.tool_calls[0].arguments, "{\"command\":\"ls\"}");
+    }
+}
+
+/// Map a reasoning effort onto Gemini's thinking token budget.
+fn thinking_budget(effort: Option<&str>) -> Option<u64> {
+    match effort.map(|e| e.trim().to_ascii_lowercase()).as_deref() {
+        Some("minimal") => Some(0),
+        Some("low") => Some(1024),
+        Some("medium") => Some(8192),
+        Some("high") => Some(24576),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod reasoning_tests {
+    use super::thinking_budget;
+
+    #[test]
+    fn minimal_disables_thinking_entirely() {
+        // 0 is the documented "no thinking" value, and the point of `minimal`.
+        assert_eq!(thinking_budget(Some("minimal")), Some(0));
+        assert_eq!(thinking_budget(Some("low")), Some(1024));
+        assert_eq!(thinking_budget(None), None);
+        assert_eq!(thinking_budget(Some("")).into_iter().count(), 0);
     }
 }
