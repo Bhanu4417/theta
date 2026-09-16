@@ -2,7 +2,7 @@
 
 use crate::harness::transcript::{Message, Part, PartKind, Role, ToolInfo, ToolStatus};
 use crate::harness::{Question, Task};
-use crate::opencode::ModelRef;
+use crate::models::ModelRef;
 use crate::providers::ProviderKind;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -290,9 +290,6 @@ pub struct SessionState {
     pub model: Option<ModelRef>,
     /// Agent used for subsequent prompts (e.g. "build", "plan").
     pub agent: Option<String>,
-    /// When set, prompts route through the agy CLI with this model
-    /// (Gemini etc.) instead of the OpenCode provider.
-    pub agy_model: Option<String>,
     /// Selected row in the slash-command popup.
     pub slash_selected: usize,
     /// Share URL when the session is shared.
@@ -353,11 +350,10 @@ impl SessionState {
             name,
             dir,
             session_id: crate::harness::SessionId(id),
-            provider: ProviderKind::OpenCode,
+            provider: ProviderKind::Local,
             task: None,
             oc_sid: None,
             model: None,
-            agy_model: None,
             agent: None,
             slash_selected: 0,
             share_url: None,
@@ -398,18 +394,20 @@ impl SessionState {
     pub fn push_local_user(&mut self, text: &str) -> String {
         self.optimistic_seq += 1;
         self.unadopted_locals += 1;
-        let local_id = format!("local-{}", self.optimistic_seq);
+        // `local-N` restarts at 1 on every launch, so include the creation time
+        // to keep ids unique against a restored transcript (otherwise a new
+        // optimistic prompt could overwrite an old message by id).
+        let created = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let local_id = format!("local-{created}-{}", self.optimistic_seq);
         let msg = Message {
             id: local_id.clone(),
             role: Role::User,
             error: None,
             completed: None,
-            created: Some(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0),
-            ),
+            created: Some(created),
             cost: None,
             tokens: None,
             parts: vec![Part {
@@ -484,9 +482,16 @@ impl SessionState {
             existing.completed = msg.completed;
             existing.cost = msg.cost;
             existing.tokens = msg.tokens;
-            self.recompute_metrics();
-            self.dirty = true;
+        } else {
+            // Create the row so the following `Part` events inherit its role
+            // (otherwise every message without a meta row — e.g. replayed
+            // history — is assumed to be an assistant message).
+            let mut meta = msg.clone();
+            meta.parts.clear();
+            self.messages.push(meta);
         }
+        self.recompute_metrics();
+        self.dirty = true;
     }
 
     /// Session cost = sum of assistant message costs; context = the latest
@@ -697,5 +702,36 @@ mod tests {
         assert!(s.adopt_by_text(&real, "do the thing"));
         assert_eq!(s.messages.len(), 1, "adoption replaces, never duplicates");
         assert_eq!(s.messages[0].id, "msg_1");
+    }
+
+    #[test]
+    fn message_meta_inserts_a_row_so_parts_keep_their_role() {
+        let mut s = SessionState::new(1, "s".into(), PathBuf::from("."));
+        let meta = Message {
+            id: "hist-1".into(),
+            role: Role::User,
+            error: None,
+            completed: None,
+            created: None,
+            cost: None,
+            tokens: None,
+            parts: Vec::new(),
+        };
+        s.upsert_message_meta(&meta);
+        assert_eq!(s.messages.len(), 1, "meta must create the row");
+        assert_eq!(s.messages[0].role, Role::User);
+
+        // The following part fills in the body; the role must not flip to
+        // assistant (replayed user prompts used to lose their Θ marker).
+        let part = Part {
+            id: "hist-1-p1".into(),
+            message_id: "hist-1".into(),
+            kind: PartKind::Text { text: "hi".into(), synthetic: false },
+        };
+        let mut with_part = meta.clone();
+        with_part.parts = vec![part.clone()];
+        s.upsert_part(&with_part, part);
+        assert_eq!(s.messages[0].role, Role::User);
+        assert_eq!(s.messages[0].parts.len(), 1);
     }
 }

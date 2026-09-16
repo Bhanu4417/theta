@@ -33,9 +33,15 @@ pub struct AgentLoop {
     permission: Box<dyn PermissionGate>,
     model: String,
     system_prompt: String,
+    /// Reasoning effort sent to reasoning models (empty = provider default).
+    reasoning_effort: Option<String>,
     max_turns: usize,
     compaction: context::CompactionSettings,
     compaction_enabled: bool,
+    /// Optional dedicated provider/model for summarization (fast/cheap), so
+    /// compaction does not depend on the session model.
+    compaction_provider: Option<Box<dyn Provider>>,
+    compaction_model: Option<String>,
     /// Answers interactive `Ask` permission decisions (local backend).
     broker: Option<std::sync::Arc<permissions::Broker>>,
     /// Answers interactive `ask`-tool questions (local backend).
@@ -54,9 +60,12 @@ impl AgentLoop {
             permission: Box::new(tools::AllowAll),
             model: model.into(),
             system_prompt: default_system_prompt(),
+            reasoning_effort: None,
             max_turns: 24,
             compaction: context::CompactionSettings::default(),
             compaction_enabled: true,
+            compaction_provider: None,
+            compaction_model: None,
             broker: None,
             question_broker: None,
             max_retries: 0,
@@ -68,6 +77,18 @@ impl AgentLoop {
     pub fn with_compaction(mut self, settings: context::CompactionSettings, enabled: bool) -> Self {
         self.compaction = settings;
         self.compaction_enabled = enabled;
+        self
+    }
+
+    /// Use a separate provider/model for compaction summaries. Keeps `/compact`
+    /// fast and cheap regardless of the session model.
+    pub fn with_compaction_model(
+        mut self,
+        provider: Box<dyn Provider>,
+        model: impl Into<String>,
+    ) -> Self {
+        self.compaction_provider = Some(provider);
+        self.compaction_model = Some(model.into());
         self
     }
 
@@ -111,6 +132,13 @@ impl AgentLoop {
 
     pub fn with_catalog(mut self, catalog: Catalog) -> Self {
         self.catalog = catalog;
+        self
+    }
+
+    /// Set the reasoning effort for normal turns (e.g. `minimal`/`low`).
+    pub fn with_reasoning_effort(mut self, effort: impl Into<String>) -> Self {
+        let e = effort.into();
+        self.reasoning_effort = (!e.trim().is_empty()).then_some(e);
         self
     }
 
@@ -207,7 +235,14 @@ impl AgentLoop {
             history.push(ChatMessage::system(self.system_prompt.clone()));
         }
         history.push(ChatMessage::user_with_images(user_text, images.to_vec()));
+        // Heal any dangling tool calls from an earlier interrupted turn so the
+        // request is valid for every provider.
+        context::repair_tool_calls(history);
         emit(HarnessEvent::SessionWorking);
+        // Unique per turn so transcript parts can never collide with a message
+        // from an earlier turn (or a restored session): `upsert_part` matches by
+        // id, so a reused `local-0` overwrote an old reply instead of appending.
+        let run_id = local_run_id();
 
         for turn in 0..self.max_turns {
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -251,11 +286,22 @@ impl AgentLoop {
                 tools: self.tools.iter().map(|t| t.spec()).collect(),
                 temperature: None,
                 max_tokens: None,
+                reasoning_effort: self.reasoning_effort.clone(),
             };
 
-            let msg_id = format!("local-{turn}");
+            let msg_id = format!("local-{run_id}-{turn}");
             let mut acc_text = String::new();
+            let mut acc_reasoning = String::new();
+            let mut reasoning_start: Option<i64> = None;
             let mut turn_usage: Option<crate::harness::transcript::TokenUsage> = None;
+            crate::tlog!(
+                "REQ provider={} model={} msgs={} tools={}",
+                self.provider.id(),
+                request.model,
+                request.messages.len(),
+                request.tools.len()
+            );
+            let started = std::time::Instant::now();
             let turn_result = {
                 let mut attempt = 0u32;
                 loop {
@@ -266,7 +312,19 @@ impl AgentLoop {
                                 emit(part_text(&msg_id, &acc_text));
                             }
                             ProviderEvent::ReasoningDelta(t) => {
-                                emit(part_reasoning(&msg_id, &t));
+                                // Accumulate: the part is keyed by id, so
+                                // emitting only the delta makes the UI replace
+                                // the text on every token (flicker).
+                                if reasoning_start.is_none() {
+                                    reasoning_start = Some(now_ms());
+                                }
+                                acc_reasoning.push_str(&t);
+                                emit(part_reasoning_span(
+                                    &msg_id,
+                                    &acc_reasoning,
+                                    reasoning_start,
+                                    None,
+                                ));
                             }
                             ProviderEvent::Usage { input, output } => {
                                 turn_usage = Some(crate::harness::transcript::TokenUsage {
@@ -281,7 +339,36 @@ impl AgentLoop {
                         self.provider.stream(request.clone(), &mut on_event).await
                     };
                     match result {
-                        Ok(turn) => break turn,
+                        Ok(turn) => {
+                            crate::tlog!(
+                                "RESP model={} ms={} chars={} tool_calls={} tokens={}",
+                                request.model,
+                                started.elapsed().as_millis(),
+                                turn.text.chars().count(),
+                                turn.tool_calls.len(),
+                                turn_usage
+                                    .map(|u| format!("{}/{}", u.input, u.output))
+                                    .unwrap_or_else(|| "-".into())
+                            );
+                            // Some providers assemble the answer without
+                            // emitting deltas (or emit none we can see). The
+                            // text is in `turn.text` either way, so make sure
+                            // the UI gets it — otherwise the reply is invisible
+                            // until the session is reloaded from disk.
+                            if acc_text.trim().is_empty() && !turn.text.trim().is_empty() {
+                                acc_text = turn.text.clone();
+                                emit(part_text(&msg_id, &acc_text));
+                            }
+                            if !acc_reasoning.is_empty() {
+                                emit(part_reasoning_span(
+                                    &msg_id,
+                                    &acc_reasoning,
+                                    reasoning_start,
+                                    Some(now_ms()),
+                                ));
+                            }
+                            break turn;
+                        }
                         Err(e) => {
                             if attempt < self.max_retries && is_retryable(&e) {
                                 attempt += 1;
@@ -295,6 +382,12 @@ impl AgentLoop {
                                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                                 continue;
                             }
+                            crate::tlog!(
+                                "ERR provider={} model={} msgs={} {e}",
+                                self.provider.id(),
+                                request.model,
+                                request.messages.len()
+                            );
                             return Err(e);
                         }
                     }
@@ -311,13 +404,66 @@ impl AgentLoop {
             journal.push(assistant_msg);
 
             if turn_result.tool_calls.is_empty() {
+                // Never end a turn silently: an empty reply (e.g. a reasoning
+                // model that stopped early) must be visible to the user.
+                if turn_result.text.trim().is_empty() {
+                    let why = match turn_result.finish.as_ref() {
+                        Some(FinishReason::Length) => {
+                            "the model hit its output limit before replying"
+                        }
+                        _ => "the model returned an empty response",
+                    };
+                    emit(HarnessEvent::Transcript(TranscriptUpdate::Part(Part {
+                        id: format!("{msg_id}-empty"),
+                        message_id: msg_id.to_string(),
+                        kind: PartKind::Text {
+                            text: format!(
+                                "(no output — {why}. Try again, or set `[ai] reasoning_effort = \"low\"`.)"
+                            ),
+                            synthetic: true,
+                        },
+                    })));
+                }
                 emit(HarnessEvent::AssistantFinished);
                 emit(HarnessEvent::SessionIdle);
                 return Ok(());
             }
 
-            for call in &turn_result.tool_calls {
+            for (i, call) in turn_result.tool_calls.iter().enumerate() {
                 if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    // Close out every pending call with a synthetic output so
+                    // the history stays valid for the next turn (providers
+                    // reject assistant tool_calls with no tool result).
+                    for pending in &turn_result.tool_calls[i..] {
+                        let info = ToolInfo {
+                            tool: pending.name.clone(),
+                            call_id: pending.id.clone(),
+                            status: ToolStatus::Error,
+                            // No server title locally: let `display_title`
+                            // derive what the call actually did from the args.
+                            title: None,
+                            input: serde_json::from_str(&pending.arguments).unwrap_or(json!({})),
+                            output: Some("interrupted by user".into()),
+                            error: Some("interrupted by user".into()),
+                            metadata: json!({}),
+                            start_ms: None,
+                        };
+                        emit(HarnessEvent::Transcript(TranscriptUpdate::Part(Part {
+                            id: format!("{msg_id}-call-{}", pending.id),
+                            message_id: msg_id.to_string(),
+                            kind: PartKind::Tool(info),
+                        })));
+                        emit(HarnessEvent::ToolFinished {
+                            tool: pending.name.clone(),
+                            ok: false,
+                        });
+                        let msg = ChatMessage::tool_result(
+                            pending.id.clone(),
+                            "tool call was not completed (interrupted)",
+                        );
+                        history.push(msg.clone());
+                        journal.push(msg);
+                    }
                     emit(HarnessEvent::SessionInterrupted);
                     emit(HarnessEvent::SessionIdle);
                     return Ok(());
@@ -342,21 +488,30 @@ impl AgentLoop {
         let cap = self.compaction.tool_result_cap;
         let mut ops = prep.file_ops.clone();
         let raw = if prep.is_split_turn && !prep.turn_prefix.is_empty() {
-            let history_text = if prep.messages_to_summarize.is_empty() {
-                "No prior history.".to_string()
-            } else {
-                self.summarize_span(&prep.messages_to_summarize, prep.previous_summary.as_deref())
-                    .await?
+            // The history and turn-prefix summaries are independent, so run them
+            // concurrently: two sequential calls made `/compact` feel hung on
+            // slower reasoning models.
+            let history_fut = async {
+                if prep.messages_to_summarize.is_empty() {
+                    Some("No prior history.".to_string())
+                } else {
+                    self.summarize_span(&prep.messages_to_summarize, prep.previous_summary.as_deref())
+                        .await
+                }
             };
-            let conversation = context::serialize_conversation(&prep.turn_prefix, cap);
-            let user = format!(
-                "<conversation>\n{conversation}\n</conversation>\n\n{}",
-                context::TURN_PREFIX_SUMMARIZATION_PROMPT
-            );
-            let prefix = self
-                .complete(context::SUMMARIZATION_SYSTEM_PROMPT, &user)
-                .await
-                .ok()?;
+            let prefix_fut = async {
+                let conversation = context::serialize_conversation(&prep.turn_prefix, cap);
+                let user = format!(
+                    "<conversation>\n{conversation}\n</conversation>\n\n{}",
+                    context::TURN_PREFIX_SUMMARIZATION_PROMPT
+                );
+                self.complete(context::SUMMARIZATION_SYSTEM_PROMPT, &user)
+                    .await
+                    .ok()
+            };
+            let (history_text, prefix) = tokio::join!(history_fut, prefix_fut);
+            let history_text = history_text?;
+            let prefix = prefix?;
             format!("{history_text}\n\n---\n\n**Turn Context (split turn):**\n\n{prefix}")
         } else {
             self.summarize_span(&prep.messages_to_summarize, prep.previous_summary.as_deref())
@@ -439,8 +594,12 @@ impl AgentLoop {
     }
 
     async fn complete(&self, system: &str, user: &str) -> Result<String, ProviderError> {
+        // Prefer the dedicated compaction model when configured so summaries do
+        // not pay the session model's latency (or reasoning).
+        let provider = self.compaction_provider.as_ref().unwrap_or(&self.provider);
+        let model = self.compaction_model.clone().unwrap_or_else(|| self.model.clone());
         let request = ChatRequest {
-            model: self.model.clone(),
+            model,
             messages: vec![
                 ChatMessage::system(system.to_string()),
                 ChatMessage::user(user.to_string()),
@@ -448,9 +607,19 @@ impl AgentLoop {
             tools: Vec::new(),
             temperature: None,
             max_tokens: Some(context::summary_max_tokens(self.compaction.reserve_tokens) as u32),
+            // Keep reasoning light: models default to `high` and can spend the
+            // whole budget thinking, emitting no summary. `low` is accepted by
+            // muse/gpt-5/grok-4 (unlike `minimal`, which gpt-5 can no-op on).
+            reasoning_effort: Some("low".into()),
         };
         let mut acc = String::new();
         let mut finish: Option<FinishReason> = None;
+        crate::tlog!(
+            "REQ (summarize) provider={} model={} msgs={}",
+            provider.id(),
+            request.model,
+            request.messages.len()
+        );
         {
             let mut attempt = 0u32;
             loop {
@@ -461,7 +630,7 @@ impl AgentLoop {
                         ProviderEvent::Done(f) => finish = Some(f),
                         _ => {}
                     };
-                    self.provider.stream(request.clone(), &mut on_event).await
+                    provider.stream(request.clone(), &mut on_event).await
                 };
                 match result {
                     Ok(turn) => {
@@ -486,15 +655,17 @@ impl AgentLoop {
                 }
             }
         }
-        // A truncated summary must not become a checkpoint (Pi's
-        // getSummarizationFailure).
-        if matches!(finish, Some(FinishReason::Length)) {
-            return Err(ProviderError::Protocol(
-                "summarization hit the token cap and is incomplete".into(),
-            ));
-        }
+        // An empty summary must not become a checkpoint (Pi's
+        // getSummarizationFailure). A length-truncated one is still useful, so
+        // keep it (with a warning) rather than leaving the context uncompacted.
         if acc.trim().is_empty() {
             return Err(ProviderError::Protocol("summarization returned no text".into()));
+        }
+        if matches!(finish, Some(FinishReason::Length)) {
+            crate::tlog!(
+                "WARN summarization hit the {} token cap; using truncated summary",
+                context::summary_max_tokens(self.compaction.reserve_tokens)
+            );
         }
         Ok(acc)
     }
@@ -532,7 +703,7 @@ impl AgentLoop {
             match tool {
             None => tools::ToolOutcome::err(format!("unknown tool: {}", call.name)),
             Some(tool) => {
-                let mut decision = self.permission.check(&call.name, &input);
+                let mut decision = self.permission.check(&call.name, &input, cwd);
                 if decision == PermissionDecision::Ask {
                     match &self.broker {
                         Some(broker) => {
@@ -564,7 +735,9 @@ impl AgentLoop {
             tool: call.name.clone(),
             call_id: call.id.clone(),
             status,
-            title: Some(call.name.clone()),
+            // No server title locally: let `display_title` derive what the
+            // call actually did from the args (file path, pattern, command).
+            title: None,
             input: input.clone(),
             output: Some(outcome.output.clone()),
             error: if outcome.ok { None } else { Some(outcome.output.clone()) },
@@ -596,11 +769,41 @@ fn part_text(msg_id: &str, text: &str) -> HarnessEvent {
 }
 
 fn part_reasoning(msg_id: &str, text: &str) -> HarnessEvent {
+    part_reasoning_span(msg_id, text, None, None)
+}
+
+fn part_reasoning_span(
+    msg_id: &str,
+    text: &str,
+    start: Option<i64>,
+    end: Option<i64>,
+) -> HarnessEvent {
     HarnessEvent::Transcript(TranscriptUpdate::Part(Part {
         id: format!("{msg_id}-reasoning"),
         message_id: msg_id.to_string(),
-        kind: PartKind::Reasoning { text: text.to_string(), running: true, start: None, end: None },
+        kind: PartKind::Reasoning {
+            text: text.to_string(),
+            running: end.is_none(),
+            start,
+            end,
+        },
     }))
+}
+
+/// A process-unique run id (timestamp + counter) used in local message ids.
+fn local_run_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{n}", now_ms())
+}
+
+/// Milliseconds since the Unix epoch (reasoning timers).
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Transient failures worth retrying.

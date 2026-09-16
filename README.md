@@ -43,21 +43,27 @@ cargo build --release && install -Dm755 target/release/theta ~/.local/bin/theta
 theta                  # restore last workspace (or show empty state)
 theta ~/projects/app   # open with the workspace rooted at DIR
 theta --no-restore     # skip workspace restore
-theta --log            # write a verbose debug log (any directory)
+theta --log            # open/tail the newest debug log
+theta --log --run      # start the TUI, recording a verbose debug log
 ```
 
-`--log` writes a timestamped trace to
+`theta --log --run` records a timestamped trace to
 `~/.local/share/theta/logs/theta-<epoch>.log` (absolute path, so it works from
-any directory) covering CLI args, per-directory server spawn/reuse, the exact
-prompt sent per session (model, agent, text), the raw OpenCode SSE stream, agy
-calls, model switches, and panics — enough to debug what was requested from
-which model and what came back. The path is printed on startup.
+any directory) covering CLI args, provider **requests → provider/model** and
+responses (latency, tokens), model/agent switches, permissions, and panics.
+`theta --log` (no `--run`) opens the newest log in `less +F` (falls back to
+`tail -f`). While a logging TUI is running, `/logs` tails the same file in place
+(`↑/↓` scroll, `f` follow, `Esc` close) so you can watch exactly which model
+each request hits without a second terminal:
 
-Theta spawns one headless `opencode serve` process per project directory
-(reusing a healthy one if it is already there) and talks to it over its real
-HTTP + SSE API: session creation, `prompt_async`, live
-`message.part.updated` streaming, tool state, permission requests,
-`session.idle`/`session.error`, and history replay on restore.
+```
+[05:47:08.109] REQ  provider=openai-compat model=deepseek-v4.1-flash msgs=2 tools=10
+[05:47:10.275] RESP model=deepseek-v4.1-flash ms=2166 chars=4 tool_calls=0 tokens=5269/3
+```
+
+Theta **runs its own agent harness in-process** — no external agent binary. It
+streams model output, executes tools, gates them by permission, compacts
+context, and persists every turn to a history tree.
 
 ## Slash commands
 
@@ -66,7 +72,8 @@ Type `/` in any session input for the command menu (filter by typing,
 
 | Command | Action |
 | --- | --- |
-| `/model [provider/model]` | Fetch and switch the session's model (searchable picker) |
+| `/model [provider/model]` | Live-fetch models from every logged-in provider and switch (searchable picker) |
+| `/logs` | Live-tail the debug log in the TUI (requests → provider/model) |
 | `/agent [name]` | Switch agent (build, plan, …) |
 | `/new` | New session |
 | `/sessions` | Jump to another open session |
@@ -165,22 +172,15 @@ quiet `✓ thought for 4.7s` marker afterwards.
 `~/.config/theta/config.toml` (written with defaults on first run):
 
 ```toml
-# Which harness drives sessions: "opencode" (default) or "local"
-# (Theta's own in-process agent loop).
-backend = "opencode"
-
-[opencode]
-binary = "opencode"      # server binary to launch
-port_base = 4310         # per-directory servers use ports [base, base+1500)
-keep_alive = true        # keep servers running after quit for instant reconnects
-
-# Settings for backend = "local".
+# Theta's own harness: LLM provider + model.
 [ai]
-provider = "openai"      # anthropic | google | openai | xai | groq | deepseek |
-                         # openrouter | together | fireworks | ollama
+provider = "openai"      # opencode | opencode-go | anthropic | google | openai |
+                         # xai | groq | deepseek | openrouter | together |
+                         # fireworks | mistral | cerebras | perplexity | ollama
 base_url = ""            # set for a custom/compatible endpoint (overrides provider)
 api_key_env = "OPENAI_API_KEY"   # fallback when no key is stored
-model = "gpt-4o"         # anthropic → claude-3-7-sonnet-20250219,
+model = "gpt-4o"         # opencode → glm-4.7, opencode-go → deepseek-v4.1-flash,
+                         # anthropic → claude-3-7-sonnet-20250219,
                          # google → gemini-2.0-flash, xai → grok-2-latest, …
 
 # Context compaction (local backend), Pi-style token budgets.
@@ -188,6 +188,8 @@ model = "gpt-4o"         # anthropic → claude-3-7-sonnet-20250219,
 enabled = true
 reserve_tokens = 16384   # headroom left for the model's response
 keep_recent_tokens = 20000  # recent tokens kept verbatim, rest summarized
+model = ""               # optional fast/cheap model for summaries ("" = session model)
+# Summary output is hard-capped at 4k tokens so /compact stays quick on any model.
 
 # Optional per-model overrides (keyed provider/model or bare model).
 [compaction.model_overrides."openai/gpt-4o"]
@@ -201,19 +203,42 @@ explorer_width = 32
 auto_approve_permissions = false
 confirm_quit = true
 notify = true            # bell + desktop notification when a run finishes
-local_permissions = "ask"  # local backend tools: ask | allow | deny | read-only
+local_permissions = "allow"  # allow (default, OpenCode-style: no prompts) |
+                             # ask | deny | read-only. In "ask", reads inside
+                             # the project are auto-allowed; only edits,
+                             # commands and out-of-tree reads prompt.
 ```
 
-API keys for the local backend are stored in
-`~/.config/theta/keys.toml` (chmod `0600`) with `/login <provider> <api-key>`
-(`/login <provider>` reports whether one is set); the matching
-`ai.api_key_env` variable is used as a fallback. `THETA_AI_PROVIDER`,
+Theta runs its own harness — there is no external agent binary to install or
+wrap. Run `/login` to open a provider picker, choose a provider and type its
+API key; keys are saved to `~/.config/theta/keys.toml` (chmod `0600`). The
+list mirrors the OpenCode CLI: **OpenCode Zen** (`opencode`, `OPENCODE_API_KEY`)
+and **OpenCode Go** (`opencode-go`) come first, then Anthropic, OpenAI, Google,
+xAI, Groq, DeepSeek, OpenRouter, Together, Fireworks, Mistral, Cerebras,
+Perplexity and local Ollama. Choosing one makes it the active provider and
+applies its default model immediately. `/model` then queries every provider you
+have logged into (`GET /models`, or the native Anthropic/Gemini list endpoints)
+and shows the full live catalog; the built-in list is the fallback. Fetched
+lists are cached in `~/.cache/theta/models.json`, so later `/model` opens do not
+re-fetch; logging in again with a new key refreshes just that provider. Zen/Go
+models served only through the OpenAI **Responses API** (`muse-spark-*`,
+`gpt-5*`, `grok-4*`) are routed to `/responses` automatically. Pick
+**custom (OpenAI-compatible URL)**
+to point Theta at any gateway: enter the base URL, then the key, and Theta
+stores it as the active endpoint. The matching `ai.api_key_env` variable is
+used as a fallback. Legacy `/login <provider> <key>` still works
+non-interactively (and activates known providers). `THETA_AI_PROVIDER`,
 `THETA_AI_MODEL`, `THETA_AI_BASE_URL` and `THETA_AI_API_KEY` override `[ai]`
 for a single run (handy for testing). `theta --check-ai [provider…]` sends a
 tiny live request per provider and reports OK/FAIL.
 
 Transient provider failures are retried with exponential backoff
-(`ai.max_retries`, `ai.retry_base_ms`). **Named agents** (`build`, `plan`,
+(`ai.max_retries`, `ai.retry_base_ms`), and every request is bounded by
+`ai.timeout_secs` (default 300, `0` disables) so a stalled gateway can never
+hang a turn or `/compact`. `ai.reasoning_effort` (`minimal`/`low`/`medium`/
+`high`) tunes reasoning models such as `muse-spark`/`gpt-5`/`grok-4`; `high`
+(the provider default) can spend a whole small budget thinking and return no
+text, so compaction always summarizes at `low`. **Named agents** (`build`, `plan`,
 `general`, `explore`) select their own tool set and prompt — `plan`/`explore`
 are read-only — and `plan`/`explore`/`general` are available as `task`
 sub-agent types. **MCP** stdio servers can be declared and their tools are
@@ -229,15 +254,14 @@ command = "uvx"
 args = ["mcp-server-git"]
 ```
 
-## Headless mode, local backend & skills
+## Harness, headless mode & skills
 
 ```sh
 theta --print "summarize this repo"       # one local turn, print the reply
 theta --print --json "list the files"     # stream neutral events as JSON lines
 ```
 
-With `backend = "local"`, Theta runs its **own agent loop** (no `opencode serve`):
-an OpenAI-compatible provider plus built-in tools (`read`, `write`, `edit`,
+Theta runs its **own agent loop**: a provider plus built-in tools (`read`, `write`, `edit`,
 `multiedit`, `bash`, `grep`, `glob`, `webfetch`, `ask`, `task`), automatic
 context compaction, and the same event stream the UI renders. Native
 **Anthropic** (Messages API) and **Google Gemini** providers are built in.
@@ -276,14 +300,15 @@ src/
 ├── app.rs             state, key routing, commands, overlay state
 ├── events.rs          AppEvent: manager → UI channel
 ├── harness/           provider-neutral HarnessEvent + transcript model
-├── providers/         AgentProvider + EventPump adapters (opencode, local)
-├── ai/                LLM layer: Provider trait, OpenAI-compatible, catalog
-├── agent/             local agent loop + tools + context compaction
+├── providers/         AgentProvider + EventPump contract + local adapter
+├── ai/                LLM layer: Provider trait, OpenAI/Anthropic/Gemini, catalog
+├── agent/             agent loop + tools + named agents + context compaction
+├── mcp.rs             stdio MCP client + dynamic mcp__ tools
 ├── extensions.rs      skills / prompt-pack registry
 ├── panes.rs           weighted row/column grid: auto-tile, resize, swap
 ├── session.rs         per-session transcript, input, status, adoption
-├── manager.rs         backend selection + server lifecycle + pump supervisor
-├── opencode.rs        typed client for the OpenCode HTTP API
+├── manager.rs         local harness bridge: async work → AppEvent, pump
+├── models.rs          shared session/model/question value types
 ├── git.rs             async git CLI (branch/status/log/diff), cached
 ├── fsx.rs             gitignore-aware listing + local search fallback
 ├── highlight.rs       syntect with an embedded Tokyo Night theme

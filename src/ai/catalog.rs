@@ -50,6 +50,13 @@ impl Catalog {
         };
         Self {
             models: vec![
+                // OpenCode Zen (`opencode`) and OpenCode Go (`opencode-go`).
+                m("claude-sonnet-4-6", "opencode", 1_000_000, 3.0, 15.0, true),
+                m("gpt-5-nano", "opencode", 400_000, 0.05, 0.4, true),
+                m("glm-4.7", "opencode", 204_800, 0.6, 2.2, true),
+                m("deepseek-v4.1-flash", "opencode-go", 1_000_000, 0.15, 0.6, true),
+                m("glm-5.2", "opencode-go", 1_000_000, 1.4, 4.4, true),
+                m("kimi-k2.7-code", "opencode-go", 262_144, 0.95, 4.0, true),
                 // OpenAI
                 m("gpt-4o", "openai", 128_000, 2.5, 10.0, true),
                 m("gpt-4o-mini", "openai", 128_000, 0.15, 0.6, true),
@@ -117,6 +124,14 @@ mod tests {
         assert_eq!(c.context_limit("gpt-4o"), 128_000);
         assert_eq!(c.context_limit("openai/gpt-4o"), 128_000);
         assert!(c.find("gpt-4o").unwrap().tools);
+    }
+
+    #[test]
+    fn opencode_gateway_models_are_listed() {
+        let c = Catalog::builtin();
+        assert_eq!(c.find("deepseek-v4.1-flash").unwrap().provider, "opencode-go");
+        assert_eq!(c.find("glm-4.7").unwrap().provider, "opencode");
+        assert_eq!(c.context_limit("opencode-go/deepseek-v4.1-flash"), 1_000_000);
     }
 
     #[test]

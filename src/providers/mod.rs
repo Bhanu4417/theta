@@ -7,7 +7,6 @@
 //! provider protocol details.
 
 pub mod local;
-pub mod opencode;
 
 use crate::harness::HarnessEvent;
 use std::fmt;

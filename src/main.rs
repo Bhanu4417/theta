@@ -1,4 +1,4 @@
-//! Theta — a multi-session OpenCode workspace TUI.
+//! Theta — a multi-session terminal coding agent (its own harness).
 
 // The ai/agent/extensions layers are a reusable library surface; not every
 // entry point is wired into the TUI yet.
@@ -23,7 +23,7 @@ mod logging;
 mod mcp;
 mod manager;
 mod mentions;
-mod opencode;
+mod models;
 mod panes;
 mod paste;
 mod persist;
@@ -53,7 +53,10 @@ use std::time::Duration;
 struct Args {
     dir: Option<PathBuf>,
     no_restore: bool,
+    /// `--log`: open/tail the newest log (or record when combined with `--run`).
     log: bool,
+    /// `--run`: start the TUI (with `--log`: record to the log file).
+    run: bool,
     help: bool,
     version: bool,
     /// Headless: run one turn and print the reply, no TUI.
@@ -67,7 +70,7 @@ struct Args {
 }
 
 fn usage() -> &'static str {
-    "Θ theta — multi-session OpenCode workspace
+    "Θ theta — terminal coding agent (local harness, multi-session)
 
 USAGE:
     theta [OPTIONS] [DIR]
@@ -77,7 +80,8 @@ ARGS:
 
 OPTIONS:
     --no-restore       Do not restore the last workspace
-    --log              Write a verbose debug log (works from any directory)
+    --log              Open/tail the newest debug log (request → provider/model)
+    --run              Start the TUI (with --log: record to the log file)
     -p, --print        Run one prompt headlessly and print the reply
     --json             With --print, emit events as JSON lines
     --check-ai [PROV…] Live-verify provider credentials (default: [ai].provider)
@@ -95,6 +99,7 @@ fn parse_args() -> Args {
         dir: None,
         no_restore: false,
         log: false,
+        run: false,
         help: false,
         version: false,
         print: false,
@@ -107,6 +112,7 @@ fn parse_args() -> Args {
         match a.as_str() {
             "--no-restore" => args.no_restore = true,
             "--log" => args.log = true,
+            "--run" => args.run = true,
             "--help" | "-h" => args.help = true,
             "--version" | "-V" => args.version = true,
             "--print" | "-p" => args.print = true,
@@ -139,6 +145,20 @@ async fn main() -> Result<()> {
     let cfg = config::Config::load()?;
     theme::set_theme(&cfg.theme);
 
+    // `--log` on its own opens/tails the newest log. Combined with a run mode
+    // (`--run`, `--print`, `--json`, `--check-ai`) it records to a fresh file.
+    let recording = args.run || args.print || args.json || args.check_ai;
+    if args.log && !recording {
+        return view_log();
+    }
+    if args.log {
+        let path = logging::default_path();
+        match logging::init(&path) {
+            Ok(()) => eprintln!("theta: logging to {}", path.display()),
+            Err(e) => eprintln!("theta: cannot open log file {}: {e}", path.display()),
+        }
+    }
+
     if args.check_ai {
         return run_check_ai(cfg, args.prompt).await;
     }
@@ -158,13 +178,6 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    if args.log {
-        let path = logging::default_path();
-        match logging::init(&path) {
-            Ok(()) => eprintln!("theta: --log enabled → {}", path.display()),
-            Err(e) => eprintln!("theta: cannot open log file {}: {e}", path.display()),
-        }
-    }
     crate::tlog!(
         "=== theta {} start cwd={:?} args={:?} ===",
         env!("CARGO_PKG_VERSION"),
@@ -181,6 +194,11 @@ async fn main() -> Result<()> {
 
     let mut app = app::App::new(cfg, manager, initial_dir);
 
+    // Nudge a first-run user whose provider has no credentials yet.
+    if !app.provider_configured() {
+        app.flash("no API key yet — run /login to add one");
+    }
+
     // Warm the resume cache at boot so the session lists open instantly.
     app.preload_sessions(app.initial_dir.clone());
 
@@ -189,19 +207,12 @@ async fn main() -> Result<()> {
     let result = run(&mut terminal, &mut app, &mut rx, &args).await;
     restore_terminal();
 
-    // `/refresh`: hand the terminal to the newest binary and re-exec. The
-    // OpenCode servers are left running so the new process reuses them and
-    // reconnects instantly.
+    // `/refresh`: hand the terminal to the newest binary and re-exec.
     if app.restart {
         exec_self()?;
     }
 
-    // Normal exit: with `keep_alive` (default) the servers stay up so the next
-    // launch reuses them instantly; otherwise shut them down gracefully so
-    // OpenCode can checkpoint its database.
-    if !app.cfg.opencode.keep_alive {
-        app.manager.shutdown_all().await;
-    }
+    app.manager.shutdown_all().await;
 
     match result {
         Ok(()) => Ok(()),
@@ -210,6 +221,32 @@ async fn main() -> Result<()> {
             Err(e)
         }
     }
+}
+
+/// `theta --log`: open/tail the newest log so request → provider/model routing
+/// and token usage are visible without hunting for the file.
+fn view_log() -> Result<()> {
+    let dir = logging::logs_dir();
+    let Some(path) = logging::newest_log(&dir) else {
+        eprintln!("theta: no logs in {}", dir.display());
+        eprintln!("theta: record one with `theta --log --run`");
+        return Ok(());
+    };
+    println!("theta: {}  (q to quit)", path.display());
+    // `less +F` follows and supports search; fall back to `tail -f`, then dump.
+    if std::process::Command::new("less").arg("+F").arg(&path).status().is_ok() {
+        return Ok(());
+    }
+    if std::process::Command::new("tail")
+        .args(["-n", "300", "-f"])
+        .arg(&path)
+        .status()
+        .is_ok()
+    {
+        return Ok(());
+    }
+    print!("{}", std::fs::read_to_string(&path).unwrap_or_default());
+    Ok(())
 }
 
 /// Live-verify providers by sending a tiny request to each and reporting the
@@ -248,7 +285,10 @@ async fn run_check_ai(cfg: config::Config, providers: Vec<String>) -> Result<()>
             messages: vec![ai::ChatMessage::user("Reply with the single word OK.")],
             tools: Vec::new(),
             temperature: None,
-            max_tokens: Some(96),
+            // Reasoning models can spend >100 tokens thinking before any text;
+            // too small a cap yields no visible output and a false "empty".
+            max_tokens: Some(1_024),
+            reasoning_effort: Some("low".into()),
         };
         let start = std::time::Instant::now();
         let mut got = String::new();
@@ -319,7 +359,7 @@ async fn run(
     app.dirty = true;
 
     let mut events = EventStream::new().fuse();
-    // 40ms frames keep the status-bar scanner as smooth as OpenCode's; the
+    // 40ms frames keep the status-bar scanner smooth; the
     // app still only redraws when something changed.
     let mut tick = tokio::time::interval(Duration::from_millis(40));
 

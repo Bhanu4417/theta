@@ -480,6 +480,85 @@ async fn compaction_summarizes_with_the_model_and_rebuilds_the_prompt() {
         .any(|m| m.text.contains("conversation-summary") && m.text.contains("GOAL: finish")));
 }
 
+/// Echoes the requested model in the summary so tests can tell which provider
+/// handled the summarization request.
+struct ModelTagProvider;
+
+impl Provider for ModelTagProvider {
+    fn id(&self) -> &'static str {
+        "model-tag"
+    }
+    fn stream<'a>(
+        &'a self,
+        request: ChatRequest,
+        on_event: &'a mut (dyn FnMut(ProviderEvent) + Send),
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<AssistantTurn, ProviderError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let summarizing = request
+                .messages
+                .first()
+                .map(|m| m.text.contains("summarization"))
+                .unwrap_or(false);
+            let text = if summarizing {
+                format!("SUMMARY model={}", request.model)
+            } else {
+                "final".to_string()
+            };
+            if summarizing {
+                on_event(ProviderEvent::TextDelta(text.clone()));
+            }
+            Ok(AssistantTurn { text, tool_calls: vec![], finish: Some(FinishReason::Stop) })
+        })
+    }
+}
+
+#[tokio::test]
+async fn dedicated_compaction_model_writes_the_summary() {
+    use crate::ai::catalog::{Catalog, ModelSpec};
+    let dir = std::env::temp_dir();
+    let catalog = Catalog::builtin().with_fallback(ModelSpec {
+        id: "session-model".into(),
+        provider: "test".into(),
+        context_limit: 3_000,
+        input_per_mtok: 0.0,
+        output_per_mtok: 0.0,
+        tools: true,
+    });
+    let agent = AgentLoop::new(Box::new(ModelTagProvider), "session-model")
+        .with_catalog(catalog)
+        .with_compaction(
+            crate::agent::context::CompactionSettings {
+                reserve_tokens: 0,
+                keep_recent_tokens: 500,
+                tool_result_cap: 2_000,
+            },
+            true,
+        )
+        .with_compaction_model(Box::new(ModelTagProvider), "cheap-model");
+
+    let mut history = vec![crate::ai::ChatMessage::system("sys")];
+    for _ in 0..30 {
+        history.push(crate::ai::ChatMessage::user("x".repeat(400)));
+        history.push(crate::ai::ChatMessage::assistant("ok", vec![]));
+    }
+    let events = std::sync::Arc::new(Mutex::new(Vec::<HarnessEvent>::new()));
+    let sink = events.clone();
+    let mut emit = move |e: HarnessEvent| sink.lock().unwrap().push(e);
+    agent
+        .run_turn(&mut history, "final question", &dir, &mut emit)
+        .await
+        .unwrap();
+
+    let summary = history
+        .iter()
+        .find(|m| m.text.contains("conversation-summary"))
+        .expect("a summary was written");
+    assert!(summary.text.contains("cheap-model"), "used the compaction model");
+    assert!(!summary.text.contains("session-model"), "did not use the session model");
+}
+
 /// Returns a truncated (length-capped) summarization, which must be rejected.
 struct LengthFailProvider;
 impl Provider for LengthFailProvider {
@@ -643,3 +722,249 @@ async fn compaction_disabled_leaves_history_alone() {
     assert!(!history.iter().any(|m| m.text.contains("conversation-summary")));
 }
 
+
+/// Flips a shared cancel flag while streaming, then returns a tool call — this
+/// reproduces interrupting the run just before tools execute.
+struct CancelMidStream {
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    fired: Mutex<bool>,
+}
+
+impl Provider for CancelMidStream {
+    fn id(&self) -> &'static str {
+        "cancel-mid-stream"
+    }
+    fn stream<'a>(
+        &'a self,
+        _request: ChatRequest,
+        _on_event: &'a mut (dyn FnMut(ProviderEvent) + Send),
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<AssistantTurn, ProviderError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let mut fired = self.fired.lock().unwrap();
+            if !*fired {
+                *fired = true;
+                self.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(AssistantTurn {
+                text: String::new(),
+                tool_calls: vec![call("c1", "bash", r#"{"command":"echo hi"}"#)],
+                finish: Some(FinishReason::ToolCalls),
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn interrupt_closes_pending_tool_calls_in_history() {
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let provider = Box::new(CancelMidStream { cancel: cancel.clone(), fired: Mutex::new(false) });
+    let agent = AgentLoop::new(provider, "test");
+    let dir = std::env::temp_dir();
+    let mut history = Vec::new();
+    let mut emit = |_e: HarnessEvent| {};
+    agent
+        .run_turn_cancellable(&mut history, "go", &dir, &cancel, &mut emit)
+        .await
+        .unwrap();
+
+    // The assistant asked for c1; the interrupt must leave a matching output so
+    // the next request is valid for every provider.
+    let has_call = history
+        .iter()
+        .any(|m| m.tool_calls.iter().any(|c| c.id == "c1"));
+    let has_output = history
+        .iter()
+        .any(|m| m.role == crate::ai::Role::Tool && m.tool_call_id.as_deref() == Some("c1"));
+    assert!(has_call, "history should keep the assistant tool call");
+    assert!(has_output, "interrupt must synthesize a tool output: {history:?}");
+}
+
+/// Streams reasoning as multiple deltas, then a text answer.
+struct ReasoningProvider;
+
+impl Provider for ReasoningProvider {
+    fn id(&self) -> &'static str {
+        "reasoning"
+    }
+    fn stream<'a>(
+        &'a self,
+        _request: ChatRequest,
+        on_event: &'a mut (dyn FnMut(ProviderEvent) + Send),
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<AssistantTurn, ProviderError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            on_event(ProviderEvent::ReasoningDelta("thi".into()));
+            on_event(ProviderEvent::ReasoningDelta("nking".into()));
+            on_event(ProviderEvent::TextDelta("hi".into()));
+            Ok(AssistantTurn {
+                text: "hi".into(),
+                tool_calls: vec![],
+                finish: Some(FinishReason::Stop),
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn reasoning_deltas_accumulate_into_one_stable_part() {
+    use crate::harness::transcript::PartKind;
+    use crate::harness::TranscriptUpdate;
+
+    let agent = AgentLoop::new(Box::new(ReasoningProvider), "test");
+    let dir = std::env::temp_dir();
+    let mut history = Vec::new();
+    let events = std::sync::Arc::new(Mutex::new(Vec::<HarnessEvent>::new()));
+    let sink = events.clone();
+    let mut emit = move |e: HarnessEvent| sink.lock().unwrap().push(e);
+    agent.run_turn(&mut history, "go", &dir, &mut emit).await.unwrap();
+
+    let reasoning: Vec<_> = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match e {
+            HarnessEvent::Transcript(TranscriptUpdate::Part(p)) => match &p.kind {
+                PartKind::Reasoning { text, running, start, end } => {
+                    Some((text.clone(), *running, *start, *end))
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    // Each delta updates the same part with the accumulated text (not the
+    // chunk alone, which made the UI flicker).
+    assert!(reasoning.iter().any(|(t, ..)| t == "thi"), "{reasoning:?}");
+    let (text, running, start, end) = reasoning.last().unwrap();
+    assert_eq!(text, "thinking");
+    assert!(!*running, "finalized");
+    assert!(start.is_some() && end.is_some(), "timer is bracketed");
+}
+
+#[tokio::test]
+async fn tool_rows_show_what_they_did() {
+    use crate::harness::transcript::PartKind;
+    use crate::harness::TranscriptUpdate;
+
+    let provider = Box::new(ScriptedProvider::new(vec![
+        AssistantTurn {
+            text: String::new(),
+            tool_calls: vec![call("c1", "read", r#"{"filePath":"src/app.rs"}"#)],
+            finish: Some(FinishReason::ToolCalls),
+        },
+        AssistantTurn {
+            text: "done".into(),
+            tool_calls: vec![],
+            finish: Some(FinishReason::Stop),
+        },
+    ]));
+    let agent = AgentLoop::new(provider, "test");
+    let dir = std::env::temp_dir();
+    let mut history = Vec::new();
+    let events = std::sync::Arc::new(Mutex::new(Vec::<HarnessEvent>::new()));
+    let sink = events.clone();
+    let mut emit = move |e: HarnessEvent| sink.lock().unwrap().push(e);
+    agent.run_turn(&mut history, "go", &dir, &mut emit).await.unwrap();
+
+    let title = events
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|e| match e {
+            HarnessEvent::Transcript(TranscriptUpdate::Part(p)) => match &p.kind {
+                PartKind::Tool(t) if t.tool == "read" => Some(t.display_title()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("a read tool part was emitted");
+    assert!(
+        title.contains("src/app.rs"),
+        "tool row must say what it did, got {title:?}"
+    );
+}
+
+/// Assembles the answer in `turn.text` without emitting any TextDelta — the
+/// loop must still surface it to the transcript (regression: it was invisible
+/// live and only appeared after a restart).
+struct SilentTextProvider;
+
+impl Provider for SilentTextProvider {
+    fn id(&self) -> &'static str {
+        "silent-text"
+    }
+    fn stream<'a>(
+        &'a self,
+        _request: ChatRequest,
+        _on_event: &'a mut (dyn FnMut(ProviderEvent) + Send),
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<AssistantTurn, ProviderError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            Ok(AssistantTurn {
+                text: "the assembled answer".into(),
+                tool_calls: vec![],
+                finish: Some(FinishReason::Stop),
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn non_streamed_answer_still_reaches_the_transcript() {
+    use crate::harness::transcript::PartKind;
+    use crate::harness::TranscriptUpdate;
+
+    let agent = AgentLoop::new(Box::new(SilentTextProvider), "test");
+    let dir = std::env::temp_dir();
+    let mut history = Vec::new();
+    let events = std::sync::Arc::new(Mutex::new(Vec::<HarnessEvent>::new()));
+    let sink = events.clone();
+    let mut emit = move |e: HarnessEvent| sink.lock().unwrap().push(e);
+    agent.run_turn(&mut history, "go", &dir, &mut emit).await.unwrap();
+
+    let shown = events.lock().unwrap().iter().any(|e| match e {
+        HarnessEvent::Transcript(TranscriptUpdate::Part(p)) => matches!(
+            &p.kind,
+            PartKind::Text { text, synthetic: false } if text == "the assembled answer"
+        ),
+        _ => false,
+    });
+    assert!(shown, "assistant text must be emitted even without deltas");
+}
+
+#[tokio::test]
+async fn local_message_ids_are_unique_across_turns() {
+    use crate::harness::transcript::PartKind;
+    use crate::harness::TranscriptUpdate;
+
+    let provider = Box::new(ScriptedProvider::new(vec![
+        AssistantTurn { text: "first".into(), tool_calls: vec![], finish: Some(FinishReason::Stop) },
+        AssistantTurn { text: "second".into(), tool_calls: vec![], finish: Some(FinishReason::Stop) },
+    ]));
+    let agent = AgentLoop::new(provider, "test");
+    let dir = std::env::temp_dir();
+    let mut history = Vec::new();
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let seen = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = seen.clone();
+        let mut emit = move |e: HarnessEvent| {
+            if let HarnessEvent::Transcript(TranscriptUpdate::Part(p)) = e {
+                if matches!(&p.kind, PartKind::Text { synthetic: false, .. }) {
+                    sink.lock().unwrap().push(p.message_id.clone());
+                }
+            }
+        };
+        agent.run_turn(&mut history, "go", &dir, &mut emit).await.unwrap();
+        ids.push(seen.lock().unwrap().clone());
+    }
+    assert!(!ids[0].is_empty() && !ids[1].is_empty(), "{ids:?}");
+    assert_ne!(
+        ids[0][0], ids[1][0],
+        "a later turn must not reuse an earlier message id (it would overwrite the reply)"
+    );
+}

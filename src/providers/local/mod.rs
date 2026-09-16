@@ -140,6 +140,11 @@ impl LocalProvider {
         let tree = SessionTree::sidecar_path(id)
             .and_then(|p| SessionTree::load(&p))
             .unwrap_or_default();
+        // Replace (don't stack on) the hydrated cache: the tree is authoritative.
+        let _ = self.events_tx.send(RoutedEvent {
+            session_id: Some(id.to_string()),
+            event: HarnessEvent::Transcript(TranscriptUpdate::Reset),
+        });
         self.replay(id, &tree);
         self.inner.sessions.lock().unwrap().insert(
             id.to_string(),
@@ -244,6 +249,16 @@ impl LocalProvider {
             session_id: Some(sid.to_string()),
             event,
         });
+    }
+
+    /// Force every session's agent to be rebuilt on its next turn (used after
+    /// credentials change, so a newly added key takes effect).
+    pub fn invalidate_agents(&self) {
+        let mut sessions = self.inner.sessions.lock().unwrap();
+        for s in sessions.values_mut() {
+            // A key no real selection can equal, so the next send rebuilds.
+            s.agent_key = ("\u{0}invalid".to_string(), String::new(), String::new());
+        }
     }
 
     /// Snapshot a session's history tree (for the `/tree` overlay).

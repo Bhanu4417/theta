@@ -12,16 +12,38 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 static LOG: OnceLock<Mutex<File>> = OnceLock::new();
 
+/// Directory holding `--log` files.
+pub fn logs_dir() -> PathBuf {
+    let base = dirs::data_dir().unwrap_or_else(std::env::temp_dir);
+    base.join("theta").join("logs")
+}
+
 /// Where `--log` writes by default: `<data>/theta/logs/theta-<epoch>.log`.
 pub fn default_path() -> PathBuf {
-    let base = dirs::data_dir().unwrap_or_else(std::env::temp_dir);
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    base.join("theta")
-        .join("logs")
-        .join(format!("theta-{secs}.log"))
+    logs_dir().join(format!("theta-{secs}.log"))
+}
+
+/// The most recently modified `.log` file, for `theta --log`.
+pub fn newest_log(dir: &Path) -> Option<PathBuf> {
+    let mut best: Option<(SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("log") {
+            continue;
+        }
+        let t = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(UNIX_EPOCH);
+        if best.as_ref().map(|(bt, _)| t > *bt).unwrap_or(true) {
+            best = Some((t, path));
+        }
+    }
+    best.map(|(_, p)| p)
 }
 
 pub fn init(path: &Path) -> std::io::Result<()> {
@@ -60,6 +82,31 @@ pub fn write(line: &str) {
     }
 }
 
+/// The last `max` lines of `path`, reading at most the trailing 4 MiB so a
+/// long-running log cannot stall the render/tick path.
+pub fn tail(path: &Path, max: usize) -> Vec<String> {
+    use std::io::Read;
+    const MAX_BYTES: u64 = 4 * 1024 * 1024;
+    let mut data = String::new();
+    if let Ok(mut f) = File::open(path) {
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        if len > MAX_BYTES {
+            use std::io::{Seek, SeekFrom};
+            let _ = f.seek(SeekFrom::Start(len - MAX_BYTES));
+            let mut buf = Vec::new();
+            let _ = f.read_to_end(&mut buf);
+            data = String::from_utf8_lossy(&buf).into_owned();
+        } else {
+            let _ = f.read_to_string(&mut data);
+        }
+    }
+    let mut lines: Vec<String> = data.lines().map(str::to_string).collect();
+    if lines.len() > max {
+        lines.drain(..lines.len() - max);
+    }
+    lines
+}
+
 /// One-line, newline-escaped excerpt for logs.
 pub fn snippet(s: &str, max: usize) -> String {
     let total = s.chars().count();
@@ -94,6 +141,15 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("hello world"));
         assert!(text.trim_start().starts_with('['));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn tail_reads_the_last_lines() {
+        let path = std::env::temp_dir().join(format!("theta-tail-{}.log", std::process::id()));
+        std::fs::write(&path, "a\nb\nc\nd\n").unwrap();
+        assert_eq!(tail(&path, 2), vec!["c".to_string(), "d".to_string()]);
+        assert_eq!(tail(&path, 9).len(), 4);
         let _ = std::fs::remove_file(&path);
     }
 

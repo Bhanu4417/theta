@@ -2,10 +2,7 @@
 
 use crate::harness::transcript::Message;
 use crate::harness::HarnessEvent;
-use crate::opencode::{
-    AgentInfo, CustomCommand, GrepMatch, ModelEntry, ModelRef, OcSession, PermissionRequest,
-    QuestionRequest,
-};
+use crate::models::{AgentInfo, CustomCommand, GrepMatch, ModelEntry, ModelRef, OcSession};
 use crate::providers::ProviderSession;
 use std::path::PathBuf;
 
@@ -92,15 +89,6 @@ pub enum AppEvent {
         sessions: Vec<OcSession>,
     },
 
-    /// Completed output of an agy CLI run.
-    AgyDone {
-        session: u32,
-        ok: bool,
-        output: String,
-        model: String,
-    },
-    /// Available models from the agy CLI.
-    AgyModels { models: Vec<(String, String)> },
     /// A session was forked; the new one shares the history.
     OcForked {
         dir: PathBuf,
@@ -111,16 +99,6 @@ pub enum AppEvent {
     OcForkFailed {
         source: u32,
         error: String,
-    },
-    /// Pending agent questions fetched when (re)connecting.
-    QuestionsListed {
-        dir: PathBuf,
-        questions: Vec<QuestionRequest>,
-    },
-    /// Pending permission requests fetched when (re)connecting.
-    PermissionsListed {
-        dir: PathBuf,
-        permissions: Vec<PermissionRequest>,
     },
     /// Progress of a `/push` (commit + push) run.
     PushProgress { session: u32, text: String },

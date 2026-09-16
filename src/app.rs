@@ -7,7 +7,7 @@ use crate::harness::transcript::{Message, PartKind, Role};
 use crate::harness::{HarnessEvent, NotificationPolicy, Task, TaskStatus, TranscriptUpdate};
 use crate::keys::Action;
 use crate::manager::Manager;
-use crate::opencode::{GrepMatch, ModelEntry, ModelRef, OcSession};
+use crate::models::{GrepMatch, ModelEntry, ModelRef, OcSession};
 use crate::panes::{Dir, PaneGrid};
 use crate::persist;
 use crate::session::{Activity, InputState, PendingPermission, PendingQuestion, SessionState, SessStatus};
@@ -38,7 +38,6 @@ pub enum Overlay {
     ConvSearch,
     Keymap,
     Theme,
-    AgyModel,
     Question,
     ModelPicker,
     AgentPicker,
@@ -48,6 +47,10 @@ pub enum Overlay {
     Tree,
     /// agy-style `/undo` rewind picker.
     Rewind,
+    /// Interactive provider login.
+    Login,
+    /// Live tail of the debug log (`/logs`).
+    Logs,
 }
 
 // ---------------------------------------------------------------------------
@@ -64,8 +67,6 @@ pub enum SlashKind {
     Close,
     Delete,
     Rename,
-    Agy,
-    AgyModel,
     Keymap,
     Clear,
     Compact,
@@ -83,6 +84,7 @@ pub enum SlashKind {
     Editor,
     Export,
     Login,
+    Logs,
     Custom(String),
 }
 
@@ -108,8 +110,6 @@ fn builtin_slash_items() -> Vec<SlashItem> {
         SlashItem { name: "share".into(), args: "".into(), desc: "Share this session (get URL)".into(), kind: SlashKind::Share },
         SlashItem { name: "unshare".into(), args: "".into(), desc: "Stop sharing this session".into(), kind: SlashKind::Unshare },
         SlashItem { name: "init".into(), args: "[focus]".into(), desc: "Create/update AGENTS.md".into(), kind: SlashKind::Init },
-        SlashItem { name: "agy".into(), args: "<prompt>".into(), desc: "Ask via agy CLI (Gemini models)".into(), kind: SlashKind::Agy },
-        SlashItem { name: "agymodel".into(), args: "".into(), desc: "Pick the agy model".into(), kind: SlashKind::AgyModel },
         SlashItem { name: "keys".into(), args: "".into(), desc: "View and edit keybindings".into(), kind: SlashKind::Keymap },
         SlashItem { name: "help".into(), args: "".into(), desc: "Overview of keys and commands".into(), kind: SlashKind::Keymap },
         SlashItem { name: "close".into(), args: "".into(), desc: "Close this session".into(), kind: SlashKind::Close },
@@ -120,7 +120,8 @@ fn builtin_slash_items() -> Vec<SlashItem> {
         SlashItem { name: "tree".into(), args: "".into(), desc: "Jump to an earlier point (local backend)".into(), kind: SlashKind::Tree },
         SlashItem { name: "editor".into(), args: "".into(), desc: "Compose the prompt in $EDITOR".into(), kind: SlashKind::Editor },
         SlashItem { name: "export".into(), args: "[file]".into(), desc: "Export this session (Markdown/JSONL)".into(), kind: SlashKind::Export },
-        SlashItem { name: "login".into(), args: "<provider> <key>".into(), desc: "Store an API key for a provider".into(), kind: SlashKind::Login },
+        SlashItem { name: "login".into(), args: "[provider]".into(), desc: "Log in to a provider (API key)".into(), kind: SlashKind::Login },
+        SlashItem { name: "logs".into(), args: "".into(), desc: "Tail the debug log (requests → model)".into(), kind: SlashKind::Logs },
         SlashItem { name: "push".into(), args: "[message]".into(), desc: "Commit and push this project (session only)".into(), kind: SlashKind::Push },
         SlashItem { name: "fork".into(), args: "".into(), desc: "Fork this session into a new pane (instant, session only)".into(), kind: SlashKind::Fork },
     ]
@@ -200,6 +201,32 @@ pub struct AgentPickerState {
     pub selected: usize,
 }
 
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+pub enum LoginStage {
+    #[default]
+    Choose,
+    /// Custom endpoint: enter a base URL first.
+    Url,
+    Key,
+}
+
+#[derive(Default)]
+pub struct LoginState {
+    pub stage: LoginStage,
+    /// `(provider id, display label, env var, already configured)`.
+    pub providers: Vec<(String, String, String, bool)>,
+    pub selected: usize,
+    pub input: InputState,
+    /// Chosen provider (Key stage).
+    pub provider: String,
+    /// Display label of the chosen provider.
+    pub provider_label: String,
+    /// Env var that holds the chosen provider's key.
+    pub env: String,
+    /// Base URL for the custom endpoint.
+    pub url: String,
+}
+
 #[derive(Default)]
 pub struct SessionListState {
     pub selected: usize,
@@ -246,6 +273,16 @@ pub struct TreeRow {
 pub struct TreeUi {
     pub items: Vec<TreeRow>,
     pub selected: usize,
+}
+
+/// Live debug-log tail (`/logs`).
+#[derive(Default)]
+pub struct LogView {
+    pub lines: Vec<String>,
+    pub scroll: usize,
+    /// Keep pinned to the newest line as the log grows.
+    pub follow: bool,
+    pub path: Option<PathBuf>,
 }
 
 /// One user turn offered by the `/undo` rewind picker.
@@ -382,7 +419,6 @@ pub enum Cmd {
     Keymap,
     Theme,
     Palette,
-    AgyModel,
     Refresh,
     Tree,
     Editor,
@@ -414,7 +450,6 @@ pub fn all_commands() -> Vec<Command> {
         Command { label: "Swap Pane Right", hint: "", cmd: Cmd::SwapRight },
         Command { label: "Swap Pane Up", hint: "", cmd: Cmd::SwapUp },
         Command { label: "Swap Pane Down", hint: "", cmd: Cmd::SwapDown },
-        Command { label: "Agy model (Gemini)", hint: "/agymodel", cmd: Cmd::AgyModel },
         Command { label: "Refresh (reload build)", hint: "/refresh", cmd: Cmd::Refresh },
         Command { label: "History tree", hint: "/tree", cmd: Cmd::Tree },
         Command { label: "Edit in $EDITOR", hint: "Ctrl+G", cmd: Cmd::Editor },
@@ -477,8 +512,8 @@ pub struct App {
 
     pub providers: Vec<ModelEntry>,
     pub default_model: Option<ModelRef>,
-    pub agents: Vec<crate::opencode::AgentInfo>,
-    pub custom_commands: Vec<crate::opencode::CustomCommand>,
+    pub agents: Vec<crate::models::AgentInfo>,
+    pub custom_commands: Vec<crate::models::CustomCommand>,
     pub model_picker: ModelPickerState,
     pub agent_picker: AgentPickerState,
     pub session_list: SessionListState,
@@ -490,6 +525,10 @@ pub struct App {
     pub tree_ui: TreeUi,
     /// `/undo` rewind picker state.
     pub rewind_ui: RewindState,
+    /// Interactive `/login` state.
+    pub login_ui: LoginState,
+    /// `/logs` live tail state.
+    pub log_view: LogView,
     /// Set when the TUI should suspend and open `$EDITOR` for a prompt.
     pub pending_editor: Option<(u32, String)>,
     pub keys: crate::keys::Keymap,
@@ -504,10 +543,6 @@ pub struct App {
     /// (source theta session id, placeholder theta session id) whose panes
     /// were created instantly and are waiting for the provider fork to land.
     pub fork_wait: Vec<(u32, u32)>,
-    /// Models offered by the agy CLI (name, description).
-    pub agy_models: Vec<(String, String)>,
-    /// Agy model picker selection state.
-    pub agy_ui: crate::app::LayoutPickerState,
 
     pub restored: bool,
     #[allow(dead_code)]
@@ -593,14 +628,14 @@ impl App {
             resume_picker: ResumePickerState::default(),
             tree_ui: TreeUi::default(),
             rewind_ui: RewindState::default(),
+            login_ui: LoginState::default(),
+            log_view: LogView::default(),
             pending_editor: None,
             keys: crate::keys::Keymap::load(&key_overrides),
             session_cache: HashMap::new(),
             known_dirs: BTreeSet::new(),
             pending_fork: Vec::new(),
             fork_wait: Vec::new(),
-            agy_models: Vec::new(),
-            agy_ui: crate::app::LayoutPickerState::default(),
             keymap_ui: KeymapUi::default(),
             theme_ui: ThemeUi::default(),
             restored: false,
@@ -833,7 +868,7 @@ impl App {
             }
         }
         let limit = self.cfg.ui.history_limit;
-        let (text, dir, oc_sid, model, agent, agy, expanded, attachments) = {
+        let (text, dir, oc_sid, model, agent, expanded, attachments) = {
             let Some(s) = self.session_mut(id) else { return };
             if s.oc_sid.is_none() {
                 self.flash("session is still connecting…");
@@ -888,18 +923,13 @@ impl App {
                 s.oc_sid.clone().unwrap_or_default(),
                 s.model.clone(),
                 s.agent.clone(),
-                s.agy_model.clone(),
                 expanded,
                 attachments,
             )
         };
         self.start_task(id, &text);
-        if let Some(agy_model) = agy {
-            self.spawn_agy_run(id, dir, expanded, agy_model);
-        } else {
-            self.manager
-                .send_prompt(dir, oc_sid, expanded, model, agent, attachments);
-        }
+        self.manager
+            .send_prompt(dir, oc_sid, expanded, model, agent, attachments);
     }
 
     /// Run a `!`/`!!` shell escape in the session's directory.
@@ -1034,6 +1064,16 @@ impl App {
                 }
                 true
             }
+            Overlay::Login => {
+                // The provider list has no text field; only the custom-endpoint
+                // URL and API-key stages accept a paste. Newlines are stripped
+                // so keys/URLs from a multi-line clipboard stay intact.
+                if !matches!(self.login_ui.stage, LoginStage::Choose) {
+                    self.login_ui.input.insert(&text.replace(['\n', '\r'], ""));
+                    self.dirty = true;
+                }
+                true
+            }
             _ => true,
         }
     }
@@ -1137,7 +1177,7 @@ impl App {
 
     /// Fire a prompt into a connected session (submit path and queue drain).
     fn send_text_now(&mut self, id: u32, text: &str) {
-        let (dir, oc_sid, model, agent, agy) = {
+        let (dir, oc_sid, model, agent) = {
             let Some(s) = self.session_mut(id) else { return };
             s.push_local_user(text);
             s.last_error = None;
@@ -1153,18 +1193,12 @@ impl App {
                 s.oc_sid.clone().unwrap_or_default(),
                 s.model.clone(),
                 s.agent.clone(),
-                s.agy_model.clone(),
             )
         };
         self.start_task(id, text);
-        if let Some(agy_model) = agy {
-            // Gemini via the agy CLI — not the OpenCode provider.
-            self.spawn_agy_run(id, dir, text.to_string(), agy_model);
-        } else {
-            let attachments = Self::attachments_for(&dir, text);
-            self.manager
-                .send_prompt(dir, oc_sid, text.to_string(), model, agent, attachments);
-        }
+        let attachments = Self::attachments_for(&dir, text);
+        self.manager
+            .send_prompt(dir, oc_sid, text.to_string(), model, agent, attachments);
     }
 
     /// Send the next queued prompt when the agent idles.
@@ -1252,7 +1286,7 @@ impl App {
             self.flash("a fork is already in progress…");
             return;
         }
-        let (dir, oc_sid, at, seed, model, agent, agy, base_name) = {
+        let (dir, oc_sid, at, seed, model, agent, base_name) = {
             let Some(s) = self.session(source) else {
                 return;
             };
@@ -1267,7 +1301,6 @@ impl App {
                 s.messages.clone(),
                 s.model.clone(),
                 s.agent.clone(),
-                s.agy_model.clone(),
                 s.name.clone(),
             )
         };
@@ -1278,7 +1311,6 @@ impl App {
         let mut sess = SessionState::new(id, name.clone(), dir.clone());
         sess.model = model;
         sess.agent = agent;
-        sess.agy_model = agy;
         // Seed with the source transcript so the pane is readable immediately;
         // the provider's forked history replaces it once it arrives.
         if !seed.is_empty() {
@@ -1495,9 +1527,14 @@ impl App {
             s.status = SessStatus::Working;
             s.dirty = true;
         }
+        // "always" stops the per-tool prompts for good (persisted).
+        if response == "always" && !self.cfg.behavior.auto_approve_permissions {
+            self.cfg.behavior.auto_approve_permissions = true;
+            let _ = self.cfg.save();
+        }
         self.flash(match response {
             "reject" => "permission rejected",
-            "always" => "allowed (always)",
+            "always" => "allowed — no more access prompts",
             _ => "allowed",
         });
     }
@@ -1857,7 +1894,7 @@ impl App {
                     .as_ref()
                     .map(|m| (m.provider_id.clone(), m.model_id.clone())),
                 agent: s.agent.clone(),
-                provider: Some(s.provider.id().to_string()),
+                provider: Some(crate::providers::ProviderKind::Local.id().to_string()),
             })
             .collect();
         let idx = |sid: u32| self.sessions.iter().position(|s| s.id == sid).unwrap_or(0);
@@ -2021,13 +2058,166 @@ impl App {
 
     pub fn open_model_picker(&mut self) {
         // Providers may still be loading on a cold start — the picker opens
-        // anyway and on_tick refreshes the list until it arrives.
+        // anyway and on_tick refreshes the list until it arrives. Refresh now
+        // so models from every logged-in provider are fetched.
         self.model_picker.input.clear();
         self.model_picker.selected = 0;
-        if self.agy_models.is_empty() {
-            self.fetch_agy_models();
+        if let Some(dir) = self.focused().map(|s| s.dir.clone()) {
+            self.manager.refresh_providers(dir);
         }
         self.overlay = Overlay::ModelPicker;
+        self.dirty = true;
+    }
+
+    /// Known providers for the `/login` picker: `(id, label, env var)`.
+    /// Shared with model discovery so login and `/model` agree.
+    const LOGIN_PROVIDERS: &'static [(&'static str, &'static str, &'static str)] =
+        crate::ai::discovery::PROVIDERS;
+
+    /// Open the interactive provider login.
+    /// True when the configured provider (or the last-used model's provider)
+    /// has a usable credential.
+    pub fn provider_configured(&self) -> bool {
+        let creds = crate::credentials::Credentials::load();
+        let mut ids = vec![self.cfg.ai.provider.to_ascii_lowercase()];
+        if let Some((p, _)) = &self.cfg.last_model {
+            ids.push(p.to_ascii_lowercase());
+        }
+        ids.iter().any(|id| {
+            creds
+                .resolve(id, &self.cfg.ai.api_key_env)
+                .is_some()
+                || !self.cfg.ai.base_url.trim().is_empty()
+                || id == "ollama"
+        })
+    }
+
+    /// `/logs`: live-tail the debug log inside the TUI (no second terminal).
+    pub fn open_logs(&mut self) {
+        if !crate::logging::enabled() {
+            self.flash("logging is off — restart with `theta --log --run`");
+            return;
+        }
+        self.log_view.follow = true;
+        self.refresh_logs();
+        self.overlay = Overlay::Logs;
+        self.dirty = true;
+    }
+
+    /// Re-read the newest log file; keep pinned to the bottom when following.
+    fn refresh_logs(&mut self) {
+        let dir = crate::logging::logs_dir();
+        let Some(path) = crate::logging::newest_log(&dir) else { return };
+        self.log_view.lines = crate::logging::tail(&path, 2000);
+        self.log_view.path = Some(path);
+        if self.log_view.follow {
+            self.log_view.scroll = self.log_view.lines.len().saturating_sub(1);
+        }
+    }
+
+    pub fn open_login(&mut self) {
+        let creds = crate::credentials::Credentials::load();
+        self.login_ui = LoginState::default();
+        self.login_ui.providers = Self::LOGIN_PROVIDERS
+            .iter()
+            .map(|(id, label, env)| {
+                let configured = creds.resolve(id, env).is_some();
+                ((*id).to_string(), (*label).to_string(), (*env).to_string(), configured)
+            })
+            .collect();
+        let custom_configured = !self.cfg.ai.base_url.trim().is_empty();
+        self.login_ui.providers.insert(
+            0,
+            (
+                "custom".to_string(),
+                "custom (OpenAI-compatible URL)".to_string(),
+                String::new(),
+                custom_configured,
+            ),
+        );
+        self.login_ui.stage = LoginStage::Choose;
+        self.overlay = Overlay::Login;
+        self.dirty = true;
+    }
+
+    /// Move from the provider list to key entry.
+    fn login_choose(&mut self) {
+        let sel = self.login_ui.selected.min(self.login_ui.providers.len().saturating_sub(1));
+        if let Some((id, label, env, _)) = self.login_ui.providers.get(sel) {
+            self.login_ui.provider = id.clone();
+            self.login_ui.provider_label = label.clone();
+            self.login_ui.env = env.clone();
+            self.login_ui.input.clear();
+            self.login_ui.stage = if id == "custom" { LoginStage::Url } else { LoginStage::Key };
+            self.dirty = true;
+        }
+    }
+
+    /// Env var for a login provider id, or `None` if it is not a preset.
+    fn login_env_for(provider: &str) -> Option<&'static str> {
+        Self::LOGIN_PROVIDERS
+            .iter()
+            .find(|(id, _, _)| *id == provider)
+            .map(|(_, _, env)| *env)
+    }
+
+    /// Point the live config at `provider`'s preset (endpoint + default model)
+    /// so a `/login` takes effect without a restart. Returns the chosen model.
+    fn activate_provider(&mut self, provider: &str, env: &str) -> String {
+        let model = crate::manager::default_model_for(provider).to_string();
+        self.cfg.ai.provider = provider.to_string();
+        self.cfg.ai.base_url = String::new();
+        self.cfg.ai.api_key_env = env.to_string();
+        self.cfg.ai.model = model.clone();
+        self.cfg.last_model = Some((provider.to_string(), model.clone()));
+        let _ = self.cfg.save();
+        self.manager.set_ai(provider, &model, "");
+        self.manager.reload_credentials();
+        // New key → re-fetch this provider's models exactly once; `/model`
+        // then reads the persisted cache.
+        crate::ai::discovery::invalidate(provider);
+        if let Some(dir) = self.focused().map(|s| s.dir.clone()) {
+            self.manager.refresh_providers(dir);
+        }
+        model
+    }
+
+    /// Persist the entered key (and endpoint) and reload providers.
+    fn login_save(&mut self) {
+        let provider = self.login_ui.provider.clone();
+        let label = self.login_ui.provider_label.clone();
+        let env = self.login_ui.env.clone();
+        let key = self.login_ui.input.text().trim().to_string();
+        let mut creds = crate::credentials::Credentials::load();
+        let res = if key.is_empty() {
+            creds.remove(&provider).map(|_| format!("cleared key for {provider}"))
+        } else {
+            creds.set(&provider, &key).map(|_| format!("saved key for {provider}"))
+        };
+        match res {
+            Ok(msg) => {
+                if provider == "custom" {
+                    let url = self.login_ui.url.trim().to_string();
+                    self.cfg.ai.provider = "custom".into();
+                    self.cfg.ai.base_url = url.clone();
+                    let _ = self.cfg.save();
+                    let model = self.cfg.ai.model.clone();
+                    self.manager.set_ai("custom", &model, &url);
+                    crate::ai::discovery::invalidate("custom");
+                    if let Some(dir) = self.focused().map(|s| s.dir.clone()) {
+                        self.manager.refresh_providers(dir);
+                    }
+                    self.flash(format!("{msg}, endpoint {url}"));
+                } else {
+                    // Activate the provider (like the OpenCode CLI does after
+                    // `/connect`) so the next prompt uses it without a restart.
+                    let model = self.activate_provider(&provider, &env);
+                    self.flash(format!("{msg} · {label} active ({model})"));
+                }
+                self.overlay = Overlay::None;
+            }
+            Err(e) => self.flash(format!("could not save key: {e}")),
+        }
         self.dirty = true;
     }
 
@@ -2117,85 +2307,8 @@ impl App {
         self.flash(format!("copied {} chars", text.chars().count()));
     }
 
-    /// Spawn an agy CLI turn (Gemini models) in the session folder.
-    fn spawn_agy_run(&mut self, id: u32, dir: PathBuf, text: String, model: String) {
-        use std::process::Stdio;
-        crate::tlog!(
-            "AGY dir={} session={} model={} text={}",
-            dir.display(),
-            id,
-            model,
-            crate::logging::snippet(&text, 2000)
-        );
-        self.push_local_user(id, &text);
-        if let Some(s) = self.session_mut(id) {
-            s.status = SessStatus::Working;
-            s.dirty = true;
-        }
-        let tx = self.manager_tx();
-        tokio::spawn(async move {
-            let out = tokio::process::Command::new("agy")
-                .arg("-p")
-                .arg(&text)
-                .arg("--model")
-                .arg(&model)
-                .current_dir(&dir)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()
-                .await;
-            let ok = out.as_ref().map(|o| o.status.success()).unwrap_or(false);
-            let body = out
-                .ok()
-                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-                .unwrap_or_default();
-            let _ = tx.send(AppEvent::AgyDone {
-                session: id,
-                ok,
-                output: body.trim().to_string(),
-                model,
-            });
-        });
-    }
-
     fn manager_tx(&self) -> tokio::sync::mpsc::UnboundedSender<AppEvent> {
         self.manager.tx()
-    }
-
-    /// Run a prompt through the agy CLI (Gemini models) in the session folder.
-    pub fn run_agy(&mut self, id: u32, prompt: &str) {
-        let model = self
-            .session(id)
-            .and_then(|s| s.agy_model.clone())
-            .unwrap_or_else(|| self.cfg.agy_model.clone());
-        let dir = self.session(id).map(|s| s.dir.clone());
-        if let Some(dir) = dir {
-            self.spawn_agy_run(id, dir, prompt.to_string(), model);
-        }
-    }
-
-    /// Fetch the model list from the agy CLI.
-    pub fn fetch_agy_models(&mut self) {
-        let tx = self.manager_tx();
-        let _ = std::fs::write("/tmp/agy-start.txt", format!("started, agy_models={}", self.agy_models.len()));
-        tokio::spawn(async move {
-            let out = tokio::process::Command::new("agy")
-                .arg("models")
-                .output()
-                .await;
-            let Ok(out) = out else { return };
-            let mut models = Vec::new();
-            for line in String::from_utf8_lossy(&out.stdout).lines() {
-                if let Some((name, desc)) = line.split_once('\t') {
-                    models.push((name.trim().to_string(), desc.trim().to_string()));
-                }
-            }
-            if !models.is_empty() {
-                let _ = tx.send(AppEvent::AgyModels { models });
-            } else {
-                let _ = std::fs::write("/tmp/agy-fetch-debug.txt", out.stdout);
-            }
-        });
     }
 
     fn base64_encode(data: &[u8]) -> String {
@@ -2212,15 +2325,6 @@ impl App {
             out.push(if chunk.len() > 2 { T[n as usize & 63] as char } else { '=' });
         }
         out
-    }
-
-    pub fn open_agy_model_picker(&mut self) {
-        if self.agy_models.is_empty() {
-            self.fetch_agy_models();
-        }
-        self.agy_ui.selected = 0;
-        self.overlay = Overlay::AgyModel;
-        self.dirty = true;
     }
 
     pub fn open_theme_picker(&mut self) {
@@ -2254,17 +2358,6 @@ impl App {
             "default".to_string(),
             self.default_model.clone(),
         )];
-        // agy CLI models (Gemini etc.) first — route through the local agy
-        // binary — then the OpenCode providers.
-        for (name, desc) in &self.agy_models {
-            v.push((
-                format!("agy/{name} — {desc}"),
-                Some(ModelRef {
-                    provider_id: "agy".into(),
-                    model_id: name.clone(),
-                }),
-            ));
-        }
         v.extend(self.providers.iter().map(|p| {
             (
                 p.label.clone(),
@@ -2289,15 +2382,8 @@ impl App {
 
     fn set_model(&mut self, id: u32, model: Option<ModelRef>, label: &str) {
         crate::tlog!("MODEL session={id} -> {label}");
-        let is_agy = model.as_ref().map(|m| m.provider_id == "agy").unwrap_or(false);
         if let Some(s) = self.session_mut(id) {
-            if is_agy {
-                s.model = None;
-                s.agy_model = model.as_ref().map(|m| m.model_id.clone());
-            } else {
-                s.model = model.clone();
-                s.agy_model = None;
-            }
+            s.model = model.clone();
         }
         // Remember as the default for future sessions.
         if let Some(m) = &model {
@@ -2481,19 +2567,18 @@ impl App {
                 }
             }
             "keys" | "help" => self.open_keymap(),
-            "agy" => {
-                if args.is_empty() {
-                    self.open_agy_model_picker();
-                } else {
-                    self.run_agy(self.focus, args);
-                }
-            }
-            "agymodel" => self.open_agy_model_picker(),
             "refresh" => self.request_refresh(),
             "tree" => self.open_tree(),
             "editor" => self.open_editor(),
             "export" => self.export_session(if args.is_empty() { None } else { Some(args) }),
-            "login" => self.login(args),
+            "login" => {
+                if args.is_empty() {
+                    self.open_login();
+                } else {
+                    self.login(args);
+                }
+            }
+            "logs" => self.open_logs(),
             "push" => self.start_push(sid, args),
             "fork" => self.fork_active(),
             "theme" => self.open_theme_picker(),
@@ -3405,13 +3490,20 @@ impl App {
             (Some(provider), Some(key)) => {
                 let mut creds = crate::credentials::Credentials::load();
                 match creds.set(provider, key) {
-                    Ok(()) => self.flash(format!("saved API key for {provider}")),
+                    Ok(()) => match Self::login_env_for(provider) {
+                        Some(env) => {
+                            let model = self.activate_provider(provider, env);
+                            self.flash(format!("saved API key for {provider} · active ({model})"));
+                        }
+                        None => self.flash(format!("saved API key for {provider}")),
+                    },
                     Err(e) => self.flash(format!("could not save key: {e}")),
                 }
             }
             (Some(provider), None) => {
                 let creds = crate::credentials::Credentials::load();
-                let configured = creds.resolve(provider, "").is_some();
+                let env = Self::login_env_for(provider).unwrap_or("");
+                let configured = creds.resolve(provider, env).is_some();
                 self.flash(if configured {
                     format!("{provider}: key configured")
                 } else {
@@ -3713,7 +3805,7 @@ impl App {
             let dir_s = dir.to_string_lossy().to_string();
             self.resume_picker.items = crate::tree::SessionTree::list_sessions()
                 .into_iter()
-                .map(|s| crate::opencode::OcSession {
+                .map(|s| crate::models::OcSession {
                     id: s.id,
                     title: s.title,
                     directory: dir_s.clone(),
@@ -4171,29 +4263,6 @@ impl App {
                 }
                 _ => {}
             },
-            Overlay::AgyModel => {
-                let n = self.agy_models.len();
-                match key.code {
-                    KeyCode::Esc => self.overlay = Overlay::None,
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        self.agy_ui.selected = self.agy_ui.selected.saturating_sub(1)
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        if n > 0 {
-                            self.agy_ui.selected = (self.agy_ui.selected + 1) % n;
-                        }
-                    }
-                    KeyCode::Enter => {
-                        if let Some((name, _)) = self.agy_models.get(self.agy_ui.selected) {
-                            self.cfg.agy_model = name.clone();
-                            let _ = self.cfg.save();
-                            self.overlay = Overlay::None;
-                            self.flash(format!("agy model: {name}"));
-                        }
-                    }
-                    _ => {}
-                }
-            }
             Overlay::Question => {
                 let sid = self.focus;
                 let info = self
@@ -4601,6 +4670,105 @@ impl App {
                 KeyCode::Enter => self.rewind_selected(),
                 _ => {}
             },
+            Overlay::Login => match self.login_ui.stage {
+                LoginStage::Choose => match key.code {
+                    KeyCode::Esc => self.overlay = Overlay::None,
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        let n = self.login_ui.providers.len();
+                        if n > 0 {
+                            self.login_ui.selected =
+                                if self.login_ui.selected == 0 { n - 1 } else { self.login_ui.selected - 1 };
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        let n = self.login_ui.providers.len();
+                        if n > 0 {
+                            self.login_ui.selected = (self.login_ui.selected + 1) % n;
+                        }
+                    }
+                    KeyCode::Enter => self.login_choose(),
+                    _ => {}
+                },
+                LoginStage::Url => match key.code {
+                    KeyCode::Esc => {
+                        self.login_ui.stage = LoginStage::Choose;
+                        self.login_ui.input.clear();
+                    }
+                    KeyCode::Enter => {
+                        let url = self.login_ui.input.text().trim().to_string();
+                        if url.is_empty() {
+                            self.flash("enter a base URL like https://host/v1");
+                        } else {
+                            self.login_ui.url = url;
+                            self.login_ui.input.clear();
+                            self.login_ui.stage = LoginStage::Key;
+                        }
+                    }
+                    KeyCode::Backspace => self.login_ui.input.backspace(),
+                    KeyCode::Left => self.login_ui.input.left(),
+                    KeyCode::Right => self.login_ui.input.right(),
+                    KeyCode::Home => self.login_ui.input.home(),
+                    KeyCode::End => self.login_ui.input.end(),
+                    KeyCode::Char(c) if !ctrl => {
+                        self.login_ui.input.insert(&c.to_string());
+                    }
+                    _ => {}
+                },
+                LoginStage::Key => match key.code {
+                    KeyCode::Esc => {
+                        self.login_ui.stage = LoginStage::Choose;
+                        self.login_ui.input.clear();
+                    }
+                    KeyCode::Enter => self.login_save(),
+                    KeyCode::Backspace => self.login_ui.input.backspace(),
+                    KeyCode::Left => self.login_ui.input.left(),
+                    KeyCode::Right => self.login_ui.input.right(),
+                    KeyCode::Home => self.login_ui.input.home(),
+                    KeyCode::End => self.login_ui.input.end(),
+                    KeyCode::Char(c) if !ctrl => {
+                        self.login_ui.input.insert(&c.to_string());
+                    }
+                    _ => {}
+                },
+            },
+            Overlay::Logs => {
+                let max = self.log_view.lines.len().saturating_sub(1);
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => self.overlay = Overlay::None,
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.log_view.follow = false;
+                        self.log_view.scroll = self.log_view.scroll.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.log_view.scroll = (self.log_view.scroll + 1).min(max);
+                        if self.log_view.scroll == max {
+                            self.log_view.follow = true;
+                        }
+                    }
+                    KeyCode::PageUp => {
+                        self.log_view.follow = false;
+                        self.log_view.scroll = self.log_view.scroll.saturating_sub(20);
+                    }
+                    KeyCode::PageDown => {
+                        self.log_view.scroll = (self.log_view.scroll + 20).min(max);
+                    }
+                    KeyCode::End | KeyCode::Char('G') => {
+                        self.log_view.follow = true;
+                        self.log_view.scroll = max;
+                    }
+                    KeyCode::Home | KeyCode::Char('g') => {
+                        self.log_view.follow = false;
+                        self.log_view.scroll = 0;
+                    }
+                    KeyCode::Char('f') => {
+                        self.log_view.follow = !self.log_view.follow;
+                        if self.log_view.follow {
+                            self.log_view.scroll = max;
+                        }
+                    }
+                    _ => {}
+                }
+            }
             Overlay::None => {}
         }
         self.dirty = true;
@@ -4697,7 +4865,6 @@ impl App {
             Cmd::GitLog => self.open_git_log().await,
             Cmd::ResumeSession => self.open_resume_picker(),
             Cmd::Keymap => self.open_keymap(),
-            Cmd::AgyModel => self.open_agy_model_picker(),
             Cmd::Refresh => self.request_refresh(),
             Cmd::Tree => self.open_tree(),
             Cmd::Editor => self.open_editor(),
@@ -4862,11 +5029,6 @@ impl App {
                     self.flash(format!("search: {error}"));
                 }
             }
-            AppEvent::AgyModels { models } => {
-                let n = models.len();
-                self.agy_models = models;
-                self.flash(format!("{n} agy models loaded"));
-            }
             AppEvent::PushProgress { session, text } => {
                 if let Some(s) = self.session_mut(session) {
                     s.activity = Some(Activity {
@@ -4904,94 +5066,6 @@ impl App {
                 }
                 // No flash: the activity strip is the single place push status
                 // is shown, so it isn't duplicated in the status bar.
-            }
-            AppEvent::QuestionsListed { dir, questions } => {
-                for q in questions {
-                    if let Some(idx) = self.sessions.iter().position(|s| {
-                        s.dir == dir && s.oc_sid.as_deref() == Some(q.session_id.as_str())
-                    }) {
-                        if self.sessions[idx].pending_question.is_none() {
-                            let prompt = crate::providers::opencode::question_prompt(&q);
-                            self.sessions[idx].pending_question =
-                                Some(PendingQuestion::new(prompt.id, prompt.questions));
-                            self.sessions[idx].status = SessStatus::Question;
-                            self.sessions[idx].dirty = true;
-                        }
-                    }
-                }
-                self.open_pending_question();
-            }
-            AppEvent::PermissionsListed { dir, permissions } => {
-                for p in permissions {
-                    if let Some(idx) = self.sessions.iter().position(|s| {
-                        s.dir == dir && s.oc_sid.as_deref() == Some(p.session_id.as_str())
-                    }) {
-                        let auto = self.cfg.behavior.auto_approve_permissions;
-                        if auto {
-                            if let Some(oc) = self.sessions[idx].oc_sid.clone() {
-                                self.manager.reply_permission(
-                                    dir.clone(),
-                                    oc,
-                                    p.id.clone(),
-                                    "once".into(),
-                                );
-                            }
-                        } else if self.sessions[idx].pending_perm.is_none() {
-                            let detail = p.detail();
-                            self.sessions[idx].pending_perm = Some(PendingPermission {
-                                id: p.id,
-                                kind: p.permission,
-                                detail,
-                            });
-                            self.sessions[idx].status = SessStatus::Permission;
-                            self.sessions[idx].dirty = true;
-                        }
-                    }
-                }
-            }
-            AppEvent::AgyDone {
-                session: id,
-                ok,
-                output,
-                model,
-            } => {
-                let mut text = if output.is_empty() {
-                    "(no output)".to_string()
-                } else {
-                    output
-                };
-                let header = format!("▌ agy · {}\n\n", model);
-                if let Some(s) = self.session_mut(id) {
-                    let msg = crate::harness::transcript::Message {
-                        id: format!("agy-{}", s.optimistic_seq()),
-                        role: crate::harness::transcript::Role::Assistant,
-                        error: if ok { None } else { Some("agy failed".into()) },
-                        completed: Some(1),
-                        created: None,
-                        cost: None,
-                        tokens: None,
-                        parts: vec![crate::harness::transcript::Part {
-                            id: format!("agy-{}-out", s.optimistic_seq()),
-                            message_id: format!("agy-{}", s.optimistic_seq()),
-                            kind: crate::harness::transcript::PartKind::Text {
-                                text: format!("{header}{}", if ok { text.clone() } else { String::new() }),
-                                synthetic: false,
-                            },
-                        }],
-                    };
-                    if !ok {
-                        // show stderr/output in the error block
-                        s.last_error = Some(if text.is_empty() {
-                            "agy failed".into()
-                        } else {
-                            format!("agy failed: {text}")
-                        });
-                    }
-                    s.messages.push(msg);
-                    s.status = SessStatus::Idle;
-                    s.dirty = true;
-                }
-                let _ = &mut text;
             }
             AppEvent::OcForked { dir, session, source } => {
                 // The pane was already created instantly in `begin_fork`; just
@@ -5238,6 +5312,7 @@ impl App {
             return;
         }
         let Some(idx) = Self::route_session(&self.sessions, &dir, &oc_sid) else {
+            crate::tlog!("APP no route oc_sid={oc_sid} dir={}", dir.display());
             return;
         };
         let sid = self.sessions[idx].id;
@@ -5248,12 +5323,13 @@ impl App {
                 let s = &mut self.sessions[idx];
                 match update {
                     TranscriptUpdate::MessageMeta(msg) => {
-                        s.upsert_message_meta(&msg);
                         if msg.role == Role::User {
                             // message.updated carries no parts; adopt by FIFO
-                            // against optimistic sends.
+                            // against optimistic sends *before* inserting, so
+                            // the adopted row is updated rather than duplicated.
                             s.adopt_oldest(&msg);
                         }
+                        s.upsert_message_meta(&msg);
                     }
                     TranscriptUpdate::Part(part) => {
                         let msg_id = part.message_id.clone();
@@ -5279,6 +5355,10 @@ impl App {
                         part_id,
                     } => {
                         s.remove_part(&message_id, &part_id);
+                    }
+                    TranscriptUpdate::Reset => {
+                        s.messages.clear();
+                        s.recompute_metrics();
                     }
                 }
                 s.dirty = true;
@@ -5536,6 +5616,11 @@ impl App {
             if let Some(dir) = self.focused().map(|s| s.dir.clone()) {
                 self.manager.refresh_providers(dir);
             }
+        }
+
+        // Keep the `/logs` tail live.
+        if self.overlay == Overlay::Logs && self.tick % 10 == 0 {
+            self.refresh_logs();
         }
 
         if self.last_save.elapsed() > Duration::from_secs(30) {
@@ -5855,6 +5940,77 @@ mod shell_tests {
         assert_eq!(parse_shell_line("hello"), None);
         assert_eq!(parse_shell_line("!"), None);
         assert_eq!(parse_shell_line("!!"), None);
+    }
+}
+
+#[cfg(test)]
+mod login_tests {
+    use super::*;
+
+    fn test_app() -> App {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cfg = Config::default();
+        let manager = Manager::new(tx, cfg.clone());
+        App::new(cfg, manager, PathBuf::from("/tmp"))
+    }
+
+    #[test]
+    fn logs_slash_command_is_registered() {
+        assert!(builtin_slash_items().iter().any(|i| i.name == "logs"));
+    }
+
+    #[test]
+    fn login_lists_opencode_zen_and_go() {
+        let ids: Vec<&str> = App::LOGIN_PROVIDERS.iter().map(|(id, _, _)| *id).collect();
+        assert!(ids.contains(&"opencode"), "OpenCode Zen is offered");
+        assert!(ids.contains(&"opencode-go"), "OpenCode Go is offered");
+        // Both OpenCode gateways authenticate with the same env var.
+        for (id, _, env) in App::LOGIN_PROVIDERS {
+            if id.starts_with("opencode") {
+                assert_eq!(*env, "OPENCODE_API_KEY", "{id} env");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pasted_key_lands_in_the_login_field() {
+        let mut app = test_app();
+        app.overlay = Overlay::Login;
+        app.login_ui.stage = LoginStage::Key;
+        app.login_ui.provider = "opencode-go".into();
+
+        app.handle_term_event(TermEvent::Paste("sk-new-key\n".into())).await;
+
+        assert_eq!(app.login_ui.input.text(), "sk-new-key");
+    }
+
+    #[tokio::test]
+    async fn pasted_url_lands_in_the_login_field() {
+        let mut app = test_app();
+        app.overlay = Overlay::Login;
+        app.login_ui.stage = LoginStage::Url;
+
+        app.handle_term_event(TermEvent::Paste("https://host/v1\n".into())).await;
+
+        assert_eq!(app.login_ui.input.text(), "https://host/v1");
+    }
+
+    #[tokio::test]
+    async fn paste_on_provider_list_is_ignored() {
+        let mut app = test_app();
+        app.sessions.push(SessionState::new(
+            10,
+            "background".into(),
+            PathBuf::from("/tmp"),
+        ));
+        app.focus = 10;
+        app.overlay = Overlay::Login;
+        app.login_ui.stage = LoginStage::Choose;
+
+        app.handle_term_event(TermEvent::Paste("sk-leak".into())).await;
+
+        assert!(app.login_ui.input.text().is_empty());
+        assert_eq!(app.session(10).expect("session").input.text(), "");
     }
 }
 

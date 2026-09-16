@@ -7,16 +7,14 @@ edits this repository. Read it fully before making changes.
 
 Theta is a **terminal client** for the OpenCode agent harness: a multi-session,
 tiled-pane TUI written in Rust (ratatui + crossterm + tokio). It does **not**
-talk to models or run an agent loop itself — it spawns `opencode serve` per
-project directory and drives its HTTP + SSE API. See `README.md` for the user
-manual and `src/` for the architecture.
+talks to models itself: it owns the agent loop, tools, providers, permissions
+and context management. See `README.md` for the user manual and `src/` for the
+architecture.
 
-**Long-term direction:** Theta is expected to evolve into an **independent
-harness** (its own agent loop + tools + providers) while keeping the same UI.
-Therefore: keep the harness/client seam clean. All harness communication is
-already isolated in `src/manager.rs` + `src/opencode.rs`; the UI consumes
-`AppEvent`s from `src/events.rs`. New features must respect that boundary so the
-`opencode serve` backend can later be swapped for an in-process loop.
+**Architecture:** Theta **is** an independent harness now. The agent loop lives
+in `src/agent/`, providers in `src/ai/`, the local adapter in
+`src/providers/local`, and the manager bridges async work to the UI as
+`AppEvent`s. Keep that seam clean: the UI never talks to a provider directly.
 
 ## Golden rules (never break these)
 
@@ -64,8 +62,9 @@ confirmed visually.
 | `main.rs` | terminal setup, event loop (keys / SSE / tick), re-exec on `/refresh` |
 | `app.rs` | all state, key routing, overlays, commands, `AppEvent` handling |
 | `session.rs` | per-session transcript, input buffer, status, questions/queue |
-| `manager.rs` | per-directory server lifecycle, async bridge, SSE pump |
-| `opencode.rs` | typed client for the OpenCode HTTP API (lenient JSON) |
+| `manager.rs` | local harness bridge: async work → `AppEvent`, event pump |
+| `models.rs` | shared session/model/question value types |
+| `mcp.rs` | stdio MCP client + dynamic `mcp__` tools |
 | `events.rs` | `AppEvent` — the only channel from harness → UI |
 | `panes.rs` | weighted row/column tiling grid |
 | `persist.rs` | workspace save/restore (`~/.local/share/theta/workspace.toml`) |
@@ -100,13 +99,154 @@ Implemented as a client today; to become a harness without a rewrite:
 3. Providers behind one trait (start with OpenAI-compatible); tools as
    schema + handler (read/write/edit/bash/grep/glob/webfetch).
 4. Own context management (token counting + compaction) and permissions.
-5. Swap `manager.rs`'s `opencode serve` spawning for the local loop behind a
-   config flag; the UI must not change.
+5. (Done.) The local loop replaced the external backend; the UI was unchanged.
 
-Design every new feature so it works for both the current OpenCode backend and
-a future in-process harness.
+Design every new feature against the stable `HarnessEvent` interface.
 
 ## Work log (recent, high-level)
+- **`ask` works under permissive permissions; parallel split-turn compaction.**
+  The question broker was only wired when `local_permissions = "ask"`, so with
+  the new `allow` default every `ask` call failed (`ask: no interactive session
+  available` — the red `✗ ask`). `local_gates` now returns gates for every
+  interactive session regardless of mode (headless still gets none); the gate
+  itself is chosen separately. Split-turn compaction ran its history and
+  turn-prefix summaries **sequentially** (~2× the latency); they now run
+  concurrently via `tokio::join!`. Test:
+  `interactive_sessions_always_wire_a_question_broker`. Verified in a real TUI:
+  `ask` overlay renders, and with `ask` mode the `[a] allow once / A always / r
+  reject` bash prompt allows the command.
+
+- **Local transcript ids + replay fixed (the "reply only after restart" bug).**
+  Three linked defects: (1) assistant message ids were `local-{turn}` and
+  reused every turn *and* every launch, and `upsert_part` matches by id — so a
+  new reply overwrote an older message (often near the top) instead of
+  appending; ids are now `local-{run}-{turn}` with a unique run id
+  (`agent::local_run_id`), and optimistic user ids embed their creation time.
+  (2) `upsert_message_meta` only updated existing rows, so replayed history had
+  no role row and the part handler defaulted every message to `Assistant` (user
+  prompts lost their `Θ` marker) — it now inserts the row; the handler adopts
+  FIFO *before* upserting to avoid duplicates. (3) restoring a workspace stacked
+  `replay`ed turns on the hydrated cache; a new `TranscriptUpdate::Reset` is
+  emitted by `LocalProvider::adopt` so the tree is authoritative. Tests:
+  `local_message_ids_are_unique_across_turns`,
+  `message_meta_inserts_a_row_so_parts_keep_their_role`,
+  `non_streamed_answer_still_reaches_the_transcript`. Verified in a real TUI
+  (tmux): restored history renders with correct roles, no duplicates, and the
+  reply appears live.
+
+- **Replies can't be invisible.** The transcript only received assistant text
+  from streamed `TextDelta`s; a provider that assembled `turn.text` without
+  emitting deltas left the UI blank while the answer sat in history/tree — it
+  only appeared after a restart. The loop now emits the final text whenever no
+  delta was seen. (Regression test: `non_streamed_answer_still_reaches_the_transcript`.)
+
+- **Reasoning models no longer go silent.** `muse-spark`/`gpt-5`/`grok-4`
+  default to `reasoning.effort = "high"`, which can consume the entire
+  `max_output_tokens` in hidden reasoning and return **no text**. The Responses
+  adapter now handles `response.incomplete` (reports `Length`), captures text
+  from `output_text.done`/message items (not just deltas), and errors on an
+  empty incomplete turn; the agent loop renders a "(no output …)" notice instead
+  of idly finishing. `ChatRequest.reasoning_effort` maps to
+  `reasoning:{effort}` on Responses only, configured via `[ai]
+  reasoning_effort`; compaction summarizes at `low` (muse 4.4s, 342 reasoning
+  tokens). `--check-ai` uses a 1k cap + `low` (96 tokens always came back
+  empty for muse).
+
+- **OpenCode-style tool rows + stable thinking.** The local loop no longer sets
+  `ToolInfo.title` to the bare tool name, so `display_title()` derives what the
+  call actually did from its args (`Reading src/app.rs`, `Searching "foo"`,
+  `$ cmd`) instead of every row reading just `read`/`grep`. Reasoning deltas are
+  accumulated before emit (the part is keyed by id, so emitting only the delta
+  made the UI replace the text every token — the "thinking text changes too
+  fast" flicker) and the span is bracketed with `start`/`end` for a real timer.
+
+- **Fast compaction for every model.** The summary output is hard-capped
+  (`context::SUMMARY_MAX_TOKENS_CAP`, 4k — was `0.8 * reserve ≈ 13k`), so
+  reasoning models no longer grind on `/compact`; a length-truncated but
+  non-empty summary is kept instead of failing the compaction. `[compaction]
+  model` selects a dedicated fast/cheap summarizer (`AgentLoop::
+  with_compaction_model`), falling back to the session model if it can't be
+  built.
+
+- **`ai.timeout_secs` is now enforced.** Every provider request carries a total
+  timeout (`Provider::set_timeout`, applied in `make_provider`), so a stalled
+  gateway can no longer hang a turn or `/compact` forever (default 300s, `0`
+  disables).
+
+- **OpenCode-style permissive defaults.** `behavior.local_permissions` now
+  defaults to `"allow"` (was `"ask"`): tools — including `bash` and edits — run
+  without prompts, matching OpenCode's defaults. `ask` remains opt-in and
+  auto-allows in-project reads; `plan`/`explore` stay `read-only`. `A`
+  ("always") still flips `auto_approve_permissions` for the ask mode.
+
+- **Tool-call/result integrity (Pi-style).** Interrupting during a tool call used
+  to leave an assistant `tool_calls` with no matching output; every later
+  request then 400'd (`assistant message with 'tool_calls' must be followed by
+  tool messages`). The loop now synthesizes a tool output for every pending call
+  on cancel, and `context::repair_tool_calls` heals history (adds missing
+  outputs, drops orphans) before each request — so existing broken sessions
+  recover without deleting history.
+
+- **OpenCode-style read permissions.** `AskGate` now auto-allows pure reads
+  (`read`/`grep`/`glob`/`webfetch`) whose target resolves inside the session's
+  working directory; only mutations, `bash`, and out-of-tree reads prompt. The
+  gate signature is `check(tool, input, cwd)`. `/logs` overlays the debug log
+  in-TUI.
+
+- **`theta --log` views, `--log --run` records, `/logs` tails in-TUI.** `--log`
+  alone opens/tails the newest log (`less +F`, else `tail -f`); `--log --run`
+  (or `--log --print`) runs with logging enabled. The agent loop logs every
+  provider call as `REQ provider=… model=… msgs/tools` and `RESP model=…
+  ms/tokens`, so the request→model routing is visible. `/logs` opens a live
+  overlay tailing the same file (`f` follow, `↑/↓` scroll). `--log` no longer
+  silently starts the TUI.
+- **"allow once" / "always" permissions.** The prompt keeps `[a] allow once`,
+  `[A] always`, `[r] reject`; choosing **always** now persists
+  `behavior.auto_approve_permissions = true` so the per-tool access prompts stop
+  for good instead of re-appearing on every call.
+
+- **OpenAI Responses API adapter** (`ai/responses.rs`). OpenCode Zen/Go serve
+  some models (`muse-spark-*`, `gpt-5*`, `grok-4*`) only via `/responses`;
+  `ai::provider_for_model` routes those to the new streaming adapter (SSE
+  `response.output_text.delta` / `response.output_item.done` function calls /
+  `response.completed` usage), while everything else keeps `/chat/completions`.
+  Verified live: `theta --check-ai` with model `muse-spark-1.3-contributor` and
+  `deepseek-v4.1-flash` both return OK on `opencode-go`.
+
+- **`/model` discovers live models from logged-in providers.** `ai::discovery`
+  owns the provider table (shared with `/login`) and `discover_models` queries
+  exactly the configured providers — those with a stored key, the active
+  provider (env fallback), the active custom endpoint, and local Ollama only
+  when it is the active provider — via
+  `Provider::list_models` — `GET /models` for OpenAI-compatible gateways
+  (including OpenCode Zen/Go), `/v1/models` for Anthropic, `/v1beta/models` for
+  Gemini. Results are **persisted per provider** in
+  `~/.cache/theta/models.json` (keyed by a key fingerprint), so `/model` does
+  not re-fetch; `/login` invalidates only the provider whose key changed. They
+  merge with the built-in catalog (fallback), and the picker refreshes on open
+  and after `/login`. The agent factory clears `base_url` when switching to a
+  named provider so presets win over a stale custom endpoint. The API-key
+  prompt shows no model — models appear in `/model` after the fetch.
+
+- **`/login` mirrors the OpenCode CLI provider list.** `opencode` (OpenCode Zen,
+  `https://opencode.ai/zen/v1`) and `opencode-go` (`…/zen/go/v1`) lead the
+  picker, followed by anthropic/openai/google/xai/groq/deepseek/openrouter/
+  together/fireworks/mistral/cerebras/perplexity/ollama. Choosing a provider
+  stores its key and **activates it immediately** (provider + default model +
+  `ai.api_key_env`, persisted, via `Manager::set_ai`/`reload_credentials`), so
+  no restart is needed. Base URLs live in `OpenAiCompat::preset` (the zen hosts
+  auto-add `x-opencode-session`); `/login <provider> <key>` does the same
+  non-interactively. The custom-endpoint flow still stores `[ai].base_url`.
+
+
+- **OpenCode removed — Theta is the harness.** Deleted `opencode.rs`, the
+  `providers/opencode` SSE adapter, the `[opencode]`/`backend` config, the agy
+  one-shot path and their events/overlays. `manager.rs` is now a local-only
+  bridge; shared value types live in `models.rs`. Users authenticate with the
+  interactive `/login` picker (keys.toml). `--check-ai`, MCP, agents, vision and
+  retries all run on Theta's own loop.
+
+
 - **Pi-level parity push**: named agents (`agent::agents` — build/plan/general/
   explore with per-agent tool sets, prompts, permission presets and delegation);
   the `task` tool takes a `subagent_type`; provider retry/backoff
@@ -208,7 +348,6 @@ a future in-process harness.
   branch summary of the abandoned work first. The local backend records each
   turn into the tree and rebuilds the prompt from the active branch.
 - Queue-or-fork when an agent is busy; forked panes share history.
-- `agy` CLI (Gemini) integration as an alternate one-shot backend.
 - Agent questions (the `ask` tool) with a picker; permission re-fetch on
   reconnect.
 - `Ctrl+Y` copy (OSC 52), mouse text selection, double-`Esc` interrupt,

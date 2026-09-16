@@ -7,14 +7,9 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    pub opencode: OcConfig,
     pub ui: UiConfig,
     pub behavior: Behavior,
-    /// Which harness backend to drive: `"opencode"` (default) or `"local"`
-    /// (Theta's own in-process agent loop).
-    #[serde(default = "default_backend")]
-    pub backend: String,
-    /// Settings for the local backend (LLM provider + model).
+    /// LLM provider + model for Theta's own agent loop.
     pub ai: AiConfig,
     /// Context compaction budgets (local backend).
     pub compaction: CompactionConfig,
@@ -25,9 +20,6 @@ pub struct Config {
     /// sessions until changed.
     #[serde(default)]
     pub last_model: Option<(String, String)>,
-    /// Model used for agy CLI prompts (gemini-3.8-flash-medium etc).
-    #[serde(default = "default_agy_model")]
-    pub agy_model: String,
     /// Active theme name (see src/theme.rs THEMES). Defaults to Theta Night
     /// (Tokyo Night); only a user change rewrites it.
     #[serde(default = "default_theme")]
@@ -53,6 +45,10 @@ pub struct AiConfig {
     pub retry_base_ms: u64,
     /// Per-request timeout in seconds (0 = no timeout).
     pub timeout_secs: u64,
+    /// Reasoning effort for reasoning models (`minimal`/`low`/`medium`/`high`);
+    /// empty keeps the provider default. Lower is faster.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub reasoning_effort: String,
 }
 
 /// One stdio MCP server (Model Context Protocol).
@@ -85,6 +81,10 @@ pub struct CompactionConfig {
     pub reserve_tokens: u64,
     /// Recent tokens kept verbatim (not summarized).
     pub keep_recent_tokens: u64,
+    /// Model used to write summaries (fast/cheap). Empty = the session model,
+    /// bounded by a small output cap so it stays quick either way.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub model: String,
     /// Per-model overrides keyed by `provider/model` or bare `model`.
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub model_overrides: HashMap<String, ModelCompaction>,
@@ -103,23 +103,10 @@ impl Default for CompactionConfig {
             enabled: true,
             reserve_tokens: 16_384,
             keep_recent_tokens: 20_000,
+            model: String::new(),
             model_overrides: HashMap::new(),
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct OcConfig {
-    /// Binary to launch for headless servers.
-    pub binary: String,
-    /// First port tried when hosting a per-directory server.
-    pub port_base: u16,
-    /// Milliseconds to wait for a spawned server to become healthy.
-    pub startup_timeout_ms: u64,
-    /// Leave servers running on exit so the next launch reuses them and
-    /// connects near-instantly instead of paying the cold-start cost again.
-    pub keep_alive: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,20 +132,11 @@ pub struct Behavior {
     /// Ring the bell / send a desktop notification when a background agent
     /// finishes or needs attention.
     pub notify: bool,
-    /// Local-backend tool permission mode: `ask` (default), `allow`, `deny`,
-    /// or `read-only`.
+    /// Local-backend tool permission mode: `allow` (default, like OpenCode),
+    /// `ask`, `deny`, or `read-only`. In `ask`, reads inside the working
+    /// directory are auto-allowed; mutations, commands, and out-of-tree reads
+    /// prompt.
     pub local_permissions: String,
-}
-
-impl Default for OcConfig {
-    fn default() -> Self {
-        Self {
-            binary: "opencode".into(),
-            port_base: 4310,
-            startup_timeout_ms: 90_000,
-            keep_alive: true,
-        }
-    }
 }
 
 impl Default for UiConfig {
@@ -178,17 +156,14 @@ impl Default for Behavior {
             history_limit: 200,
             confirm_quit: true,
             notify: true,
-            local_permissions: "ask".into(),
+            // OpenCode-style permissive default: tools run without prompting.
+            local_permissions: "allow".into(),
         }
     }
 }
 
 fn default_theme() -> String {
     "theta-night".to_string()
-}
-
-fn default_backend() -> String {
-    "opencode".to_string()
 }
 
 impl Default for AiConfig {
@@ -201,26 +176,20 @@ impl Default for AiConfig {
             max_retries: 3,
             retry_base_ms: 500,
             timeout_secs: 300,
+            reasoning_effort: String::new(),
         }
     }
-}
-
-fn default_agy_model() -> String {
-    "gemini-3.8-flash-medium".to_string()
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            opencode: OcConfig::default(),
             ui: UiConfig::default(),
             behavior: Behavior::default(),
-            backend: default_backend(),
             ai: AiConfig::default(),
             compaction: CompactionConfig::default(),
             keys: HashMap::new(),
             theme: "theta-night".into(),
-            agy_model: "gemini-3.8-flash-medium".into(),
             last_model: None,
             mcp: HashMap::new(),
         }
@@ -261,6 +230,11 @@ impl Config {
         if std::env::var("THETA_AI_API_KEY").map(|v| !v.trim().is_empty()).unwrap_or(false) {
             self.ai.api_key_env = "THETA_AI_API_KEY".into();
         }
+        if let Ok(v) = std::env::var("THETA_AI_REASONING_EFFORT") {
+            if !v.trim().is_empty() {
+                self.ai.reasoning_effort = v;
+            }
+        }
     }
 
     pub fn save_default_if_missing() -> Result<()> {
@@ -285,5 +259,15 @@ impl Config {
             std::fs::write(&path, toml::to_string_pretty(self)?)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permissions_default_to_permissive_like_opencode() {
+        assert_eq!(Behavior::default().local_permissions, "allow");
     }
 }

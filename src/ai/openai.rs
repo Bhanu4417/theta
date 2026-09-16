@@ -23,6 +23,8 @@ pub struct OpenAiCompat {
     client: reqwest::Client,
     /// Extra request headers (e.g. a gateway session id).
     headers: Vec<(String, String)>,
+    /// Total per-request timeout; `None` means no limit.
+    timeout: Option<std::time::Duration>,
 }
 
 impl OpenAiCompat {
@@ -32,12 +34,13 @@ impl OpenAiCompat {
             .build()
             .expect("reqwest client");
         let base_url = base_url.into().trim_end_matches('/').to_string();
+        // Some gateways require a per-request session id; add one only when the
+        // host needs it (transport quirk, not a provider identity).
         let mut headers = Vec::new();
-        // The OpenCode "zen" gateway routes per session and requires this.
         if base_url.contains("opencode.ai/zen") {
             headers.push(("x-opencode-session".to_string(), session_id()));
         }
-        Self { base_url, api_key, client, headers }
+        Self { base_url, api_key, client, headers, timeout: None }
     }
 
     /// Add/replace an extra request header.
@@ -48,7 +51,15 @@ impl OpenAiCompat {
 
     /// Standard preset for a well-known provider id, or `None` if unknown.
     pub fn preset(provider: &str, api_key: Option<String>) -> Option<Self> {
-        let base = match provider {
+        Self::preset_base(provider).map(|base| Self::new(base, api_key))
+    }
+
+    /// Base URL for a well-known provider id, or `None` if unknown.
+    pub fn preset_base(provider: &str) -> Option<&'static str> {
+        Some(match provider {
+            // OpenCode's own gateways.
+            "opencode" | "opencode-zen" | "zen" => "https://opencode.ai/zen/v1",
+            "opencode-go" | "go" => "https://opencode.ai/zen/go/v1",
             "openai" => "https://api.openai.com/v1",
             "xai" | "grok" => "https://api.x.ai/v1",
             "groq" => "https://api.groq.com/openai/v1",
@@ -56,10 +67,43 @@ impl OpenAiCompat {
             "openrouter" => "https://openrouter.ai/api/v1",
             "together" => "https://api.together.xyz/v1",
             "fireworks" => "https://api.fireworks.ai/inference/v1",
+            "mistral" => "https://api.mistral.ai/v1",
+            "cerebras" => "https://api.cerebras.ai/v1",
+            "perplexity" => "https://api.perplexity.ai",
             "ollama" => "http://localhost:11434/v1",
             _ => return None,
-        };
-        Some(Self::new(base, api_key))
+        })
+    }
+
+    /// List model ids from `{base_url}/models`. OpenAI-compatible gateways all
+    /// expose this, so it covers OpenAI/xAI/Groq/OpenAI Zen and local servers.
+    pub async fn fetch_models(&self) -> Result<Vec<String>, ProviderError> {
+        let url = format!("{}/models", self.base_url);
+        let mut req = self.client.get(&url).timeout(std::time::Duration::from_secs(20));
+        if let Some(k) = &self.api_key {
+            req = req.bearer_auth(k);
+        }
+        for (k, v) in &self.headers {
+            req = req.header(k, v);
+        }
+        let resp = req.send().await.map_err(net)?;
+        let status = resp.status();
+        let text = resp.text().await.map_err(net)?;
+        if !status.is_success() {
+            return Err(ProviderError::Protocol(format!("HTTP {status}: {}", text.trim())));
+        }
+        let v: Value =
+            serde_json::from_str(&text).map_err(|e| ProviderError::Protocol(e.to_string()))?;
+        let arr = v
+            .get("data")
+            .or_else(|| v.get("models"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        Ok(arr
+            .iter()
+            .filter_map(|m| m.get("id").and_then(Value::as_str).map(str::to_string))
+            .collect())
     }
 }
 
@@ -230,6 +274,18 @@ impl Provider for OpenAiCompat {
         "openai-compat"
     }
 
+    fn set_timeout(&mut self, secs: u64) {
+        self.timeout = (secs > 0).then(|| std::time::Duration::from_secs(secs));
+    }
+
+    fn list_models<'a>(
+        &'a self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<String>, ProviderError>> + Send + 'a>,
+    > {
+        Box::pin(self.fetch_models())
+    }
+
     fn stream<'a>(
         &'a self,
         request: ChatRequest,
@@ -244,6 +300,9 @@ impl Provider for OpenAiCompat {
                 .post(format!("{}/chat/completions", self.base_url))
                 .header("Accept", "text/event-stream")
                 .json(&body);
+            if let Some(t) = self.timeout {
+                rb = rb.timeout(t);
+            }
             if let Some(key) = &self.api_key {
                 rb = rb.bearer_auth(key);
             }
@@ -340,6 +399,7 @@ mod tests {
             }],
             temperature: Some(0.2),
             max_tokens: Some(1024),
+            ..Default::default()
         };
         let b = build_body(&req, true);
         assert_eq!(b["stream"], true);
@@ -394,10 +454,39 @@ mod tests {
     }
 
     #[test]
+    fn set_timeout_is_applied_and_zero_disables() {
+        let mut p = OpenAiCompat::new("https://example.test/v1", None);
+        p.set_timeout(42);
+        assert_eq!(p.timeout, Some(std::time::Duration::from_secs(42)));
+        p.set_timeout(0);
+        assert!(p.timeout.is_none());
+    }
+
+    #[test]
     fn presets_cover_common_gateways() {
-        for p in ["openai", "xai", "grok", "groq", "deepseek", "openrouter", "ollama"] {
+        for p in [
+            "opencode",
+            "opencode-go",
+            "openai",
+            "xai",
+            "grok",
+            "groq",
+            "deepseek",
+            "openrouter",
+            "ollama",
+        ] {
             assert!(OpenAiCompat::preset(p, None).is_some(), "{p} preset");
         }
         assert!(OpenAiCompat::preset("nope", None).is_none());
+    }
+
+    #[test]
+    fn opencode_presets_use_zen_endpoints_and_session_header() {
+        let zen = OpenAiCompat::preset("opencode", None).unwrap();
+        assert_eq!(zen.base_url, "https://opencode.ai/zen/v1");
+        let go = OpenAiCompat::preset("opencode-go", None).unwrap();
+        assert_eq!(go.base_url, "https://opencode.ai/zen/go/v1");
+        // The zen gateways require a per-request session id.
+        assert!(go.headers.iter().any(|(k, _)| k == "x-opencode-session"));
     }
 }

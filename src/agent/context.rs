@@ -451,9 +451,15 @@ pub fn summarization_user_message(
     out
 }
 
-/// Summary token cap: `min(0.8 * reserveTokens, model max)` (Pi).
+/// Hard cap on the summary output. A structured summary never needs the full
+/// `reserveTokens` budget; without a cap, reasoning models can grind for
+/// minutes emitting hidden reasoning, which made `/compact` feel hung. Keeping
+/// this small makes compaction quick for **every** model.
+pub const SUMMARY_MAX_TOKENS_CAP: u64 = 4_096;
+
+/// Summary token cap: `min(0.8 * reserveTokens, SUMMARY_MAX_TOKENS_CAP)`.
 pub fn summary_max_tokens(reserve_tokens: u64) -> u64 {
-    (reserve_tokens * 4 / 5).max(256)
+    (reserve_tokens * 4 / 5).min(SUMMARY_MAX_TOKENS_CAP).max(256)
 }
 
 // ---------------------------------------------------------------------------
@@ -530,6 +536,62 @@ pub fn prepare(messages: &[ChatMessage], settings: &CompactionSettings) -> Optio
     })
 }
 
+/// Make the message list valid for providers: every assistant `tool_call`
+/// must be followed by a matching tool output, and orphan tool outputs are
+/// dropped. An interrupted turn can otherwise leave a dangling call that makes
+/// every later request fail (OpenAI chat and Responses both reject it).
+pub fn repair_tool_calls(messages: &mut Vec<ChatMessage>) {
+    let mut declared: HashMap<String, bool> = HashMap::new();
+    for m in messages.iter() {
+        if m.role == Role::Assistant {
+            for c in &m.tool_calls {
+                if !c.id.is_empty() {
+                    declared.entry(c.id.clone()).or_insert(false);
+                }
+            }
+        }
+    }
+    for m in messages.iter() {
+        if m.role == Role::Tool {
+            if let Some(id) = &m.tool_call_id {
+                if let Some(answered) = declared.get_mut(id) {
+                    *answered = true;
+                }
+            }
+        }
+    }
+
+    let mut out: Vec<ChatMessage> = Vec::with_capacity(messages.len());
+    for m in messages.drain(..) {
+        if m.role == Role::Tool {
+            let known = m
+                .tool_call_id
+                .as_ref()
+                .map(|id| declared.contains_key(id))
+                .unwrap_or(false);
+            if !known {
+                continue; // orphan output with no call
+            }
+        }
+        if m.role == Role::Assistant && !m.tool_calls.is_empty() {
+            let calls = m.tool_calls.clone();
+            out.push(m);
+            for c in calls {
+                if declared.get(&c.id) == Some(&false) {
+                    declared.insert(c.id.clone(), true);
+                    out.push(ChatMessage::tool_result(
+                        c.id,
+                        "tool call was not completed (interrupted)",
+                    ));
+                }
+            }
+            continue;
+        }
+        out.push(m);
+    }
+    *messages = out;
+}
+
 /// Replace `messages[system_prefix..first_kept]` with a summary message,
 /// preserving the leading system prefix and the kept tail.
 pub fn apply_summary(messages: &mut Vec<ChatMessage>, first_kept: usize, summary: &str) {
@@ -580,6 +642,43 @@ mod tests {
     }
     fn call(id: &str, name: &str, args: &str) -> ToolCall {
         ToolCall { id: id.into(), name: name.into(), arguments: args.into() }
+    }
+
+    #[test]
+    fn repair_adds_missing_tool_outputs_and_drops_orphans() {
+        // Interrupted turn: assistant asked for a tool but no output recorded.
+        let mut msgs = vec![
+            ChatMessage::system("sys"),
+            user("q"),
+            ChatMessage::assistant("", vec![call("c1", "bash", "{}")]),
+        ];
+        repair_tool_calls(&mut msgs);
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[3].role, Role::Tool);
+        assert_eq!(msgs[3].tool_call_id.as_deref(), Some("c1"));
+        // A second pass is idempotent.
+        let before = msgs.clone();
+        repair_tool_calls(&mut msgs);
+        assert_eq!(msgs, before);
+
+        // Orphan tool output (no matching call) is removed.
+        let mut msgs = vec![
+            ChatMessage::system("sys"),
+            user("q"),
+            ChatMessage::tool_result("ghost", "x"),
+        ];
+        repair_tool_calls(&mut msgs);
+        assert_eq!(msgs.len(), 2);
+
+        // A complete pair is untouched.
+        let mut msgs = vec![
+            user("q"),
+            ChatMessage::assistant("", vec![call("c1", "read", "{}")]),
+            ChatMessage::tool_result("c1", "data"),
+        ];
+        let before = msgs.clone();
+        repair_tool_calls(&mut msgs);
+        assert_eq!(msgs, before);
     }
 
     #[test]
@@ -689,7 +788,10 @@ mod tests {
         let initial = summarization_user_message("[User]: hi", None, None);
         assert!(initial.contains("structured context checkpoint"));
         assert!(!initial.contains("previous-summary"));
-        assert_eq!(summary_max_tokens(16_384), 13_107);
+        // Bounded by SUMMARY_MAX_TOKENS_CAP so compaction stays fast.
+        assert_eq!(summary_max_tokens(16_384), SUMMARY_MAX_TOKENS_CAP);
+        // A small reserve still scales down (never below 256).
+        assert_eq!(summary_max_tokens(256), 256);
     }
 
     #[test]

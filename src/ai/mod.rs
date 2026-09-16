@@ -7,8 +7,10 @@
 
 pub mod anthropic;
 pub mod catalog;
+pub mod discovery;
 pub mod google;
 pub mod openai;
+pub mod responses;
 
 use crate::providers::ProviderError;
 use std::pin::Pin;
@@ -139,6 +141,10 @@ pub struct ChatRequest {
     pub tools: Vec<ToolSpec>,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
+    /// Reasoning effort for reasoning models (`minimal`/`low`/`medium`/`high`).
+    /// Only adapters that understand it (OpenAI Responses) map it; others
+    /// ignore it so a stray value can never break a request.
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -179,6 +185,79 @@ pub trait Provider: Send + Sync {
         request: ChatRequest,
         on_event: &'a mut (dyn FnMut(ProviderEvent) + Send),
     ) -> Pin<Box<dyn std::future::Future<Output = Result<AssistantTurn, ProviderError>> + Send + 'a>>;
+
+    /// List the model ids this credential can use. The default is empty, so a
+    /// provider without a listing endpoint simply contributes nothing.
+    fn list_models<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<String>, ProviderError>> + Send + 'a>>
+    {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    /// Apply a total per-request timeout (0 = no limit). Providers that do not
+    /// override this ignore the setting.
+    fn set_timeout(&mut self, _secs: u64) {}
+}
+
+/// Build the provider for an explicit `provider_id` + `base_url` + key. A
+/// non-empty `base_url` wins (custom/OpenAI-compatible endpoint); otherwise the
+/// provider id selects a native adapter or a built-in OpenAI-compatible preset.
+pub fn provider_for(
+    provider_id: &str,
+    base_url: &str,
+    key: Option<String>,
+) -> Result<Box<dyn Provider>, ProviderError> {
+    let id = provider_id.to_ascii_lowercase();
+    if !base_url.trim().is_empty() {
+        return Ok(Box::new(openai::OpenAiCompat::new(base_url, key)));
+    }
+    match id.as_str() {
+        "anthropic" | "claude" => Ok(Box::new(anthropic::Anthropic::new(key))),
+        "google" | "gemini" => Ok(Box::new(google::Google::new(key))),
+        _ => openai::OpenAiCompat::preset(&id, key)
+            .map(|p| Box::new(p) as Box<dyn Provider>)
+            .ok_or_else(|| {
+                ProviderError::Unsupported(format!(
+                    "unknown ai.provider '{provider_id}' (use anthropic/google/openai/xai/… or set ai.base_url)"
+                ))
+            }),
+    }
+}
+
+/// Some OpenCode Zen/Go models are only served through the OpenAI Responses
+/// API, not `/chat/completions`. Route those by model family.
+pub fn needs_responses_api(provider_id: &str, model: &str) -> bool {
+    let id = provider_id.to_ascii_lowercase();
+    let zen = matches!(
+        id.as_str(),
+        "opencode" | "opencode-zen" | "zen" | "opencode-go" | "go"
+    );
+    if !zen {
+        return false;
+    }
+    let m = model.to_ascii_lowercase();
+    m.starts_with("muse-spark") || m.starts_with("gpt-5") || m.starts_with("grok-4")
+}
+
+/// Like [`provider_for`], but picks the Responses API for models that need it.
+pub fn provider_for_model(
+    provider_id: &str,
+    base_url: &str,
+    key: Option<String>,
+    model: &str,
+) -> Result<Box<dyn Provider>, ProviderError> {
+    if needs_responses_api(provider_id, model) {
+        let base = if base_url.trim().is_empty() {
+            openai::OpenAiCompat::preset_base(&provider_id.to_ascii_lowercase()).unwrap_or("")
+        } else {
+            base_url
+        };
+        if !base.is_empty() {
+            return Ok(Box::new(responses::Responses::new(base, key)));
+        }
+    }
+    provider_for(provider_id, base_url, key)
 }
 
 /// Transient failures worth retrying (network, gateway, upstream overload).
@@ -253,6 +332,24 @@ mod tests {
         assert_eq!(a.tool_calls.len(), 1);
         let t = ChatMessage::tool_result("1", "ok");
         assert_eq!(t.tool_call_id.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn responses_api_routing_by_model_family() {
+        assert!(needs_responses_api("opencode-go", "muse-spark-1.3-contributor"));
+        assert!(needs_responses_api("opencode", "gpt-5.6-luna"));
+        assert!(needs_responses_api("opencode-go", "grok-4.6"));
+        assert!(!needs_responses_api("opencode-go", "deepseek-v4.1-flash"));
+        assert!(!needs_responses_api("opencode-go", "glm-5.2"));
+        assert!(!needs_responses_api("openai", "muse-spark-1.3-contributor"));
+    }
+
+    #[test]
+    fn provider_for_model_picks_the_right_adapter() {
+        let p = provider_for_model("opencode-go", "", None, "muse-spark-1.3-contributor").unwrap();
+        assert_eq!(p.id(), "openai-responses");
+        let p = provider_for_model("opencode-go", "", None, "deepseek-v4.1-flash").unwrap();
+        assert_eq!(p.id(), "openai-compat");
     }
 
     #[test]

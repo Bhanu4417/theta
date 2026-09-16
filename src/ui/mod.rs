@@ -121,26 +121,6 @@ pub fn render(f: &mut ratatui::Frame, app: &mut App) {
             });
             overlays::render_theme_picker(f, app, area, anchor);
         }
-        Overlay::AgyModel => {
-            let anchor = app.focused().and_then(|sess| {
-                let rects = app.layout_rects(app.last_body_area)?;
-                let (_, pr) = rects.iter().find(|(sid, _)| *sid == sess.id)?;
-                let inner = Rect {
-                    x: pr.x + 1,
-                    y: pr.y + 1,
-                    width: pr.width.saturating_sub(2),
-                    height: pr.height.saturating_sub(2),
-                };
-                let ih = pane::input_height(sess, inner.width as usize, inner.height as usize);
-                Some(Rect {
-                    x: inner.x + 1,
-                    y: inner.y + inner.height.saturating_sub(ih),
-                    width: inner.width.saturating_sub(2),
-                    height: ih,
-                })
-            });
-            overlays::render_agy_model_picker(f, app, area, anchor);
-        }
         Overlay::ModelPicker | Overlay::AgentPicker => {
             // Anchor the picker to the focused pane's chat box.
             let anchor = app.focused().and_then(|sess| {
@@ -189,6 +169,27 @@ pub fn render(f: &mut ratatui::Frame, app: &mut App) {
             });
             overlays::render_rewind(f, app, area, anchor);
         }
+        Overlay::Login => {
+            let anchor = app.focused().and_then(|sess| {
+                let rects = app.layout_rects(app.last_body_area)?;
+                let (_, pr) = rects.iter().find(|(sid, _)| *sid == sess.id)?;
+                let inner = Rect {
+                    x: pr.x + 1,
+                    y: pr.y + 1,
+                    width: pr.width.saturating_sub(2),
+                    height: pr.height.saturating_sub(2),
+                };
+                let ih = pane::input_height(sess, inner.width as usize, inner.height as usize);
+                Some(Rect {
+                    x: inner.x + 1,
+                    y: inner.y + inner.height.saturating_sub(ih),
+                    width: inner.width.saturating_sub(2),
+                    height: ih,
+                })
+            });
+            overlays::render_login(f, app, area, anchor);
+        }
+        Overlay::Logs => overlays::render_logs(f, app, area),
         Overlay::None => {}
     }
 }

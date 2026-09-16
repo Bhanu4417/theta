@@ -41,6 +41,18 @@ fn surface(f: &mut ratatui::Frame, area: Rect, title: Line<'static>) -> Rect {
     inner
 }
 
+/// Like [`surface`] but borderless: just a floating background patch. Used
+/// where a box would crowd the content (e.g. API-key entry).
+fn surface_plain(f: &mut ratatui::Frame, area: Rect) -> Rect {
+    let block = Block::default()
+        .style(Style::default().bg(pal().bg_float))
+        .padding(Padding::new(1, 1, 0, 0));
+    let inner = block.inner(area);
+    f.render_widget(Clear, area);
+    f.render_widget(block, area);
+    inner
+}
+
 /// Style-preserving background patch for spans.
 trait SpanExt {
     fn patch(self, style: Style) -> Self;
@@ -724,92 +736,6 @@ pub fn render_agent_picker(
         f.set_cursor_position((cx, rect.y));
     }
 }
-
-pub fn render_agy_model_picker(
-    f: &mut ratatui::Frame,
-    app: &App,
-    screen: Rect,
-    anchor: Option<Rect>,
-) {
-    let models = &app.agy_models;
-    let visible = models.len().min(8).max(1);
-    let h = (visible + 1) as u16;
-    let rect = match anchor {
-        Some(r) => Rect {
-            x: r.x,
-            y: r.y.saturating_sub(h).max(screen.y + 1),
-            width: r.width.min(52),
-            height: h,
-        },
-        None => centered_rect(40, h, screen),
-    };
-    if rect.width < 12 || rect.height < 2 {
-        return;
-    }
-    let bg = Style::default().bg(pal().bg_float);
-    let w = rect.width as usize;
-    let mut head = vec![
-        Span::styled("  ".to_string(), bg),
-        Span::styled(format!("{} ", P_SYMBOL), theme::bold(pal().cyan)).patch(bg),
-        Span::styled(
-            if models.is_empty() {
-                "loading agy models…".to_string()
-            } else {
-                "agy models".to_string()
-            },
-            theme::bold(pal().fg),
-        )
-        .patch(bg),
-    ];
-    let used: usize = head.iter().map(|x| x.content.chars().count()).sum();
-    if used < w {
-        head.push(Span::styled(" ".repeat(w - used), bg));
-    }
-    f.render_widget(
-        Paragraph::new(Line::from(head)),
-        Rect { x: rect.x, y: rect.y, width: rect.width, height: 1 },
-    );
-    let sel = app.agy_ui.selected.min(models.len().saturating_sub(1));
-    let offset = window_offset(sel, models.len(), visible as usize);
-    for (row, i) in (offset..models.len()).take(visible as usize).enumerate() {
-        let Some((name, desc)) = models.get(i) else { continue };
-        let is_sel = i == sel;
-        let is_current = *name == app.cfg.agy_model;
-        let mark = if is_current { "● " } else { "  " };
-        let mut sp = vec![
-            Span::styled("    ".to_string(), bg),
-            Span::styled(mark.to_string(), theme::fg(pal().green)).patch(bg),
-            Span::styled(
-                truncate(name, 26),
-                if is_sel { theme::bold(pal().fg) } else { theme::fg(pal().cyan) },
-            )
-            .patch(bg),
-            Span::styled(
-                format!("  {}", truncate(desc, w - 34)),
-                if is_sel { theme::fg(pal().fg) } else { theme::fg(pal().fg_soft) },
-            )
-            .patch(bg),
-        ];
-        if is_sel {
-            for x in &mut sp {
-                x.style = x.style.bg(pal().selection);
-            }
-        }
-        let used: usize = sp.iter().map(|x| x.content.chars().count()).sum();
-        if used < w {
-            sp.push(Span::styled(" ".repeat(w - used), bg));
-        }
-        f.render_widget(
-            Paragraph::new(Line::from(sp)),
-            Rect { x: rect.x, y: rect.y + 1 + row as u16, width: rect.width, height: 1 },
-        );
-    }
-    if !models.is_empty() {
-        let cx = rect.x + 4;
-        f.set_cursor_position((cx, rect.y));
-    }
-}
-
 pub fn render_session_list(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let order = app.grid.order();
     let h = (order.len().min(12) + 4) as u16 + 1;
@@ -1444,5 +1370,219 @@ pub fn render_rewind(f: &mut ratatui::Frame, app: &App, screen: Rect, anchor: Op
         }
         lines.push(Line::from(spans));
     }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Interactive provider login: pick a provider, then type its API key.
+pub fn render_login(f: &mut ratatui::Frame, app: &App, screen: Rect, anchor: Option<Rect>) {
+    use crate::app::LoginStage;
+    match app.login_ui.stage {
+        LoginStage::Choose => {
+            let n = app.login_ui.providers.len();
+            let visible = n.min(10).max(1);
+            let h = (visible + 2) as u16;
+            let rect = match anchor {
+                Some(r) => Rect {
+                    x: r.x,
+                    y: r.y.saturating_sub(h).max(screen.y + 1),
+                    width: r.width.min(56),
+                    height: h,
+                },
+                None => centered_rect(48, h, screen),
+            };
+            if rect.width < 20 || rect.height < 3 {
+                return;
+            }
+            let inner = surface(
+                f,
+                rect,
+                title_line(vec![
+                    Span::styled("Login", theme::bold(pal().fg)),
+                    Span::styled("  choose a provider", theme::mute()),
+                ]),
+            );
+            if inner.width < 16 || inner.height == 0 {
+                return;
+            }
+            let mut lines: Vec<Line<'static>> = Vec::new();
+            lines.push(Line::from(Span::styled(
+                "  ↑/↓ move · Enter select · Esc cancel",
+                theme::mute(),
+            )));
+            let offset = window_offset(app.login_ui.selected, n, visible);
+            for (i, (_id, label, _env, configured)) in
+                app.login_ui.providers.iter().enumerate().skip(offset)
+            {
+                if lines.len() + 1 >= inner.height as usize {
+                    break;
+                }
+                let is_sel = i == app.login_ui.selected;
+                let mark = if *configured { "●" } else { "○" };
+                let mark_style = if *configured { theme::fg(pal().green) } else { theme::mute() };
+                let mut spans = vec![
+                    Span::styled("  ".to_string(), Style::default()),
+                    Span::styled(format!("{mark} "), mark_style),
+                    Span::styled(
+                        label.clone(),
+                        if is_sel { theme::bold(pal().fg) } else { theme::fg(pal().fg_soft) },
+                    ),
+                    Span::styled(
+                        if *configured { "  (configured)" } else { "" }.to_string(),
+                        theme::mute(),
+                    ),
+                ];
+                if is_sel {
+                    for s in &mut spans {
+                        s.style = s.style.bg(pal().selection);
+                    }
+                }
+                lines.push(Line::from(spans));
+            }
+            f.render_widget(Paragraph::new(lines), inner);
+        }
+        LoginStage::Url => {
+            let h = 3u16;
+            let rect = match anchor {
+                Some(r) => Rect {
+                    x: r.x,
+                    y: r.y.saturating_sub(h).max(screen.y + 1),
+                    width: r.width.min(72),
+                    height: h,
+                },
+                None => centered_rect(56, h, screen),
+            };
+            if rect.width < 20 {
+                return;
+            }
+            let inner = surface(
+                f,
+                rect,
+                title_line(vec![Span::styled(
+                    "Login · custom endpoint".to_string(),
+                    theme::bold(pal().fg),
+                )]),
+            );
+            if inner.width < 10 || inner.height == 0 {
+                return;
+            }
+            let typed = app.login_ui.input.text();
+            let shown = if typed.is_empty() {
+                "OpenAI-compatible base URL…".to_string()
+            } else {
+                typed.to_string()
+            };
+            let style = if typed.is_empty() { theme::dim() } else { theme::fg(pal().fg) };
+            let lines = vec![
+                Line::from(Span::styled(format!("  {shown}"), style)),
+                Line::from(Span::styled(
+                    "  Enter next · Esc back  (e.g. https://host/v1)",
+                    theme::mute(),
+                )),
+            ];
+            f.render_widget(Paragraph::new(lines), inner);
+        }
+        LoginStage::Key => {
+            let h = 3u16;
+            let rect = match anchor {
+                Some(r) => Rect {
+                    x: r.x,
+                    y: r.y.saturating_sub(h).max(screen.y + 1),
+                    width: r.width.min(64),
+                    height: h,
+                },
+                None => centered_rect(52, h, screen),
+            };
+            if rect.width < 20 {
+                return;
+            }
+            let inner = surface_plain(f, rect);
+            if inner.width < 10 || inner.height == 0 {
+                return;
+            }
+            let label = if app.login_ui.provider_label.is_empty() {
+                app.login_ui.provider.clone()
+            } else {
+                app.login_ui.provider_label.clone()
+            };
+            let typed = app.login_ui.input.text();
+            let style = if typed.is_empty() { theme::dim() } else { theme::fg(pal().fg) };
+            let shown = if typed.is_empty() {
+                "paste or type the API key…".to_string()
+            } else {
+                typed.to_string()
+            };
+            let lines = vec![
+                Line::from(vec![
+                    Span::styled("Login · ", theme::mute()),
+                    Span::styled(label, theme::bold(pal().fg)),
+                ]),
+                Line::from(Span::styled(shown, style)),
+                Line::from(Span::styled(
+                    "Enter save · Esc back · empty clears the key",
+                    theme::mute(),
+                )),
+            ];
+            f.render_widget(Paragraph::new(lines), inner);
+        }
+    }
+}
+
+/// `/logs`: live tail of the debug log (requests → provider/model).
+pub fn render_logs(f: &mut ratatui::Frame, app: &App, screen: Rect) {
+    let w = screen.width.saturating_sub(4).min(120).max(20);
+    let h = screen.height.saturating_sub(4).min(28).max(6);
+    let rect = centered_rect_w(w, h, screen);
+    let path = app
+        .log_view
+        .path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "(no log yet)".to_string());
+    let state = if app.log_view.follow { "  following" } else { "  paused" };
+    let title = title_line(vec![
+        Span::styled("Logs".to_string(), theme::bold(pal().fg)),
+        Span::styled(format!("  {state}"), theme::fg(pal().green)),
+    ]);
+    let inner = surface(f, rect, title);
+    let rows = inner.height as usize;
+    if inner.width < 10 || rows == 0 {
+        return;
+    }
+    let log_rows = rows.saturating_sub(1).max(1);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if app.log_view.lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no log lines — start with `theta --log --run`",
+            theme::mute(),
+        )));
+    } else {
+        let max_scroll = app.log_view.lines.len().saturating_sub(log_rows);
+        let offset = if app.log_view.follow {
+            max_scroll
+        } else {
+            app.log_view.scroll.min(max_scroll)
+        };
+        for l in app.log_view.lines.iter().skip(offset).take(log_rows) {
+            let style = if l.contains("RESP") {
+                theme::fg(pal().green)
+            } else if l.contains("REQ") {
+                theme::fg(pal().fg)
+            } else {
+                theme::fg(pal().fg_soft)
+            };
+            lines.push(Line::from(Span::styled(truncate(l, inner.width as usize), style)));
+        }
+    }
+    while lines.len() + 1 < rows {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(
+        truncate(
+            &format!("{path}   ↑/↓ scroll · f follow · Esc close"),
+            inner.width as usize,
+        ),
+        theme::mute(),
+    )));
+    lines.truncate(rows);
     f.render_widget(Paragraph::new(lines), inner);
 }

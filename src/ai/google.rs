@@ -15,6 +15,8 @@ pub struct Google {
     api_key: Option<String>,
     base_url: String,
     client: reqwest::Client,
+    /// Total per-request timeout; `None` means no limit.
+    timeout: Option<std::time::Duration>,
 }
 
 impl Google {
@@ -27,7 +29,34 @@ impl Google {
             api_key,
             base_url: "https://generativelanguage.googleapis.com".into(),
             client,
+            timeout: None,
         }
+    }
+
+    /// List model ids from `{base_url}/v1beta/models` (Gemini ListModels).
+    pub async fn fetch_models(&self) -> Result<Vec<String>, ProviderError> {
+        let url = format!("{}/v1beta/models", self.base_url);
+        let mut req = self.client.get(&url).timeout(std::time::Duration::from_secs(20));
+        if let Some(k) = &self.api_key {
+            req = req.query(&[("key", k)]);
+        }
+        let resp = req.send().await.map_err(net)?;
+        let status = resp.status();
+        let text = resp.text().await.map_err(net)?;
+        if !status.is_success() {
+            return Err(ProviderError::Protocol(format!("HTTP {status}: {}", text.trim())));
+        }
+        let v: Value =
+            serde_json::from_str(&text).map_err(|e| ProviderError::Protocol(e.to_string()))?;
+        Ok(v.get("models")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| m.get("name").and_then(Value::as_str))
+                    .map(|n| n.strip_prefix("models/").unwrap_or(n).to_string())
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 }
 
@@ -188,6 +217,18 @@ impl Provider for Google {
         "google"
     }
 
+    fn set_timeout(&mut self, secs: u64) {
+        self.timeout = (secs > 0).then(|| std::time::Duration::from_secs(secs));
+    }
+
+    fn list_models<'a>(
+        &'a self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<String>, ProviderError>> + Send + 'a>,
+    > {
+        Box::pin(self.fetch_models())
+    }
+
     fn stream<'a>(
         &'a self,
         request: ChatRequest,
@@ -207,6 +248,9 @@ impl Provider for Google {
                 .post(url)
                 .header("Accept", "text/event-stream")
                 .json(&body);
+            if let Some(t) = self.timeout {
+                rb = rb.timeout(t);
+            }
             if let Some(key) = &self.api_key {
                 rb = rb.query(&[("key", key)]);
             }
@@ -264,6 +308,7 @@ mod tests {
             tools: vec![ToolSpec { name: "read".into(), description: "r".into(), parameters: json!({"type":"object"}) }],
             temperature: None,
             max_tokens: None,
+            ..Default::default()
         };
         let b = build_body(&req);
         assert_eq!(b["systemInstruction"]["parts"][0]["text"], "be brief");

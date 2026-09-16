@@ -53,29 +53,35 @@ pub enum PermissionDecision {
 }
 
 pub trait PermissionGate: Send + Sync {
-    fn check(&self, tool: &str, input: &Value) -> PermissionDecision;
+    fn check(&self, tool: &str, input: &Value, cwd: &Path) -> PermissionDecision;
 }
 
 /// Allow everything (the default for the opted-in local backend).
 pub struct AllowAll;
 impl PermissionGate for AllowAll {
-    fn check(&self, _tool: &str, _input: &Value) -> PermissionDecision {
+    fn check(&self, _tool: &str, _input: &Value, _cwd: &Path) -> PermissionDecision {
         PermissionDecision::Allow
     }
 }
 
-/// Ask the user before any tool that could have side effects.
+/// OpenCode-style default: reading the workspace never needs approval — only
+/// tools that mutate files or run commands (and reads *outside* the working
+/// directory) ask.
 pub struct AskGate;
 impl PermissionGate for AskGate {
-    fn check(&self, _tool: &str, _input: &Value) -> PermissionDecision {
-        PermissionDecision::Ask
+    fn check(&self, tool: &str, input: &Value, cwd: &Path) -> PermissionDecision {
+        if read_within(tool, input, cwd) {
+            PermissionDecision::Allow
+        } else {
+            PermissionDecision::Ask
+        }
     }
 }
 
 /// Deny everything.
 pub struct DenyAll;
 impl PermissionGate for DenyAll {
-    fn check(&self, _tool: &str, _input: &Value) -> PermissionDecision {
+    fn check(&self, _tool: &str, _input: &Value, _cwd: &Path) -> PermissionDecision {
         PermissionDecision::Deny
     }
 }
@@ -83,11 +89,34 @@ impl PermissionGate for DenyAll {
 /// Allow read-only tools, deny anything that mutates the workspace.
 pub struct ReadOnly;
 impl PermissionGate for ReadOnly {
-    fn check(&self, tool: &str, _input: &Value) -> PermissionDecision {
+    fn check(&self, tool: &str, _input: &Value, _cwd: &Path) -> PermissionDecision {
         match tool {
             "read" | "grep" | "glob" | "webfetch" => PermissionDecision::Allow,
             _ => PermissionDecision::Deny,
         }
+    }
+}
+
+/// True for pure reads whose target stays inside `cwd` (no approval needed).
+/// Anything that could mutate, or reads an absolute path outside the project,
+/// falls through to the normal permission flow.
+fn read_within(tool: &str, input: &Value, cwd: &Path) -> bool {
+    match tool {
+        "read" | "grep" | "glob" => {
+            let arg = input
+                .get("path")
+                .and_then(Value::as_str)
+                .or_else(|| input.get("file_path").and_then(Value::as_str))
+                .or_else(|| input.get("filePath").and_then(Value::as_str))
+                .or_else(|| input.get("dir").and_then(Value::as_str));
+            match arg {
+                Some(p) if !p.trim().is_empty() => resolve(cwd, p).starts_with(cwd),
+                // No path means "the working directory", which is in scope.
+                _ => true,
+            }
+        }
+        "webfetch" => true,
+        _ => false,
     }
 }
 
@@ -821,9 +850,31 @@ mod tests {
 
     #[test]
     fn permission_gates() {
-        assert_eq!(AllowAll.check("bash", &json!({})), PermissionDecision::Allow);
-        assert_eq!(ReadOnly.check("read", &json!({})), PermissionDecision::Allow);
-        assert_eq!(ReadOnly.check("bash", &json!({})), PermissionDecision::Deny);
+        let cwd = Path::new("/work/proj");
+        assert_eq!(AllowAll.check("bash", &json!({}), cwd), PermissionDecision::Allow);
+        assert_eq!(ReadOnly.check("read", &json!({}), cwd), PermissionDecision::Allow);
+        assert_eq!(ReadOnly.check("bash", &json!({}), cwd), PermissionDecision::Deny);
+    }
+
+    #[test]
+    fn ask_gate_allows_reads_in_scope_only() {
+        let cwd = Path::new("/work/proj");
+        // Workspace reads never prompt.
+        assert_eq!(
+            AskGate.check("read", &json!({"path": "src/main.rs"}), cwd),
+            PermissionDecision::Allow
+        );
+        assert_eq!(AskGate.check("grep", &json!({"path": "src"}), cwd), PermissionDecision::Allow);
+        assert_eq!(AskGate.check("glob", &json!({}), cwd), PermissionDecision::Allow);
+        assert_eq!(AskGate.check("webfetch", &json!({"url": "https://x"}), cwd), PermissionDecision::Allow);
+        // Reads outside the project and anything mutating still ask.
+        assert_eq!(
+            AskGate.check("read", &json!({"path": "/etc/passwd"}), cwd),
+            PermissionDecision::Ask
+        );
+        assert_eq!(AskGate.check("write", &json!({"path": "a"}), cwd), PermissionDecision::Ask);
+        assert_eq!(AskGate.check("edit", &json!({"path": "a"}), cwd), PermissionDecision::Ask);
+        assert_eq!(AskGate.check("bash", &json!({"command": "ls"}), cwd), PermissionDecision::Ask);
     }
 
     #[test]

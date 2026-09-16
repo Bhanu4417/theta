@@ -1,7 +1,7 @@
 //! Provider-neutral transcript model.
 //!
 //! These are the normalized shapes the UI renders. They are produced by the
-//! active provider adapter (e.g. [`crate::providers::opencode`]) from native
+//! active provider adapter from native
 //! events, so the application never handles provider protocol directly.
 
 use serde::{Deserialize, Serialize};
@@ -179,4 +179,7 @@ pub enum TranscriptUpdate {
     Part(Part),
     /// A part was removed.
     PartRemoved { message_id: String, part_id: String },
+    /// Drop the whole transcript before replaying stored history, so a restore
+    /// never stacks replayed turns on top of the cached ones (duplicates).
+    Reset,
 }
