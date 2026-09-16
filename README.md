@@ -56,6 +56,47 @@ binary. That has consequences you feel every day:
 
 ## Install
 
+**Linux and macOS**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Bhanu4417/theta/main/install.sh | sh
+```
+
+**Windows** (PowerShell)
+
+```powershell
+irm https://raw.githubusercontent.com/Bhanu4417/theta/main/install.ps1 | iex
+```
+
+Both download the release for your platform, **verify its SHA-256**, and install
+the binary. Nothing else is touched. Set `THETA_INSTALL_DIR` to choose where it
+goes (`~/.local/bin` on Linux/macOS, `%LOCALAPPDATA%\Programs\Theta` on
+Windows), or pass `-Version`/`--version` to pin a release.
+
+<details>
+<summary>Other ways to install</summary>
+
+**Prebuilt binary.** Grab the archive for your platform from
+[Releases](https://github.com/Bhanu4417/theta/releases), check it against
+`SHA256SUMS`, and put the binary on your `PATH`.
+
+**cargo-binstall** — same binary, no compile:
+
+```sh
+cargo binstall theta
+```
+
+**Homebrew** — once the tap is published (see `packaging/homebrew/` for the
+one-time setup):
+
+```sh
+brew tap Bhanu4417/tap
+brew install theta
+```
+
+**From source.** Stable Rust **1.88+** is required (a dependency floor, not a
+choice):
+
 ```sh
 git clone https://github.com/Bhanu4417/theta
 cd theta
@@ -63,13 +104,21 @@ cargo build --release
 install -Dm755 target/release/theta ~/.local/bin/theta
 ```
 
-Stable Rust (edition 2021) is the only requirement.
+**Cargo:**
 
-**Platforms.** Linux and macOS are fully supported. Windows builds too — CI
-verifies it on every commit — with one caveat: the `bash` tool and the `!cmd`
-shell escape need a `bash` on your `PATH`, so install Git for Windows or use
-WSL. On Windows, `cargo install --path .` is a convenient alternative to the
-`install` command above.
+```sh
+cargo install --path .
+```
+
+</details>
+
+**Platforms.** Linux (x64, arm64), macOS (Apple Silicon, Intel) and Windows
+(x64) all have prebuilt binaries, and CI builds and tests on all three. One
+Windows caveat: the `bash` tool and the `!cmd` shell escape need a `bash` on
+your `PATH`, so use Git for Windows or WSL.
+
+**Uninstall.** Delete the binary. Your sessions, keys and config live in
+`~/.config/theta` and `~/.local/share/theta` and are left alone.
 
 Then:
 

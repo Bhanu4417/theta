@@ -1,0 +1,153 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and attach artifacts to"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN: theta
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the tag
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          # The version baked into the binary must match the tag, so the
+          # installers and `--version` can never disagree.
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Check the tag matches Cargo.toml
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          if [ "$manifest" != "${{ steps.tag.outputs.version }}" ]; then
+            echo "::error::tag ${{ steps.tag.outputs.version }} != Cargo.toml $manifest"
+            exit 1
+          fi
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="$BIN-${{ matrix.target }}"
+          mkdir -p dist
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cp "target/${{ matrix.target }}/release/$BIN.exe" "dist/$BIN.exe"
+            (cd dist && 7z a -tzip "../$name.zip" "$BIN.exe" >/dev/null)
+            echo "asset=$name.zip" >> "$GITHUB_ENV"
+          else
+            cp "target/${{ matrix.target }}/release/$BIN" "dist/$BIN"
+            chmod +x "dist/$BIN"
+            (cd dist && tar czf "../$name.tar.gz" "$BIN")
+            echo "asset=$name.tar.gz" >> "$GITHUB_ENV"
+          fi
+
+      - name: Checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ matrix.os }}" in
+            windows-*) sha256sum "${{ env.asset }}" > "${{ env.asset }}.sha256" ;;
+            *)         shasum -a 256 "${{ env.asset }}" > "${{ env.asset }}.sha256" ;;
+          esac
+          cat "${{ env.asset }}.sha256"
+
+      # The installers verify this archive by hash, so a failed build must not
+      # reach the release page.
+      - name: Smoke-test the binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            ./dist/$BIN.exe --version
+          else
+            ./dist/$BIN --version
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.asset }}
+          path: |
+            ${{ env.asset }}
+            ${{ env.asset }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Checksums file
+        run: |
+          set -euo pipefail
+          cd artifacts
+          # Combined manifest, so an installer can fetch one file.
+          cat *.sha256 | sort -k2 > ../SHA256SUMS
+          ls -l
+
+      - name: Resolve the tag
+        id: tag
+        run: echo "tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.tag }}"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --title "$tag" --generate-notes
+          fi
+          gh release upload "$tag" artifacts/* SHA256SUMS --clobber

@@ -70,6 +70,16 @@ Key modules:
 - The codebase is intentionally hand-formatted (compact struct literals). It is
   not rustfmt-normalized; match the surrounding style rather than reformatting.
 
+## Packaging
+
+| Path | Purpose |
+| --- | --- |
+| `install.sh` | Linux/macOS installer (`curl \| sh`). Verifies SHA-256; never writes outside the install directory. |
+| `install.ps1` | Windows installer (`irm \| iex`), same guarantees. |
+| `.github/workflows/release.yml` | Builds and publishes per-platform binaries on a `v*` tag. |
+| `.github/workflows/ci.yml` | Also runs both installers against a locally built release, so a broken installer fails CI. |
+| `packaging/homebrew/` | Homebrew formula and updater. |
+
 ## Build and test
 
 ```sh

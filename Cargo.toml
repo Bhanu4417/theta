@@ -2,7 +2,16 @@
 name = "theta"
 version = "0.1.0"
 edition = "2021"
+# Floor imposed by dependencies (darling/icu via syntect declare 1.88).
+rust-version = "1.88"
 description = "Theta — a multi-session tiled terminal workspace for coding agents"
+license = "MIT"
+repository = "https://github.com/Bhanu4417/theta"
+homepage = "https://github.com/Bhanu4417/theta"
+readme = "README.md"
+keywords = ["tui", "agent", "coding-agent", "cli", "ai"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = ["/.github", "/assets"]
 
 [dependencies]
 ratatui = "0.29"
