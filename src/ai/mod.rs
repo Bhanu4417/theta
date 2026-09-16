@@ -57,14 +57,18 @@ pub struct ChatMessage {
     /// Inline images (vision models).
     #[serde(default)]
     pub images: Vec<ImagePart>,
+    /// Estimated USD cost of this message, from the model catalog. `None` when
+    /// the model's pricing is unknown (never a fake `0.0`).
+    #[serde(default)]
+    pub cost: Option<f64>,
 }
 
 impl ChatMessage {
     pub fn system(text: impl Into<String>) -> Self {
-        Self { role: Role::System, text: text.into(), tool_calls: Vec::new(), tool_call_id: None, tokens: None, images: Vec::new() }
+        Self { role: Role::System, text: text.into(), tool_calls: Vec::new(), tool_call_id: None, tokens: None, images: Vec::new(), cost: None }
     }
     pub fn user(text: impl Into<String>) -> Self {
-        Self { role: Role::User, text: text.into(), tool_calls: Vec::new(), tool_call_id: None, tokens: None, images: Vec::new() }
+        Self { role: Role::User, text: text.into(), tool_calls: Vec::new(), tool_call_id: None, tokens: None, images: Vec::new(), cost: None }
     }
     /// A user message carrying inline images.
     pub fn user_with_images(text: impl Into<String>, images: Vec<ImagePart>) -> Self {
@@ -73,7 +77,7 @@ impl ChatMessage {
         m
     }
     pub fn assistant(text: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
-        Self { role: Role::Assistant, text: text.into(), tool_calls, tool_call_id: None, tokens: None, images: Vec::new() }
+        Self { role: Role::Assistant, text: text.into(), tool_calls, tool_call_id: None, tokens: None, images: Vec::new(), cost: None }
     }
     pub fn tool_result(call_id: impl Into<String>, text: impl Into<String>) -> Self {
         Self {
@@ -83,6 +87,7 @@ impl ChatMessage {
             tool_call_id: Some(call_id.into()),
             tokens: None,
             images: Vec::new(),
+            cost: None,
         }
     }
 }

@@ -163,9 +163,11 @@ it any time with `/model`) and lists recent server sessions to resume.
 
 Like the OpenCode TUI, Theta surfaces live usage: per-session prompt context
 size (`ctx 4%` when the model's context limit is known, raw tokens otherwise)
-and cost on the pane separator, plus the whole-workspace cost in the status
-bar. Thinking shows an animated elapsed timer while the model reasons and a
-quiet `✓ thought for 4.7s` marker afterwards.
+and cost in the pane footer, immediately left of the folder path —
+`ctx 4% · $0.0012 · ~/projects/my-app`. Thinking shows an animated elapsed
+timer while the model reasons and a quiet `✓ thought for 4.7s` marker
+afterwards; the reasoning text itself is not previewed (streaming it made the
+transcript flicker), but it stays searchable with `Ctrl+F`.
 
 ## Configuration
 
@@ -232,8 +234,11 @@ non-interactively (and activates known providers). `THETA_AI_PROVIDER`,
 for a single run (handy for testing). `theta --check-ai [provider…]` sends a
 tiny live request per provider and reports OK/FAIL.
 
-Transient provider failures are retried with exponential backoff
-(`ai.max_retries`, `ai.retry_base_ms`), and every request is bounded by
+Provider round-trips are unlimited by default (`ai.max_turns`, `0` = no cap):
+the model runs until it finishes and `Ctrl+C` interrupts. Set a positive number
+for an automatic safety stop. Transient provider failures are retried with
+exponential backoff (`ai.max_retries`, `ai.retry_base_ms`), and every request is
+bounded by
 `ai.timeout_secs` (default 300, `0` disables) so a stalled gateway can never
 hang a turn or `/compact`. `ai.reasoning_effort` (`minimal`/`low`/`medium`/
 `high`) tunes reasoning models such as `muse-spark`/`gpt-5`/`grok-4`; `high`

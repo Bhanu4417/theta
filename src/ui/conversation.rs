@@ -114,6 +114,16 @@ pub fn build_cache(sess: &SessionState, width: u16, tick: u64) -> Cache {
         for (pi, part) in msg.parts.iter().enumerate() {
             match &part.kind {
                 PartKind::Text { text, synthetic } if !synthetic && !text.trim().is_empty() => {
+                    // While the agent is working, don't render the assistant's
+                    // streamed text: it re-wraps on every token and flickers
+                    // ("the model talking while it thinks"). It appears as soon
+                    // as the turn finishes, when the pane is stable.
+                    if busy
+                        && msg.role == Role::Assistant
+                        && last_user.map(|u| mi > u).unwrap_or(false)
+                    {
+                        continue;
+                    }
                     if !rendered_any {
                         start_block(block_kind.clone(), String::new(), &mut lines, &mut blocks);
                         rendered_any = true;
@@ -192,21 +202,11 @@ pub fn build_cache(sess: &SessionState, width: u16, tick: u64) -> Cache {
                                 theme::fg(pal().fg_dim),
                             ),
                         ]));
-                        // Preview the latest reasoning lines, like the
-                        // OpenCode TUI streams what it is thinking.
-                        let recent: Vec<&str> =
-                            text.lines().rev().take(3).collect::<Vec<_>>();
-                        for rl in recent.into_iter().rev() {
-                            let trimmed: String =
-                                rl.trim().chars().take(w.saturating_sub(8)).collect();
-                            if trimmed.is_empty() {
-                                continue;
-                            }
-                            lines.push(Line::from(Span::styled(
-                                format!("    {trimmed}"),
-                                theme::italic_dim(),
-                            )));
-                        }
+                        // Deliberately no preview of the reasoning text: it
+                        // rewraps on every delta, so a fast-thinking model
+                        // makes the transcript flicker and jump. The spinner
+                        // and timer convey that it is working; the text stays
+                        // in `block_text` so `Ctrl+F` can still find it.
                         block_text.push_str(text);
                     } else if let Some(e) = end {
                         let start_ms = start.unwrap_or(*e);
@@ -829,6 +829,19 @@ pub struct SelRange {
     pub c1: usize,
 }
 
+/// First visible rendered line for a pane: pinned to the bottom while
+/// following, otherwise the stored offset clamped to the content. Shared by
+/// the transcript renderer and the selection mapper so a restored scroll
+/// position means the same thing in both.
+pub fn view_offset(stick_bottom: bool, scroll: usize, total: usize, height: usize) -> usize {
+    let max_off = total.saturating_sub(height);
+    if stick_bottom {
+        max_off
+    } else {
+        scroll.min(max_off)
+    }
+}
+
 /// Render the transcript into `area`, honoring scroll + stick-to-bottom.
 pub fn render(
     f: &mut ratatui::Frame,
@@ -844,12 +857,7 @@ pub fn render(
     let total = cache.lines.len();
     // Like the OpenCode TUI: never scroll past the end — the last line stays
     // anchored to the bottom of the viewport.
-    let max_off = total.saturating_sub(h);
-    let offset = if sess.stick_bottom {
-        max_off
-    } else {
-        sess.scroll.min(max_off)
-    };
+    let offset = view_offset(sess.stick_bottom, sess.scroll, total, h);
     let end = (offset + h).min(total);
     let slice: Vec<Line<'static>> = match sel {
         Some(sel) => cache.lines[offset..end]
@@ -1057,5 +1065,58 @@ mod tests {
         assert!(text
             .lines()
             .any(|l| l.contains("conversation compacted") && l.starts_with('─')), "{text}");
+    }
+
+    #[test]
+    fn live_thinking_shows_a_spinner_but_not_the_reasoning_text() {
+        let mut s = SessionState::new(1, "s".into(), std::path::PathBuf::from("."));
+        s.status = crate::session::SessStatus::Working;
+        let part = Part {
+            id: "r1".into(),
+            message_id: "m1".into(),
+            kind: PartKind::Reasoning {
+                text: "SECRET-REASONING-TEXT".into(),
+                running: true,
+                start: Some(1),
+                end: None,
+            },
+        };
+        let meta = Message {
+            id: "m1".into(),
+            role: TRole::Assistant,
+            error: None,
+            // In flight: this is the message allowed to animate.
+            completed: None,
+            created: None,
+            cost: None,
+            tokens: None,
+            parts: vec![part.clone()],
+        };
+        s.upsert_part(&meta, part);
+        let cache = build_cache(&s, 60, 0);
+        let text = plain(&cache);
+        assert!(text.contains("Thinking"), "spinner still shows: {text}");
+        // The preview rewrapped on every delta and made fast models flicker.
+        assert!(
+            !text.contains("SECRET-REASONING-TEXT"),
+            "reasoning text must not be rendered: {text}"
+        );
+        // It stays in the block text so `Ctrl+F` can still find it.
+        assert!(
+            cache.blocks.iter().any(|b| b.text.contains("SECRET-REASONING-TEXT")),
+            "reasoning stays searchable"
+        );
+    }
+
+    #[test]
+    fn restored_scroll_offset_is_honored_and_clamped() {
+        // A saved offset reopens the pane exactly where the user stopped.
+        assert_eq!(view_offset(false, 40, 200, 20), 40);
+        // Following the bottom stays pinned.
+        assert_eq!(view_offset(true, 0, 200, 20), 180);
+        // A stale offset (smaller window, shorter transcript) clamps instead
+        // of rendering past the end or panicking.
+        assert_eq!(view_offset(false, 999, 200, 20), 180);
+        assert_eq!(view_offset(false, 40, 10, 20), 0);
     }
 }

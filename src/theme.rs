@@ -310,10 +310,6 @@ pub fn bold(c: Color) -> Style {
     Style::default().fg(c).add_modifier(ratatui::style::Modifier::BOLD)
 }
 
-pub fn italic_dim() -> Style {
-    fg(pal().fg_dim).add_modifier(ratatui::style::Modifier::ITALIC)
-}
-
 pub const SPINNER: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
 
 /// Spinner frame for the given tick.

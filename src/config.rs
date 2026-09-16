@@ -45,6 +45,11 @@ pub struct AiConfig {
     pub retry_base_ms: u64,
     /// Per-request timeout in seconds (0 = no timeout).
     pub timeout_secs: u64,
+    /// Maximum provider round-trips (assistant response + its tool calls)
+    /// before the loop stops with a notice. Each tool call consumes one, so a
+    /// real task needs headroom; `0` (the default) means no limit — the model
+    /// runs until it finishes and you interrupt with Ctrl+C, like OpenCode/Pi.
+    pub max_turns: usize,
     /// Reasoning effort for reasoning models (`minimal`/`low`/`medium`/`high`);
     /// empty keeps the provider default. Lower is faster.
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -176,6 +181,9 @@ impl Default for AiConfig {
             max_retries: 3,
             retry_base_ms: 500,
             timeout_secs: 300,
+            // Unlimited: run until the model finishes; Ctrl+C interrupts. Set a
+            // positive number only if you want an automatic safety stop.
+            max_turns: 0,
             reasoning_effort: String::new(),
         }
     }

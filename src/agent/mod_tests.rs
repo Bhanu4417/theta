@@ -344,13 +344,18 @@ async fn permission_gate_denies_side_effects() {
 
 #[tokio::test]
 async fn loop_stops_at_max_turns_instead_of_spinning() {
+    use crate::harness::transcript::PartKind;
+    use crate::harness::TranscriptUpdate;
+
     let dir = std::env::temp_dir();
     // A provider that never stops requesting a tool.
+    // Distinct arguments each round: with identical ones the repeated-failure
+    // guard would (correctly) stop it first, and this test is about the cap.
     let mut turns = Vec::new();
     for i in 0..40 {
         turns.push(AssistantTurn {
             text: String::new(),
-            tool_calls: vec![call(&format!("c{i}"), "read", r#"{"path":"x"}"#)],
+            tool_calls: vec![call(&format!("c{i}"), "read", &format!(r#"{{"path":"x{i}"}}"#))],
             finish: None,
         });
     }
@@ -365,9 +370,26 @@ async fn loop_stops_at_max_turns_instead_of_spinning() {
     agent.run_turn(&mut history, "go", &dir, &mut emit).await.unwrap();
 
     let events = events.lock().unwrap();
-    assert!(events
+    // Hitting the budget is a *notice*, not a hard error: the work so far is
+    // kept and the session stays usable, so the user can just continue.
+    assert!(
+        !events.iter().any(|e| matches!(e, HarnessEvent::SessionError(_))),
+        "the turn limit must not surface as an error"
+    );
+    let told = events.iter().any(|e| match e {
+        HarnessEvent::Transcript(TranscriptUpdate::Part(p)) => matches!(
+            &p.kind,
+            PartKind::Text { text, synthetic: true } if text.contains("max_turns")
+        ),
+        _ => false,
+    });
+    assert!(told, "the user must be told why it stopped");
+    // It stopped at the cap instead of spinning (3 rounds, not 40).
+    let rounds = events
         .iter()
-        .any(|e| matches!(e, HarnessEvent::SessionError(m) if m.contains("without completion"))));
+        .filter(|e| matches!(e, HarnessEvent::ToolStarted { .. }))
+        .count();
+    assert_eq!(rounds, 3, "stops at the cap, got {rounds}");
     assert!(events.last().unwrap() == &HarnessEvent::SessionIdle);
 }
 
@@ -405,6 +427,9 @@ impl Provider for CompactProvider {
                 *self.summarized.lock().unwrap() += 1;
                 let s = "GOAL: finish. PROGRESS: mostly done.".to_string();
                 on_event(ProviderEvent::TextDelta(s.clone()));
+                // Usage on the summarize path feeds the `RESP (summarize)` log
+                // line; emitting it here keeps that arm covered.
+                on_event(ProviderEvent::Usage { input: 1_200, output: 40 });
                 return Ok(AssistantTurn { text: s, tool_calls: vec![], finish: Some(FinishReason::Stop) });
             }
             let t = self.turns.lock().unwrap().pop_front().unwrap_or(AssistantTurn {
@@ -967,4 +992,149 @@ async fn local_message_ids_are_unique_across_turns() {
         ids[0][0], ids[1][0],
         "a later turn must not reuse an earlier message id (it would overwrite the reply)"
     );
+}
+
+#[test]
+fn resp_log_formats_turns_and_summaries_alike() {
+    // A normal turn keeps the exact historical shape.
+    assert_eq!(
+        super::resp_log("", "deepseek-v4.1-flash", 2166, 4, 0, Some((5269, 3))),
+        "RESP model=deepseek-v4.1-flash ms=2166 chars=4 tool_calls=0 tokens=5269/3"
+    );
+    // A compaction summary is distinguishable but still a `RESP` line, so
+    // `/logs` keeps highlighting it (it styles any line containing "RESP").
+    let summary = super::resp_log(" (summarize)", "muse-spark", 4400, 342, 0, Some((1_200, 40)));
+    assert!(summary.starts_with("RESP (summarize)"), "{summary}");
+    assert!(summary.contains("ms=4400") && summary.contains("tokens=1200/40"), "{summary}");
+}
+
+#[test]
+fn resp_log_renders_missing_usage_as_a_dash() {
+    // Providers that never report usage must not fake a token count.
+    let line = super::resp_log("", "m", 10, 0, 2, None);
+    assert!(line.ends_with("tool_calls=2 tokens=-"), "{line}");
+}
+
+/// Always asks for a tool call, so the loop only ends via a limit/guard.
+struct AlwaysToolProvider;
+
+impl Provider for AlwaysToolProvider {
+    fn id(&self) -> &'static str {
+        "always-tool"
+    }
+    fn stream<'a>(
+        &'a self,
+        _request: ChatRequest,
+        _on_event: &'a mut (dyn FnMut(ProviderEvent) + Send),
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<AssistantTurn, ProviderError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            Ok(AssistantTurn {
+                text: String::new(),
+                // A guaranteed failure: no such tool.
+                tool_calls: vec![call("c1", "no_such_tool", r#"{"x":1}"#)],
+                finish: Some(FinishReason::ToolCalls),
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn repeated_failing_tool_call_stops_the_loop_early() {
+    use crate::harness::transcript::PartKind;
+    use crate::harness::TranscriptUpdate;
+
+    // The budget is far larger than the guard, so reaching the guard (not the
+    // limit) is what proves the loop-breaker works.
+    let agent = AgentLoop::new(Box::new(AlwaysToolProvider), "test").with_max_turns(500);
+    let dir = std::env::temp_dir();
+    let mut history = Vec::new();
+    let events = std::sync::Arc::new(Mutex::new(Vec::<HarnessEvent>::new()));
+    let sink = events.clone();
+    let mut emit = move |e: HarnessEvent| sink.lock().unwrap().push(e);
+    agent.run_turn(&mut history, "go", &dir, &mut emit).await.unwrap();
+
+    let evs = events.lock().unwrap();
+    let stopped = evs.iter().any(|e| match e {
+        HarnessEvent::Transcript(TranscriptUpdate::Part(p)) => matches!(
+            &p.kind,
+            PartKind::Text { text, synthetic: true }
+                if text.contains("failed") && text.contains("same arguments")
+        ),
+        _ => false,
+    });
+    assert!(stopped, "a repeated identical failure must stop the loop");
+    // It stopped early, not by exhausting the budget.
+    let rounds = evs
+        .iter()
+        .filter(|e| matches!(e, HarnessEvent::ToolStarted { .. }))
+        .count();
+    assert!(rounds < 10, "should stop after a few repeats, got {rounds}");
+}
+
+#[tokio::test]
+async fn turn_limit_stops_with_a_visible_notice() {
+    use crate::harness::transcript::PartKind;
+    use crate::harness::TranscriptUpdate;
+
+    // Distinct arguments each round, so the repeated-failure guard never fires
+    // and the turn budget is what stops it.
+    struct VaryingProvider {
+        n: Mutex<usize>,
+    }
+    impl Provider for VaryingProvider {
+        fn id(&self) -> &'static str {
+            "varying"
+        }
+        fn stream<'a>(
+            &'a self,
+            _request: ChatRequest,
+            _on_event: &'a mut (dyn FnMut(ProviderEvent) + Send),
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<AssistantTurn, ProviderError>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                let mut n = self.n.lock().unwrap();
+                *n += 1;
+                let args = format!(r#"{{"command":"echo {}"}}"#, *n);
+                Ok(AssistantTurn {
+                    text: String::new(),
+                    tool_calls: vec![call("c1", "bash", &args)],
+                    finish: Some(FinishReason::ToolCalls),
+                })
+            })
+        }
+    }
+
+    let agent = AgentLoop::new(Box::new(VaryingProvider { n: Mutex::new(0) }), "test")
+        .with_max_turns(4);
+    let dir = std::env::temp_dir();
+    let mut history = Vec::new();
+    let events = std::sync::Arc::new(Mutex::new(Vec::<HarnessEvent>::new()));
+    let sink = events.clone();
+    let mut emit = move |e: HarnessEvent| sink.lock().unwrap().push(e);
+    agent.run_turn(&mut history, "go", &dir, &mut emit).await.unwrap();
+
+    let evs = events.lock().unwrap();
+    let noticed = evs.iter().any(|e| match e {
+        HarnessEvent::Transcript(TranscriptUpdate::Part(p)) => matches!(
+            &p.kind,
+            PartKind::Text { text, synthetic: true } if text.contains("max_turns")
+        ),
+        _ => false,
+    });
+    assert!(noticed, "hitting the turn limit must tell the user, not fail silently");
+    // Never a hard error: the session stays usable.
+    assert!(
+        !evs.iter().any(|e| matches!(e, HarnessEvent::SessionError(_))),
+        "the limit is a notice, not an error"
+    );
+    assert!(evs.iter().any(|e| matches!(e, HarnessEvent::SessionIdle)));
+}
+
+#[test]
+fn zero_max_turns_means_no_limit() {
+    let agent = AgentLoop::new(Box::new(AlwaysToolProvider), "test").with_max_turns(0);
+    assert_eq!(agent.max_turns, 0, "0 is the documented 'no limit' value");
 }

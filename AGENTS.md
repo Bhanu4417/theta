@@ -104,6 +104,48 @@ Implemented as a client today; to become a harness without a rewrite:
 Design every new feature against the stable `HarnessEvent` interface.
 
 ## Work log (recent, high-level)
+- **Startup scroll flicker and restore fixed from root.** Previously, opening Theta
+  or switching sessions caused the transcript to start at the top/middle and visibly
+  flicker down to the bottom. Root causes: (1) `LocalProvider::adopt` emitted
+  `TranscriptUpdate::Reset` (wiping the transcript to 0 messages) and then called
+  `replay()`, streaming hundreds of individual `MessageMeta` and `Part` events
+  across multiple frames; each event dirtied the UI, forcing ratatui to render
+  intermediate states growing from message 1 to the bottom. (2) `restore_workspace`
+  and `resume_session` only restored a 50-message cached stub rather than the
+  authoritative session tree. (3) Scrolling down with mouse or PageDown incremented
+  offset but didn't set `stick_bottom = true`, saving a stale offset. Fixed:
+  added `TranscriptUpdate::ReplaceAll(msgs)` and `SessionTree::to_messages()` for
+  atomic history hydration; `restore_workspace` and `resume_session` now preload
+  from the authoritative tree on frame 0; `ReplaceAll` is an idempotent no-op if
+  already hydrated; `stick_bottom` automatically heals when scrolling to the bottom.
+  Tests: `replace_all_transcript_update_is_atomic_and_idempotent`,
+  `tree_to_messages_reconstructs_tools_and_compactions`,
+  `scrolling_down_to_bottom_restores_stick_bottom`,
+  `session_tree_loads_and_converts_to_messages_for_restore`,
+  `list_sessions_skips_short_fillers_and_resolves_directory`.
+  Also improved `/resume` title and directory inference (skips trivial 1-word
+  fillers like "so"/"hi" so substantive prompts appear as titles, and resolves
+  the workspace root from snapshots).
+
+- **Context/cost readout fixed.** `upsert_part_existing` overwrote the message
+  row's `tokens`/`cost`/`completed` with the Part's `None` values, so any part
+  arriving after the usage update blanked the footer's `ctx`/`$` readout.
+  Metadata is now merged (only set when present), and `recompute_metrics` picks
+  the most recent assistant row *that has tokens* so the readout can't blink to
+  0. Test: `a_part_does_not_wipe_recorded_tokens_or_cost`.
+
+- **No mid-task stop, no streaming flicker, scroll restored.** (1) The local
+  loop's turn cap defaulted low (24 in `AgentLoop::new`) and stopped real tasks
+  with "(stopped after N tool rounds…)"; it is now unlimited by default
+  (`[ai] max_turns = 0`, matching OpenCode/Pi — Ctrl+C interrupts), with a
+  positive value available as an explicit safety stop. (2) Streamed **assistant**
+  text was re-wrapped through the markdown renderer on every token, so a fast
+  model flickered; in-flight text (messages after the last user prompt) is now
+  hidden until the turn completes, and the reasoning preview is gone — only the
+  stable spinner + timer show while working. (3) Scroll position is persisted as
+  it changes (`persist_scroll_if_changed` in `on_tick`, throttled) and restored
+  on `--refresh`/restart, so a pane reopens where you left it.
+
 - **`ask` works under permissive permissions; parallel split-turn compaction.**
   The question broker was only wired when `local_permissions = "ask"`, so with
   the new `allow` default every `ask` call failed (`ask: no interactive session

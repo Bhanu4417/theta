@@ -61,7 +61,8 @@ impl AgentLoop {
             model: model.into(),
             system_prompt: default_system_prompt(),
             reasoning_effort: None,
-            max_turns: 24,
+            // Unlimited by default; the caller configures a cap if desired.
+            max_turns: 0,
             compaction: context::CompactionSettings::default(),
             compaction_enabled: true,
             compaction_provider: None,
@@ -115,6 +116,12 @@ impl AgentLoop {
         self
     }
 
+    /// Cap the provider round-trips in one user turn (`0` = no limit).
+    pub fn with_max_turns(mut self, max_turns: usize) -> Self {
+        self.max_turns = max_turns;
+        self
+    }
+
     /// Wire the interactive permission broker (local backend).
     pub fn with_broker(mut self, broker: std::sync::Arc<permissions::Broker>) -> Self {
         self.broker = Some(broker);
@@ -158,6 +165,15 @@ impl AgentLoop {
 
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    /// USD cost for a turn's usage, or `None` when the catalog has no pricing
+    /// for this model. Never guesses: an unknown model reports no cost rather
+    /// than a misleading `$0.0000`.
+    fn cost_for(&self, usage: Option<crate::harness::transcript::TokenUsage>) -> Option<f64> {
+        let u = usage?;
+        let spec = self.catalog.find(&self.model)?;
+        Some(spec.cost(u.input, u.output))
     }
 
     /// Run one user turn to completion, mutating `history` in place and
@@ -243,8 +259,17 @@ impl AgentLoop {
         // from an earlier turn (or a restored session): `upsert_part` matches by
         // id, so a reused `local-0` overwrote an old reply instead of appending.
         let run_id = local_run_id();
+        // Same tool + same arguments failing over and over means the model is
+        // stuck in a retry loop (a failing `ask`, a bad path). Count repeats so
+        // the loop can stop with an explanation instead of burning every turn.
+        let mut failed: std::collections::HashMap<(String, String), usize> =
+            std::collections::HashMap::new();
+        // Last message id seen, so the turn-limit notice can attach to a real
+        // message row instead of inventing one.
+        let mut last_msg_id = String::new();
 
-        for turn in 0..self.max_turns {
+        let turn_limit = if self.max_turns == 0 { usize::MAX } else { self.max_turns };
+        for turn in 0..turn_limit {
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 emit(HarnessEvent::SessionInterrupted);
                 emit(HarnessEvent::SessionIdle);
@@ -290,6 +315,7 @@ impl AgentLoop {
             };
 
             let msg_id = format!("local-{run_id}-{turn}");
+            last_msg_id = msg_id.clone();
             let mut acc_text = String::new();
             let mut acc_reasoning = String::new();
             let mut reasoning_start: Option<i64> = None;
@@ -332,7 +358,18 @@ impl AgentLoop {
                                     output,
                                     ..Default::default()
                                 });
-                                emit(part_meta(&msg_id, input, output));
+                                emit(part_meta(
+                                    &msg_id,
+                                    input,
+                                    output,
+                                    self.cost_for(Some(
+                                        crate::harness::transcript::TokenUsage {
+                                            input,
+                                            output,
+                                            ..Default::default()
+                                        },
+                                    )),
+                                ));
                             }
                             ProviderEvent::Done(_) | ProviderEvent::ToolCall(_) => {}
                         };
@@ -341,14 +378,15 @@ impl AgentLoop {
                     match result {
                         Ok(turn) => {
                             crate::tlog!(
-                                "RESP model={} ms={} chars={} tool_calls={} tokens={}",
-                                request.model,
-                                started.elapsed().as_millis(),
-                                turn.text.chars().count(),
-                                turn.tool_calls.len(),
-                                turn_usage
-                                    .map(|u| format!("{}/{}", u.input, u.output))
-                                    .unwrap_or_else(|| "-".into())
+                                "{}",
+                                resp_log(
+                                    "",
+                                    &request.model,
+                                    started.elapsed().as_millis(),
+                                    turn.text.chars().count(),
+                                    turn.tool_calls.len(),
+                                    turn_usage.map(|u| (u.input, u.output)),
+                                )
                             );
                             // Some providers assemble the answer without
                             // emitting deltas (or emit none we can see). The
@@ -398,8 +436,11 @@ impl AgentLoop {
                 turn_result.text.clone(),
                 turn_result.tool_calls.clone(),
             );
-            // Record real usage so the next context estimate is accurate.
+            // Record real usage so the next context estimate is accurate, and
+            // the catalog-derived cost so the footer can show it live and the
+            // tree can replay it after a restart.
             assistant_msg.tokens = turn_usage;
+            assistant_msg.cost = self.cost_for(turn_usage);
             history.push(assistant_msg.clone());
             journal.push(assistant_msg);
 
@@ -468,15 +509,65 @@ impl AgentLoop {
                     emit(HarnessEvent::SessionIdle);
                     return Ok(());
                 }
-                self.run_tool_call(&msg_id, call, cwd, history, emit, journal, snapshots).await;
+                let ok = self
+                    .run_tool_call(&msg_id, call, cwd, history, emit, journal, snapshots)
+                    .await;
+                // A tool that keeps failing with identical arguments will keep
+                // failing; stop rather than spend the whole turn budget on it.
+                if !ok {
+                    let key = (call.name.clone(), call.arguments.clone());
+                    let n = failed.entry(key).or_insert(0);
+                    *n += 1;
+                    if *n >= MAX_REPEATED_TOOL_FAILURES {
+                        crate::tlog!(
+                            "STOP repeated failing tool {} x{} (turn {})",
+                            call.name,
+                            *n,
+                            turn
+                        );
+                        emit(HarnessEvent::Transcript(TranscriptUpdate::Part(Part {
+                            id: format!("{msg_id}-looped"),
+                            message_id: msg_id.to_string(),
+                            kind: PartKind::Text {
+                                text: format!(
+                                    "(stopped: `{}` failed {} times with the same arguments — \
+                                     it is unlikely to succeed on a retry.)",
+                                    call.name, *n
+                                ),
+                                synthetic: true,
+                            },
+                        })));
+                        emit(HarnessEvent::AssistantFinished);
+                        emit(HarnessEvent::SessionIdle);
+                        return Ok(());
+                    }
+                }
             }
         }
 
         // Safety stop: never loop forever.
-        emit(HarnessEvent::SessionError(format!(
-            "stopped after {} turns without completion",
-            self.max_turns
-        )));
+        crate::tlog!(
+            "STOP hit the {}-turn limit without finishing (model={})",
+            self.max_turns,
+            self.model
+        );
+        let message_id = if last_msg_id.is_empty() {
+            format!("local-{run_id}-limit")
+        } else {
+            last_msg_id
+        };
+        emit(HarnessEvent::Transcript(TranscriptUpdate::Part(Part {
+            id: format!("{message_id}-limit"),
+            message_id,
+            kind: PartKind::Text {
+                text: format!(
+                    "(stopped after {} tool rounds without finishing. Send another message to \
+                     continue, or raise `[ai] max_turns`.)",
+                    self.max_turns
+                ),
+                synthetic: true,
+            },
+        })));
         emit(HarnessEvent::SessionIdle);
         Ok(())
     }
@@ -614,6 +705,10 @@ impl AgentLoop {
         };
         let mut acc = String::new();
         let mut finish: Option<FinishReason> = None;
+        // Assigned on the only path that exits the retry loop (the `Ok` arm),
+        // so it needs no initializer.
+        let usage: Option<(u64, u64)>;
+        let started = std::time::Instant::now();
         crate::tlog!(
             "REQ (summarize) provider={} model={} msgs={}",
             provider.id(),
@@ -624,10 +719,15 @@ impl AgentLoop {
             let mut attempt = 0u32;
             loop {
                 acc.clear();
+                // Per-attempt, so a failed attempt cannot leak usage into a retry.
+                let mut attempt_usage: Option<(u64, u64)> = None;
                 let result = {
                     let mut on_event = |ev: ProviderEvent| match ev {
                         ProviderEvent::TextDelta(t) => acc.push_str(&t),
                         ProviderEvent::Done(f) => finish = Some(f),
+                        ProviderEvent::Usage { input, output } => {
+                            attempt_usage = Some((input, output));
+                        }
                         _ => {}
                     };
                     provider.stream(request.clone(), &mut on_event).await
@@ -640,6 +740,7 @@ impl AgentLoop {
                         if finish.is_none() {
                             finish = turn.finish;
                         }
+                        usage = attempt_usage;
                         break;
                     }
                     Err(e) => {
@@ -650,11 +751,30 @@ impl AgentLoop {
                             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                             continue;
                         }
+                        crate::tlog!(
+                            "ERR (summarize) provider={} model={} msgs={} {e}",
+                            provider.id(),
+                            request.model,
+                            request.messages.len()
+                        );
                         return Err(e);
                     }
                 }
             }
         }
+        // Log the response before validating it, so a summary the provider
+        // returned but we reject (empty) is still visible in `/logs`.
+        crate::tlog!(
+            "{}",
+            resp_log(
+                " (summarize)",
+                &request.model,
+                started.elapsed().as_millis(),
+                acc.chars().count(),
+                0,
+                usage,
+            )
+        );
         // An empty summary must not become a checkpoint (Pi's
         // getSummarizationFailure). A length-truncated one is still useful, so
         // keep it (with a warning) rather than leaving the context uncompacted.
@@ -680,7 +800,8 @@ impl AgentLoop {
         emit: &mut F,
         journal: &mut Vec<ChatMessage>,
         snapshots: &mut Vec<tools::FileSnapshot>,
-    ) where
+    ) -> bool
+    where
         F: FnMut(HarnessEvent),
     {
         // (permission `Ask` is resolved inside via the broker)
@@ -751,12 +872,14 @@ impl AgentLoop {
         })));
         emit(HarnessEvent::ToolFinished { tool: call.name.clone(), ok: outcome.ok });
 
+        let ok = outcome.ok;
         let result_msg = ChatMessage::tool_result(
             call.id.clone(),
             if outcome.output.is_empty() { "(no output)".into() } else { outcome.output },
         );
         history.push(result_msg.clone());
         journal.push(result_msg);
+        ok
     }
 }
 
@@ -804,6 +927,28 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// How many times the same tool + arguments may fail before the loop stops.
+const MAX_REPEATED_TOOL_FAILURES: usize = 3;
+
+/// Format a provider-response log line (`RESP`). Pure so it can be tested and
+/// so a normal turn and a compaction summary log identically: `label` is `""`
+/// for a turn and `" (summarize)"` for compaction.
+pub(crate) fn resp_log(
+    label: &str,
+    model: &str,
+    ms: u128,
+    chars: usize,
+    tool_calls: usize,
+    tokens: Option<(u64, u64)>,
+) -> String {
+    format!(
+        "RESP{label} model={model} ms={ms} chars={chars} tool_calls={tool_calls} tokens={}",
+        tokens
+            .map(|(input, output)| format!("{input}/{output}"))
+            .unwrap_or_else(|| "-".to_string())
+    )
 }
 
 /// Transient failures worth retrying.
@@ -869,14 +1014,14 @@ fn parse_questions(
     ))
 }
 
-fn part_meta(msg_id: &str, input: u64, output: u64) -> HarnessEvent {
+fn part_meta(msg_id: &str, input: u64, output: u64, cost: Option<f64>) -> HarnessEvent {
     HarnessEvent::Transcript(TranscriptUpdate::MessageMeta(Message {
         id: msg_id.to_string(),
         role: TRole::Assistant,
         error: None,
         completed: None,
         created: None,
-        cost: None,
+        cost,
         tokens: Some(TokenUsage { input, output, ..Default::default() }),
         parts: Vec::new(),
     }))

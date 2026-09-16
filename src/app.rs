@@ -548,6 +548,11 @@ pub struct App {
     #[allow(dead_code)]
     pub started: Instant,
     pub last_save: Instant,
+    /// Per-session scroll signature at the last scroll save, so scrolling is
+    /// persisted as it happens — not only on a clean exit.
+    scroll_sig: Vec<(u32, usize, bool)>,
+    /// Timestamp of the last lightweight scroll save (throttles writes).
+    last_scroll_save: Option<Instant>,
     /// Body area (between header and status bar) from the last render pass.
     pub last_body_area: Rect,
     /// Set during render when the grid cannot fit at minimum sizes.
@@ -641,6 +646,8 @@ impl App {
             restored: false,
             started: Instant::now(),
             last_save: Instant::now(),
+            scroll_sig: Vec::new(),
+            last_scroll_save: None,
             last_body_area: Rect::default(),
             too_small: false,
         }
@@ -1885,16 +1892,27 @@ impl App {
         let sessions: Vec<persist::SavedSession> = self
             .sessions
             .iter()
-            .map(|s| persist::SavedSession {
-                name: s.name.clone(),
-                dir: s.dir.to_string_lossy().to_string(),
-                oc_sid: s.oc_sid.clone(),
-                model: s
-                    .model
-                    .as_ref()
-                    .map(|m| (m.provider_id.clone(), m.model_id.clone())),
-                agent: s.agent.clone(),
-                provider: Some(crate::providers::ProviderKind::Local.id().to_string()),
+            .map(|s| {
+                let scroll = if s.stick_bottom {
+                    let total = self.conv_cache.get(&s.id).map(|c| c.lines.len()).unwrap_or(0);
+                    let h = self.pane_view_height();
+                    total.saturating_sub(h) as u64
+                } else {
+                    s.scroll as u64
+                };
+                persist::SavedSession {
+                    name: s.name.clone(),
+                    dir: s.dir.to_string_lossy().to_string(),
+                    oc_sid: s.oc_sid.clone(),
+                    model: s
+                        .model
+                        .as_ref()
+                        .map(|m| (m.provider_id.clone(), m.model_id.clone())),
+                    agent: s.agent.clone(),
+                    provider: Some(crate::providers::ProviderKind::Local.id().to_string()),
+                    scroll,
+                    stick_bottom: s.stick_bottom,
+                }
             })
             .collect();
         let idx = |sid: u32| self.sessions.iter().position(|s| s.id == sid).unwrap_or(0);
@@ -1941,6 +1959,37 @@ impl App {
         }
         let _ = persist::save_transcripts(&cache);
         crate::tlog!("TRANSCRIPT cache saved {} sessions", cache.len());
+    }
+
+    /// Persist only the workspace layout + scroll positions. Cheaper than
+    /// [`Self::save_workspace`], which also rewrites the transcript cache and
+    /// is far too heavy to run on every scroll event.
+    fn save_scroll_state(&mut self) {
+        let _ = persist::save(&self.snapshot());
+        self.last_scroll_save = Some(Instant::now());
+    }
+
+    /// Save scroll positions as they change, so a `/refresh`, a killed
+    /// terminal or a crash doesn't lose the user's place.
+    fn persist_scroll_if_changed(&mut self) {
+        let sig: Vec<(u32, usize, bool)> = self
+            .sessions
+            .iter()
+            .map(|s| (s.id, s.scroll, s.stick_bottom))
+            .collect();
+        if sig == self.scroll_sig {
+            return;
+        }
+        self.scroll_sig = sig;
+        // Throttle the write during a fast wheel scroll; the periodic full save
+        // and the exit save both catch anything skipped here.
+        let due = self
+            .last_scroll_save
+            .map(|t| t.elapsed() >= Duration::from_millis(200))
+            .unwrap_or(true);
+        if due {
+            self.save_scroll_state();
+        }
     }
 
     fn transcript_key(s: &SessionState) -> Option<String> {
@@ -1991,18 +2040,29 @@ impl App {
                     model_id: m.clone(),
                 });
             sess.status = SessStatus::Connecting;
-            // Hydrate from the display cache so the pane is readable instantly;
-            // authoritative history replaces it when it arrives.
+            // Hydrate from the session tree or display cache so the pane is readable instantly
+            // and positioned correctly from frame 1 without needing to replay turns.
             if let Some(oc) = &sess.oc_sid {
-                let key = format!("{}|{}", dir.display(), oc);
-                if let Some(msgs) = transcript_cache.get(&key) {
-                    crate::tlog!("TRANSCRIPT cache hit {} msgs for {}", msgs.len(), key);
-                    sess.messages = msgs.clone();
+                let tree_msgs = crate::tree::SessionTree::sidecar_path(oc)
+                    .and_then(|p| crate::tree::SessionTree::load(&p))
+                    .map(|tree| tree.to_messages(oc))
+                    .filter(|m| !m.is_empty());
+                let msgs = tree_msgs.or_else(|| {
+                    let key = format!("{}|{}", dir.display(), oc);
+                    transcript_cache.get(&key).cloned()
+                });
+                if let Some(msgs) = msgs {
+                    crate::tlog!("TRANSCRIPT loaded {} msgs for {}", msgs.len(), oc);
+                    sess.messages = msgs;
                     sess.recompute_metrics();
-                    sess.stick_bottom = true;
                     sess.dirty = true;
                 }
             }
+            // Reopen where the user stopped scrolling instead of snapping to
+            // the bottom: the saved offset is clamped to the cache length when
+            // the pane renders, so a changed window size is safe.
+            sess.scroll = saved.scroll as usize;
+            sess.stick_bottom = saved.stick_bottom;
             let model = sess.model.clone();
             self.sessions.push(sess);
             new_ids.push(id);
@@ -2671,8 +2731,16 @@ impl App {
             }
             MouseEventKind::ScrollDown => {
                 self.select = None;
+                let h = self.pane_view_height();
+                let sid = self.focused().map(|s| s.id).unwrap_or(0);
+                let total = self.conv_cache.get(&sid).map(|c| c.lines.len()).unwrap_or(0);
+                let bottom = total.saturating_sub(h);
                 if let Some(s) = self.focused_mut() {
                     s.scroll = s.scroll.saturating_add(4);
+                    if s.scroll >= bottom {
+                        s.scroll = bottom;
+                        s.stick_bottom = true;
+                    }
                 }
                 self.dirty = true;
             }
@@ -3128,8 +3196,14 @@ impl App {
             }
             KeyCode::PageDown => {
                 let h = self.pane_view_height();
+                let total = self.conv_cache.get(&sid).map(|c| c.lines.len()).unwrap_or(0);
+                let bottom = total.saturating_sub(h);
                 if let Some(s) = self.session_mut(sid) {
                     s.scroll = s.scroll.saturating_add(h.max(1));
+                    if s.scroll >= bottom {
+                        s.scroll = bottom;
+                        s.stick_bottom = true;
+                    }
                     s.dirty = true;
                 }
                 self.dirty = true;
@@ -3808,7 +3882,7 @@ impl App {
                 .map(|s| crate::models::OcSession {
                     id: s.id,
                     title: s.title,
-                    directory: dir_s.clone(),
+                    directory: s.directory.unwrap_or_else(|| dir_s.clone()),
                     updated_ms: Some(s.updated_ms),
                 })
                 .collect();
@@ -3838,6 +3912,14 @@ impl App {
         let mut sess = SessionState::new(id, name.to_string(), dir.clone());
         sess.oc_sid = Some(oc_sid.clone());
         sess.status = SessStatus::Connecting;
+        if let Some(msgs) = crate::tree::SessionTree::sidecar_path(&oc_sid)
+            .and_then(|p| crate::tree::SessionTree::load(&p))
+            .map(|tree| tree.to_messages(&oc_sid))
+            .filter(|m| !m.is_empty())
+        {
+            sess.messages = msgs;
+            sess.recompute_metrics();
+        }
         self.sessions.push(sess);
         let area = self.pane_area();
         self.grid.insert_session(id, area.width, area.height);
@@ -5321,6 +5403,7 @@ impl App {
             HarnessEvent::FilesChanged | HarnessEvent::BranchChanged => {}
             HarnessEvent::Transcript(update) => {
                 let s = &mut self.sessions[idx];
+                let mut dirty = true;
                 match update {
                     TranscriptUpdate::MessageMeta(msg) => {
                         if msg.role == Role::User {
@@ -5360,8 +5443,23 @@ impl App {
                         s.messages.clear();
                         s.recompute_metrics();
                     }
+                    TranscriptUpdate::ReplaceAll(msgs) => {
+                        if s.messages != msgs {
+                            s.replace_history(msgs);
+                            if s.status == SessStatus::Connecting {
+                                s.status = SessStatus::Idle;
+                            }
+                        } else {
+                            if s.status == SessStatus::Connecting {
+                                s.status = SessStatus::Idle;
+                            }
+                            dirty = false;
+                        }
+                    }
                 }
-                s.dirty = true;
+                if dirty {
+                    s.dirty = true;
+                }
             }
             HarnessEvent::SessionIdle => {
                 let has_queue = !self.sessions[idx].queue.is_empty();
@@ -5626,6 +5724,7 @@ impl App {
         if self.last_save.elapsed() > Duration::from_secs(30) {
             self.save_workspace();
         }
+        self.persist_scroll_if_changed();
 
         // Keep animating while any workspace is active (slider) or a push is
         // in flight (its progress bar needs continuous redraws).
@@ -5911,6 +6010,101 @@ mod harness_tests {
         app.handle_term_event(TermEvent::Paste("leftover".into())).await;
 
         assert_eq!(app.session(10).expect("session").input.text(), "");
+    }
+
+    #[tokio::test]
+    async fn replace_all_transcript_update_is_atomic_and_idempotent() {
+        let mut app = paste_test_app();
+        let mut sess = SessionState::new(1, "s".into(), PathBuf::from("/tmp"));
+        sess.oc_sid = Some("oc-1".into());
+        app.sessions.push(sess);
+
+        let m1 = text_msg("m1", Role::User, Some(10), "hello");
+        let m2 = text_msg("m2", Role::Assistant, Some(20), "world");
+        let msgs = vec![m1, m2];
+
+        // Initial ReplaceAll populates messages and marks session dirty.
+        app.handle_event(AppEvent::Harness {
+            dir: PathBuf::from("/tmp"),
+            oc_sid: "oc-1".into(),
+            event: HarnessEvent::Transcript(TranscriptUpdate::ReplaceAll(msgs.clone())),
+        }).await;
+
+        let s = app.session(1).unwrap();
+        assert_eq!(s.messages.len(), 2);
+        assert_eq!(s.messages[0].id, "m1");
+        assert_eq!(s.messages[1].id, "m2");
+
+        // Clear dirty flag (as render would do)
+        app.session_mut(1).unwrap().dirty = false;
+
+        // An identical ReplaceAll must be a zero-cost no-op: session stays NOT dirty, no redraw.
+        app.handle_event(AppEvent::Harness {
+            dir: PathBuf::from("/tmp"),
+            oc_sid: "oc-1".into(),
+            event: HarnessEvent::Transcript(TranscriptUpdate::ReplaceAll(msgs)),
+        }).await;
+
+        let s = app.session(1).unwrap();
+        assert!(!s.dirty, "identical ReplaceAll must not set dirty flag (no flicker)");
+    }
+
+    #[tokio::test]
+    async fn scrolling_down_to_bottom_restores_stick_bottom() {
+        let mut app = paste_test_app();
+        let mut sess = SessionState::new(1, "s".into(), PathBuf::from("/tmp"));
+        sess.stick_bottom = false;
+        sess.scroll = 20;
+        app.sessions.push(sess);
+        app.focus = 1;
+
+        let cache = crate::ui::conversation::Cache {
+            width: 80,
+            lines: (0..50).map(|_| ratatui::text::Line::from("line")).collect(),
+            blocks: Vec::new(),
+            animating: false,
+            built_at_tick: 0,
+        };
+        app.conv_cache.insert(1, cache);
+        app.last_body_area = ratatui::layout::Rect::new(0, 0, 80, 20);
+
+        let h = app.pane_view_height();
+        let bottom = 50usize.saturating_sub(h);
+
+        // Scroll down past bottom
+        app.session_mut(1).unwrap().scroll = bottom + 10;
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollDown,
+            column: 10,
+            row: 10,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        });
+
+        let s = app.session(1).unwrap();
+        assert!(s.stick_bottom, "stick_bottom must be restored when scrolling to bottom");
+        assert_eq!(s.scroll, bottom, "scroll must be clamped to bottom");
+    }
+
+    #[test]
+    fn session_tree_loads_and_converts_to_messages_for_restore() {
+        let temp_dir = std::env::temp_dir().join(format!("theta-test-restore-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let path = temp_dir.join("ses_test.jsonl");
+
+        let mut tree = crate::tree::SessionTree::new();
+        for i in 0..10 {
+            tree.append(&crate::ai::ChatMessage::user(format!("prompt {i}")));
+            tree.append(&crate::ai::ChatMessage::assistant(format!("response {i}"), vec![]));
+        }
+        std::fs::write(&path, tree.to_jsonl()).unwrap();
+
+        let loaded = crate::tree::SessionTree::load(&path).unwrap();
+        let msgs = loaded.to_messages("ses_test");
+        assert_eq!(msgs.len(), 20);
+        assert_eq!(msgs[0].role, Role::User);
+        assert_eq!(msgs[1].role, Role::Assistant);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
 

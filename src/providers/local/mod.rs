@@ -15,7 +15,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use crate::agent::AgentLoop;
 use crate::ai::ChatMessage;
 use crate::tree::SessionTree;
-use crate::harness::transcript::{Message, Part, PartKind, Role as TRole, TranscriptUpdate};
+use crate::harness::transcript::TranscriptUpdate;
 use crate::harness::HarnessEvent;
 use crate::providers::{
     AgentProvider, EventPump, EventSink, ModelId, ProviderError, ProviderKind, ProviderSession,
@@ -140,11 +140,6 @@ impl LocalProvider {
         let tree = SessionTree::sidecar_path(id)
             .and_then(|p| SessionTree::load(&p))
             .unwrap_or_default();
-        // Replace (don't stack on) the hydrated cache: the tree is authoritative.
-        let _ = self.events_tx.send(RoutedEvent {
-            session_id: Some(id.to_string()),
-            event: HarnessEvent::Transcript(TranscriptUpdate::Reset),
-        });
         self.replay(id, &tree);
         self.inner.sessions.lock().unwrap().insert(
             id.to_string(),
@@ -161,50 +156,19 @@ impl LocalProvider {
         session
     }
 
-    /// Re-emit a stored transcript so a resumed pane shows prior turns.
+    /// Re-emit a stored transcript atomically so a resumed pane shows prior turns
+    /// without flickering through intermediate incremental frames.
     fn replay(&self, sid: &str, tree: &SessionTree) {
         if tree.is_empty() {
             return;
         }
-        let mut n = 0u64;
-        for entry in tree.active_path() {
-            let (role, text) = match entry.kind {
-                crate::tree::EntryKind::User => (TRole::User, entry.text.clone()),
-                crate::tree::EntryKind::Assistant => (TRole::Assistant, entry.text.clone()),
-                _ => continue,
-            };
-            if text.trim().is_empty() {
-                continue;
-            }
-            n += 1;
-            let message_id = format!("{sid}-hist-{n}");
-            let part_id = format!("{message_id}-p1");
-            let _ = self.events_tx.send(RoutedEvent {
-                session_id: Some(sid.to_string()),
-                event: HarnessEvent::Transcript(TranscriptUpdate::MessageMeta(Message {
-                    id: message_id.clone(),
-                    role,
-                    error: None,
-                    completed: Some(entry.timestamp_ms),
-                    created: Some(entry.timestamp_ms),
-                    cost: None,
-                    tokens: None,
-                    parts: Vec::new(),
-                })),
-            });
-            let _ = self.events_tx.send(RoutedEvent {
-                session_id: Some(sid.to_string()),
-                event: HarnessEvent::Transcript(TranscriptUpdate::Part(Part {
-                    id: part_id,
-                    message_id,
-                    kind: PartKind::Text { text, synthetic: false },
-                })),
-            });
-        }
+        let msgs = tree.to_messages(sid);
+        let _ = self.events_tx.send(RoutedEvent {
+            session_id: Some(sid.to_string()),
+            event: HarnessEvent::Transcript(TranscriptUpdate::ReplaceAll(msgs)),
+        });
     }
 
-    /// Force a compaction of a live session (the `/compact` command). Rebuilds
-    /// the tree as `[compaction summary] + retained tail` and persists it.
     pub async fn compact_session(&self, id: &str) -> bool {
         let mut tree = {
             let mut sessions = self.inner.sessions.lock().unwrap();
@@ -840,22 +804,24 @@ mod tests {
             tool_call_id: None,
             tokens: None,
             images: vec![],
+            cost: None,
         });
         local.replay("theta-old-1", &tree);
 
         let mut texts = Vec::new();
-        for _ in 0..4 {
-            let Ok(Some(ev)) =
-                tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await
-            else {
-                break;
-            };
+        if let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await
+        {
             if let crate::harness::HarnessEvent::Transcript(
-                crate::harness::transcript::TranscriptUpdate::Part(p),
+                crate::harness::transcript::TranscriptUpdate::ReplaceAll(msgs),
             ) = ev.event
             {
-                if let crate::harness::transcript::PartKind::Text { text, .. } = p.kind {
-                    texts.push(text);
+                for m in msgs {
+                    for p in m.parts {
+                        if let crate::harness::transcript::PartKind::Text { text, .. } = p.kind {
+                            texts.push(text);
+                        }
+                    }
                 }
             }
         }

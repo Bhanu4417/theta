@@ -76,6 +76,20 @@ pub fn render(f: &mut ratatui::Frame, app: &mut App, area: Rect, sid: u32, focus
         }
     }
 
+    if let Some(cache) = app.conv_cache.get(&sid) {
+        let h = conv_area.height as usize;
+        let total = cache.lines.len();
+        if h > 0 {
+            let bottom = total.saturating_sub(h);
+            if let Some(s) = app.session_mut(sid) {
+                if !s.stick_bottom && s.scroll >= bottom {
+                    s.stick_bottom = true;
+                    s.scroll = bottom;
+                }
+            }
+        }
+    }
+
     let cache_empty = app
         .conv_cache
         .get(&sid)
@@ -93,8 +107,7 @@ pub fn render(f: &mut ratatui::Frame, app: &mut App, area: Rect, sid: u32, focus
                     return None;
                 }
                 let total = cache.lines.len();
-                let max_off = total.saturating_sub(h);
-                let offset = if s.stick_bottom { max_off } else { s.scroll.min(max_off) };
+                let offset = conversation::view_offset(s.stick_bottom, s.scroll, total, h);
                 let to_abs = |p: crate::app::SelectPoint| -> (usize, usize) {
                     let row = (p.row.saturating_sub(conv_area.y) as usize)
                         .min(h.saturating_sub(1));
@@ -490,16 +503,26 @@ fn render_input(
         .unwrap_or_else(|| "default model".to_string());
     let dir = theme::abbreviate_path(&sess.dir.to_string_lossy());
 
-    let mut right_parts: Vec<String> = vec![dir];
+    // Usage sits immediately left of the folder path, so a pane reads
+    // `12k ctx · $0.0012 · ~/proj/app`: context size first (as a percentage
+    // when the model's limit is known), then cost, then the directory.
+    let mut right_parts: Vec<String> = Vec::new();
     if sess.ctx_tokens > 0 {
-        right_parts.push(format!(
-            "{} ctx",
-            crate::ui::statusbar::fmt_tokens(sess.ctx_tokens)
-        ));
+        right_parts.push(match context_limit_for(app, sess) {
+            Some(lim) if lim > 0 => {
+                let pct = (sess.ctx_tokens as f64 / lim as f64 * 100.0).min(999.0);
+                format!("ctx {pct:.0}%")
+            }
+            _ => format!(
+                "{} ctx",
+                crate::ui::statusbar::fmt_tokens(sess.ctx_tokens)
+            ),
+        });
     }
     if sess.cost > 0.0 {
         right_parts.push(format!("${:.4}", sess.cost));
     }
+    right_parts.push(dir);
     if sess.interrupt_armed.is_some() {
         right_parts.push("press Esc again to interrupt".into());
     }
@@ -645,6 +668,16 @@ fn render_input(
 }
 
 /// A queued prompt row: text on the left, a muted "— queued" label right.
+/// The model's context window for a session, when the provider list knows it.
+/// Falls back to the workspace default model before giving up.
+fn context_limit_for(app: &App, sess: &SessionState) -> Option<u64> {
+    let want = sess.model.as_ref().or(app.default_model.as_ref())?;
+    app.providers
+        .iter()
+        .find(|p| p.provider_id == want.provider_id && p.model_id == want.model_id)
+        .and_then(|p| p.context_limit)
+}
+
 fn queued_line(text: &str, w: usize, bg: Style) -> Line<'static> {
     let label = "— queued";
     let label_w = label.chars().count();

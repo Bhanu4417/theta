@@ -813,7 +813,8 @@ pub fn render_session_list(f: &mut ratatui::Frame, app: &App, area: Rect) {
 
 pub fn render_resume_picker(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let n = app.resume_picker.items.len().min(14);
-    let rect = centered_rect(64, (n + 4) as u16, area);
+    let width = 80.min(area.width.saturating_sub(4));
+    let rect = centered_rect(width, (n + 4) as u16, area);
     let inner = surface(
         f,
         rect,

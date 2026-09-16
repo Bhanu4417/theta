@@ -502,12 +502,14 @@ impl SessionState {
             .iter()
             .filter_map(|m| if m.role == Role::Assistant { m.cost } else { None })
             .sum();
+        // Most recent assistant usage, skipping any trailing row that has no
+        // recorded tokens (so the context readout doesn't blink to 0).
         self.ctx_tokens = self
             .messages
             .iter()
             .rev()
-            .find(|m| m.role == Role::Assistant)
-            .and_then(|m| m.tokens)
+            .filter(|m| m.role == Role::Assistant)
+            .find_map(|m| m.tokens)
             .map(|t| t.context())
             .unwrap_or(0);
     }
@@ -537,11 +539,21 @@ impl SessionState {
             let Some(msg) = self.messages.iter_mut().find(|m| m.id == dirty_msg_id) else {
                 return;
             };
-            msg.role = message.role;
-            msg.error = message.error.clone();
-            msg.completed = message.completed;
-            msg.cost = message.cost;
-            msg.tokens = message.tokens;
+            // Merge, never blank: a Part arrives with no cost/tokens/completed,
+            // and overwriting the row with `None` wiped the context/cost that a
+            // preceding usage update had just recorded.
+            if message.error.is_some() {
+                msg.error = message.error.clone();
+            }
+            if message.completed.is_some() {
+                msg.completed = message.completed;
+            }
+            if message.cost.is_some() {
+                msg.cost = message.cost;
+            }
+            if message.tokens.is_some() {
+                msg.tokens = message.tokens;
+            }
             // An adopted message still carries placeholder local parts; purge
             // them once the server delivers its own.
             if !part.id.starts_with("local-")
@@ -575,6 +587,7 @@ impl SessionState {
         });
         self.messages = msgs;
         self.unadopted_locals = 0;
+        self.recompute_metrics();
         self.dirty = true;
     }
 
@@ -733,5 +746,40 @@ mod tests {
         s.upsert_part(&with_part, part);
         assert_eq!(s.messages[0].role, Role::User);
         assert_eq!(s.messages[0].parts.len(), 1);
+    }
+
+    #[test]
+    fn a_part_does_not_wipe_recorded_tokens_or_cost() {
+        use crate::harness::transcript::{Part, PartKind, TokenUsage};
+        let mut s = SessionState::new(1, "s".into(), PathBuf::from("."));
+        let usage = Message {
+            id: "m1".into(),
+            role: Role::Assistant,
+            error: None,
+            completed: None,
+            created: None,
+            cost: Some(0.25),
+            tokens: Some(TokenUsage { input: 12_345, output: 67, ..Default::default() }),
+            parts: Vec::new(),
+        };
+        s.upsert_message_meta(&usage);
+        assert_eq!(s.ctx_tokens, 12_345);
+
+        // The text part for the same message carries no usage metadata; it must
+        // not blank the tokens/cost the usage update just recorded.
+        let part = Part {
+            id: "m1-text".into(),
+            message_id: "m1".into(),
+            kind: PartKind::Text { text: "hi".into(), synthetic: false },
+        };
+        let mut with_part = usage.clone();
+        with_part.cost = None;
+        with_part.tokens = None;
+        with_part.parts = vec![part.clone()];
+        s.upsert_part(&with_part, part);
+
+        assert_eq!(s.messages[0].tokens.map(|t| t.input), Some(12_345));
+        assert_eq!(s.messages[0].cost, Some(0.25));
+        assert_eq!(s.ctx_tokens, 12_345, "context readout must survive");
     }
 }

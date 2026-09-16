@@ -182,4 +182,7 @@ pub enum TranscriptUpdate {
     /// Drop the whole transcript before replaying stored history, so a restore
     /// never stacks replayed turns on top of the cached ones (duplicates).
     Reset,
+    /// Atomically replace the full transcript with authoritative history.
+    /// Avoids progressive re-rendering frames or flicker when adopting a session.
+    ReplaceAll(Vec<Message>),
 }

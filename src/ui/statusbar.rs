@@ -92,53 +92,20 @@ pub fn render(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
         ));
     }
 
-    // Right cluster: dir · git · ctx · cost · model · hint
+    // Right cluster: git · model · hints. Per-session context size and cost
+    // live in the pane footer next to the folder path, not here.
     let mut right: Vec<Span<'static>> = Vec::new();
-    if let Some(s) = app.focused() {
-        if let Some(git) = &app.git_display {
-            if let Some(branch) = &git.branch {
-                right.push(Span::styled(branch.clone(), dim));
-                let summary = git.summary();
-                if !summary.is_empty() {
-                    right.push(Span::styled(
-                        format!(" {summary}"),
-                        Style::default().bg(barbg).fg(pal().orange),
-                    ));
-                }
-                sep(&mut right);
+    if let Some(git) = &app.git_display {
+        if let Some(branch) = &git.branch {
+            right.push(Span::styled(branch.clone(), dim));
+            let summary = git.summary();
+            if !summary.is_empty() {
+                right.push(Span::styled(
+                    format!(" {summary}"),
+                    Style::default().bg(barbg).fg(pal().orange),
+                ));
             }
-        }
-        if s.ctx_tokens > 0 {
-            let limit = app
-                .focused()
-                .and_then(|sess| {
-                    let want = sess.model.as_ref().or(app.default_model.as_ref())?;
-                    app.providers
-                        .iter()
-                        .find(|p| p.provider_id == want.provider_id && p.model_id == want.model_id)
-                })
-                .and_then(|p| p.context_limit);
-            match limit {
-                Some(lim) if lim > 0 => {
-                    let pct = (s.ctx_tokens as f64 / lim as f64 * 100.0).min(999.0);
-                    right.push(Span::styled(
-                        format!("ctx {:.0}%", pct),
-                        Style::default().bg(barbg).fg(pal().fg_soft),
-                    ));
-                }
-                _ => {
-                    right.push(Span::styled(
-                        format!("ctx {}", fmt_tokens(s.ctx_tokens)),
-                        Style::default().bg(barbg).fg(pal().fg_soft),
-                    ));
-                }
-            }
-        }
-        if s.cost > 0.0 {
-            right.push(Span::styled(
-                format!(" ${:.4}", s.cost),
-                Style::default().bg(barbg).fg(pal().orange),
-            ));
+            sep(&mut right);
         }
     }
     right.push(Span::styled("   ", bg));
