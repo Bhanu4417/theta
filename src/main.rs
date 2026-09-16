@@ -440,47 +440,61 @@ fn install_panic_hook() {
 }
 
 fn exec_self() -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::ffi::OsString;
-        use std::os::unix::process::CommandExt;
-        use std::path::PathBuf;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
 
-        let mut candidates: Vec<PathBuf> = Vec::new();
-        if let Ok(p) = std::env::current_exe() {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(p) = std::env::current_exe() {
+        candidates.push(p);
+    }
+    if let Some(arg0) = std::env::args_os().next() {
+        let p = PathBuf::from(&arg0);
+        if p.components().count() > 1 {
             candidates.push(p);
         }
-        if let Some(arg0) = std::env::args_os().next() {
-            let p = PathBuf::from(&arg0);
-            if p.components().count() > 1 {
-                candidates.push(p);
-            }
+    }
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join(".local/bin/theta"));
+    }
+    let exe = if cfg!(windows) { "theta.exe" } else { "theta" };
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            candidates.push(dir.join(exe));
         }
-        if let Some(home) = dirs::home_dir() {
-            candidates.push(home.join(".local/bin/theta"));
-        }
-        if let Some(paths) = std::env::var_os("PATH") {
-            for dir in std::env::split_paths(&paths) {
-                candidates.push(dir.join("theta"));
-            }
-        }
+    }
 
-        let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
         let mut last_err: Option<std::io::Error> = None;
         for cand in candidates {
             if !cand.is_file() {
                 continue;
             }
-            let err = std::process::Command::new(&cand).args(&args).exec();
-            last_err = Some(err);
+            last_err = Some(std::process::Command::new(&cand).args(&args).exec());
         }
         match last_err {
             Some(e) => Err(anyhow::anyhow!("refresh failed: {e}")),
             None => Err(anyhow::anyhow!("refresh failed: could not locate the theta binary")),
         }
     }
+
     #[cfg(not(unix))]
     {
-        std::process::exit(0);
+        // `exec` is unix-only. Spawn the new build and stay alive until it
+        // exits, so the restarted TUI owns the terminal instead of racing a
+        // shell prompt for it.
+        for cand in candidates {
+            if !cand.is_file() {
+                continue;
+            }
+            if let Ok(mut child) = std::process::Command::new(&cand).args(&args).spawn() {
+                let status = child.wait();
+                std::process::exit(status.ok().and_then(|s| s.code()).unwrap_or(0));
+            }
+        }
+        Err(anyhow::anyhow!("refresh failed: could not locate the theta binary"))
     }
 }

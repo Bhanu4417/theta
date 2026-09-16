@@ -1546,7 +1546,6 @@ dependencies = [
  "dirs",
  "futures",
  "ignore",
- "libc",
  "ratatui",
  "reqwest",
  "serde",

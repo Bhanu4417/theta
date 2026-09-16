@@ -63,7 +63,15 @@ cargo build --release
 install -Dm755 target/release/theta ~/.local/bin/theta
 ```
 
-Stable Rust (edition 2021) is the only requirement. Then:
+Stable Rust (edition 2021) is the only requirement.
+
+**Platforms.** Linux and macOS are fully supported. Windows builds too — CI
+verifies it on every commit — with one caveat: the `bash` tool and the `!cmd`
+shell escape need a `bash` on your `PATH`, so install Git for Windows or use
+WSL. On Windows, `cargo install --path .` is a convenient alternative to the
+`install` command above.
+
+Then:
 
 ```sh
 theta                    # restore your last workspace
