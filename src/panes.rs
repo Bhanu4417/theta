@@ -75,10 +75,14 @@ impl PaneGrid {
         self.rows.iter().all(|r| r.cells.is_empty())
     }
 
+    /// Test-only helper: total panes across all rows.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.rows.iter().map(|r| r.cells.len()).sum()
     }
 
+    /// Test-only helper: is this session currently in the grid?
+    #[cfg(test)]
     pub fn contains(&self, session: u32) -> bool {
         self.rows
             .iter()

@@ -101,6 +101,11 @@ impl ProviderCapabilities {
 #[derive(Debug, Clone)]
 pub enum ProviderError {
     /// The runtime/binary is not reachable or not installed.
+    ///
+    /// Part of the error taxonomy the retry classifier treats as transient
+    /// (`ai::is_retryable_provider_error`); kept so providers can report a
+    /// temporarily-down backend.
+    #[allow(dead_code)]
     Unavailable(String),
     /// The requested session no longer exists.
     SessionNotFound(String),
@@ -139,6 +144,10 @@ pub struct ProviderSession {
 }
 
 /// Everything the harness needs to ask a provider for a fresh session.
+///
+/// Used by the `AgentProvider` contract below; the local manager creates
+/// sessions through `LocalProvider` directly, so this is exercised by tests.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct SessionConfig {
     pub directory: String,
@@ -201,12 +210,17 @@ impl<T: EventPump + ?Sized> EventPump for std::sync::Arc<T> {
 /// The inbound side (event streaming) lives on [`EventPump`]; together they
 /// are the complete adapter contract.
 pub trait AgentProvider {
+    /// Adapter contract: exercised by the local provider's tests rather than
+    /// the production path, which drives `LocalProvider` directly.
+    #[allow(dead_code)]
     fn kind(&self) -> ProviderKind;
 
+    #[allow(dead_code)]
     fn capabilities(&self) -> ProviderCapabilities {
         self.kind().capabilities()
     }
 
+    #[allow(dead_code)]
     async fn create_session(&self, config: SessionConfig)
         -> Result<ProviderSession, ProviderError>;
 

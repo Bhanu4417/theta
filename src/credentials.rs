@@ -71,11 +71,14 @@ impl Credentials {
         self.save()
     }
 
+    /// Test-only helper: the stored provider ids, sorted.
+    #[cfg(test)]
     pub fn providers(&self) -> Vec<String> {
         let mut v: Vec<String> = self.api_keys.keys().cloned().collect();
         v.sort();
         v
     }
+
 }
 
 #[cfg(test)]

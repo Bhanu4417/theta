@@ -4,7 +4,6 @@ use crate::app::App;
 use crate::session::SessStatus;
 use crate::theme::{pal, self};
 use ratatui::layout::Rect;
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 

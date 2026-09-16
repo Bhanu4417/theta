@@ -1,8 +1,8 @@
 //! Theta's harness: provider-independent session/task/event concepts.
 //!
 //! The UI and the manager communicate in terms of these types, never raw
-//! provider protocol. The OpenCode adapter converts native events into
-//! [`HarnessEvent`]s.
+//! provider protocol. The local harness (`providers::local`) converts its
+//! native events into [`HarnessEvent`]s.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -15,6 +15,11 @@ pub use transcript::TranscriptUpdate;
 
 /// Common, provider-neutral events. Where a provider produces something that
 /// has no common representation, `ProviderSpecific` preserves it untouched.
+// Some variants are reserved: they are part of the provider-neutral protocol
+// that the UI, the manager and future adapters are written against, even when
+// the current local harness does not emit them yet. Deleting one would break
+// that contract, so they are intentionally kept.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub enum HarnessEvent {
     SessionIdle,

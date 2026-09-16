@@ -32,9 +32,6 @@ impl GitInfo {
         parts.join(" ")
     }
 
-    pub fn dirty(&self) -> bool {
-        self.staged + self.modified + self.deleted + self.untracked > 0
-    }
 }
 
 pub struct GitCache {

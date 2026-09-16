@@ -2,7 +2,7 @@
 name = "theta"
 version = "0.1.0"
 edition = "2021"
-description = "Theta — a multi-session OpenCode workspace TUI"
+description = "Theta — a multi-session tiled terminal workspace for coding agents"
 
 [dependencies]
 ratatui = "0.29"

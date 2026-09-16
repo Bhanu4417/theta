@@ -1,6 +1,6 @@
 //! Per-session state: transcript, input buffer, status, scroll.
 
-use crate::harness::transcript::{Message, Part, PartKind, Role, ToolInfo, ToolStatus};
+use crate::harness::transcript::{Message, Part, PartKind, Role, ToolInfo};
 use crate::harness::{Question, Task};
 use crate::models::ModelRef;
 use crate::providers::ProviderKind;
@@ -292,8 +292,6 @@ pub struct SessionState {
     pub agent: Option<String>,
     /// Selected row in the slash-command popup.
     pub slash_selected: usize,
-    /// Share URL when the session is shared.
-    pub share_url: Option<String>,
     /// Last submission (time, text) — guards double-Enter duplicates.
     pub last_send: Option<(std::time::Instant, String)>,
     /// Prompt typed while the agent was busy — awaiting queue/fork choice.
@@ -356,7 +354,6 @@ impl SessionState {
             model: None,
             agent: None,
             slash_selected: 0,
-            share_url: None,
             last_send: None,
             pending_send: None,
             queue: Vec::new(),
@@ -384,10 +381,6 @@ impl SessionState {
             mention_selected: 0,
             dirty: true,
         }
-    }
-
-    pub fn title(&self) -> &str {
-        &self.name
     }
 
     /// Optimistic local user message shown before the server acknowledges.
@@ -638,23 +631,6 @@ impl SessionState {
         self.synthetic_seq
     }
 
-    pub fn any_tool_running(&self) -> bool {
-        self.messages.iter().any(|m| {
-            m.parts.iter().any(|p| match &p.kind {
-                PartKind::Tool(t) => matches!(t.status, ToolStatus::Pending | ToolStatus::Running),
-                _ => false,
-            })
-        })
-    }
-
-    pub fn last_assistant_unfinished(&self) -> bool {
-        self.messages
-            .iter()
-            .rev()
-            .find(|m| m.role == Role::Assistant)
-            .map(|m| m.completed.is_none())
-            .unwrap_or(false)
-    }
 }
 
 #[cfg(test)]

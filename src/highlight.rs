@@ -10,7 +10,7 @@ use syntect::highlighting::{
 };
 use syntect::parsing::SyntaxSet;
 
-use crate::theme::{pal, rgb_tuple};
+use crate::theme::pal;
 
 pub struct Highlighter {
     ps: SyntaxSet,

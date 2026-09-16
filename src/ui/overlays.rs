@@ -1,7 +1,7 @@
 //! Overlay surfaces: palette, dialogs, searches, viewer, diff.
 
 use crate::app::App;
-use crate::theme::{pal, self, P_SYMBOL};
+use crate::theme::{pal, self, SpanExt, P_SYMBOL};
 use crate::ui::conversation::truncate;
 use ratatui::layout::Rect;
 use ratatui::style::{Style};
@@ -51,16 +51,6 @@ fn surface_plain(f: &mut ratatui::Frame, area: Rect) -> Rect {
     f.render_widget(Clear, area);
     f.render_widget(block, area);
     inner
-}
-
-/// Style-preserving background patch for spans.
-trait SpanExt {
-    fn patch(self, style: Style) -> Self;
-}
-impl SpanExt for Span<'static> {
-    fn patch(self, style: Style) -> Self {
-        Span::styled(self.content, self.style.patch(style))
-    }
 }
 
 /// Stop drawing when the surface is full.

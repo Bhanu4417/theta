@@ -57,90 +57,56 @@ pub enum Overlay {
 // Slash commands
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum SlashKind {
-    Model,
-    Agent,
-    New,
-    Sessions,
-    Resume,
-    Close,
-    Delete,
-    Rename,
-    Keymap,
-    Clear,
-    Compact,
-    Undo,
-    Redo,
-    Share,
-    Unshare,
-    Init,
-    Help,
-    Quit,
-    Refresh,
-    Push,
-    Fork,
-    Tree,
-    Editor,
-    Export,
-    Login,
-    Logs,
-    Custom(String),
-}
 
 #[derive(Debug, Clone)]
 pub struct SlashItem {
     pub name: String,
-    pub args: String,
     pub desc: String,
-    pub kind: SlashKind,
 }
 
 fn builtin_slash_items() -> Vec<SlashItem> {
     vec![
-        SlashItem { name: "model".into(), args: "[provider/model]".into(), desc: "Change the model for this session".into(), kind: SlashKind::Model },
-        SlashItem { name: "agent".into(), args: "[name]".into(), desc: "Switch agent (build, plan, …)".into(), kind: SlashKind::Agent },
-        SlashItem { name: "new".into(), args: "".into(), desc: "Create a new session".into(), kind: SlashKind::New },
-        SlashItem { name: "sessions".into(), args: "".into(), desc: "Jump to another open session".into(), kind: SlashKind::Sessions },
-        SlashItem { name: "resume".into(), args: "".into(), desc: "Resume a previous session".into(), kind: SlashKind::Resume },
-        SlashItem { name: "clear".into(), args: "".into(), desc: "Clear transcript view (history kept)".into(), kind: SlashKind::Clear },
-        SlashItem { name: "compact".into(), args: "".into(), desc: "Summarize the conversation".into(), kind: SlashKind::Compact },
-        SlashItem { name: "undo".into(), args: "".into(), desc: "Rewind to an earlier message (pick from a list)".into(), kind: SlashKind::Undo },
-        SlashItem { name: "redo".into(), args: "".into(), desc: "Re-apply the last rewind".into(), kind: SlashKind::Redo },
-        SlashItem { name: "share".into(), args: "".into(), desc: "Share this session (get URL)".into(), kind: SlashKind::Share },
-        SlashItem { name: "unshare".into(), args: "".into(), desc: "Stop sharing this session".into(), kind: SlashKind::Unshare },
-        SlashItem { name: "init".into(), args: "[focus]".into(), desc: "Create/update AGENTS.md".into(), kind: SlashKind::Init },
-        SlashItem { name: "keys".into(), args: "".into(), desc: "View and edit keybindings".into(), kind: SlashKind::Keymap },
-        SlashItem { name: "help".into(), args: "".into(), desc: "Overview of keys and commands".into(), kind: SlashKind::Keymap },
-        SlashItem { name: "close".into(), args: "".into(), desc: "Close this session".into(), kind: SlashKind::Close },
-        SlashItem { name: "delete".into(), args: "".into(), desc: "Delete this session from the workspace (server history kept)".into(), kind: SlashKind::Delete },
-        SlashItem { name: "rename".into(), args: "[name]".into(), desc: "Rename this session".into(), kind: SlashKind::Rename },
-        SlashItem { name: "quit".into(), args: "".into(), desc: "Quit Theta".into(), kind: SlashKind::Quit },
-        SlashItem { name: "refresh".into(), args: "".into(), desc: "Reload the newest build in place".into(), kind: SlashKind::Refresh },
-        SlashItem { name: "tree".into(), args: "".into(), desc: "Jump to an earlier point (local backend)".into(), kind: SlashKind::Tree },
-        SlashItem { name: "editor".into(), args: "".into(), desc: "Compose the prompt in $EDITOR".into(), kind: SlashKind::Editor },
-        SlashItem { name: "export".into(), args: "[file]".into(), desc: "Export this session (Markdown/JSONL)".into(), kind: SlashKind::Export },
-        SlashItem { name: "login".into(), args: "[provider]".into(), desc: "Log in to a provider (API key)".into(), kind: SlashKind::Login },
-        SlashItem { name: "logs".into(), args: "".into(), desc: "Tail the debug log (requests → model)".into(), kind: SlashKind::Logs },
-        SlashItem { name: "push".into(), args: "[message]".into(), desc: "Commit and push this project (session only)".into(), kind: SlashKind::Push },
-        SlashItem { name: "fork".into(), args: "".into(), desc: "Fork this session into a new pane (instant, session only)".into(), kind: SlashKind::Fork },
+        SlashItem { name: "model".into(), desc: "Change the model for this session".into() },
+        SlashItem { name: "agent".into(), desc: "Switch agent (build, plan, …)".into() },
+        SlashItem { name: "new".into(), desc: "Create a new session".into() },
+        SlashItem { name: "sessions".into(), desc: "Jump to another open session".into() },
+        SlashItem { name: "resume".into(), desc: "Resume a previous session".into() },
+        SlashItem { name: "clear".into(), desc: "Clear transcript view (history kept)".into() },
+        SlashItem { name: "compact".into(), desc: "Summarize the conversation".into() },
+        SlashItem { name: "undo".into(), desc: "Rewind to an earlier message (pick from a list)".into() },
+        SlashItem { name: "redo".into(), desc: "Re-apply the last rewind".into() },
+        SlashItem { name: "share".into(), desc: "Share this session (no share links; use /export)".into() },
+        SlashItem { name: "unshare".into(), desc: "Stop sharing this session".into() },
+        SlashItem { name: "init".into(), desc: "AGENTS.md setup (not yet supported; skills auto-load)".into() },
+        SlashItem { name: "keys".into(), desc: "View and edit keybindings".into() },
+        SlashItem { name: "help".into(), desc: "Overview of keys and commands".into() },
+        SlashItem { name: "close".into(), desc: "Close this session".into() },
+        SlashItem { name: "delete".into(), desc: "Delete this session from the workspace (history kept)".into() },
+        SlashItem { name: "rename".into(), desc: "Rename this session".into() },
+        SlashItem { name: "quit".into(), desc: "Quit Theta".into() },
+        SlashItem { name: "refresh".into(), desc: "Reload the newest build in place".into() },
+        SlashItem { name: "tree".into(), desc: "Jump to an earlier point (local backend)".into() },
+        SlashItem { name: "editor".into(), desc: "Compose the prompt in $EDITOR".into() },
+        SlashItem { name: "export".into(), desc: "Export this session (Markdown/JSONL)".into() },
+        SlashItem { name: "login".into(), desc: "Log in to a provider (API key)".into() },
+        SlashItem { name: "logs".into(), desc: "Tail the debug log (requests → model)".into() },
+        SlashItem { name: "push".into(), desc: "Commit and push this project (session only)".into() },
+        SlashItem { name: "fork".into(), desc: "Fork this session into a new pane (instant, session only)".into() },
     ]
 }
 
-/// All slash commands: builtins plus server-provided custom ones.
+/// All slash commands: builtins plus project-defined custom ones.
 pub fn slash_items(app: &App) -> Vec<SlashItem> {
     let mut items = builtin_slash_items();
     for c in &app.custom_commands {
         items.push(SlashItem {
             name: c.name.clone(),
-            args: String::new(),
             desc: if c.description.is_empty() {
                 format!("{} command", c.source)
             } else {
                 let d: String = c.description.chars().take(60).collect();
                 d
             },
-            kind: SlashKind::Custom(c.name.clone()),
         });
     }
     items
@@ -265,7 +231,6 @@ pub struct TreeRow {
     pub id: String,
     pub depth: usize,
     pub label: String,
-    pub kind: crate::tree::EntryKind,
     pub active: bool,
 }
 
@@ -291,10 +256,8 @@ pub struct RewindRow {
     /// Index into the session transcript where this user message starts.
     pub index: usize,
     pub text: String,
-    /// Local backend: the tree entry id to rewind before.
+    /// The history-tree entry id to rewind before.
     pub entry: Option<String>,
-    /// OpenCode backend: the message id to revert.
-    pub msg_id: Option<String>,
     pub adds: u32,
     pub dels: u32,
     pub files: usize,
@@ -353,7 +316,6 @@ pub struct ExplorerState {
 pub struct ViewerState {
     pub title: String,
     pub lines: Vec<Line<'static>>,
-    pub raw: String,
     pub scroll: usize,
     pub jump_line: Option<u64>,
 }
@@ -760,7 +722,7 @@ impl App {
     pub fn close_session(&mut self, id: u32) {
         if let Some(s) = self.session(id) {
             if let (Some(oc_sid), true) = (s.oc_sid.clone(), s.status.is_busy()) {
-                self.manager.abort_session(s.dir.clone(), oc_sid);
+                self.manager.abort_session(oc_sid);
             }
         }
         // Cancel the harness task so it does not linger as running.
@@ -795,7 +757,7 @@ impl App {
     pub fn restart_session(&mut self, id: u32) {
         let Some(s) = self.session(id) else { return };
         if let Some(oc_sid) = s.oc_sid.clone() {
-            self.manager.abort_session(s.dir.clone(), oc_sid);
+            self.manager.abort_session(oc_sid);
         }
         let (dir, model, name) = (s.dir.clone(), s.model.clone(), s.name.clone());
         if let Some(s) = self.session_mut(id) {
@@ -900,7 +862,6 @@ impl App {
             if s.status.is_busy() {
                 s.pending_send = Some(text.clone());
                 s.dirty = true;
-                drop(s);
                 self.busy_choice = 0;
                 self.overlay = Overlay::BusyChoice;
                 self.dirty = true;
@@ -1443,7 +1404,7 @@ impl App {
             let Some(pq) = s.pending_question.as_ref() else { return };
             (s.dir.clone(), pq.id.clone(), pq.answers.clone())
         };
-        self.manager.reply_question(req.0, req.1, req.2);
+        self.manager.reply_question(req.1, req.2);
         if let Some(s) = self.session_mut(id) {
             s.pending_question = None;
             if s.status == SessStatus::Question {
@@ -1462,7 +1423,7 @@ impl App {
             let Some(pq) = s.pending_question.as_ref() else { return };
             (s.dir.clone(), pq.id.clone())
         };
-        self.manager.reject_question(req.0, req.1);
+        self.manager.reject_question(req.1);
         if let Some(s) = self.session_mut(id) {
             s.pending_question = None;
             if s.status == SessStatus::Question {
@@ -1494,7 +1455,7 @@ impl App {
     pub fn interrupt(&mut self, id: u32) {
         if let Some(s) = self.session(id) {
             if let Some(oc_sid) = s.oc_sid.clone() {
-                self.manager.abort_session(s.dir.clone(), oc_sid);
+                self.manager.abort_session(oc_sid);
             }
         }
         if let Some(s) = self.session_mut(id) {
@@ -1516,18 +1477,14 @@ impl App {
         let request = {
             let Some(s) = self.session(id) else { return };
             match (&s.pending_perm, &s.oc_sid) {
-                (Some(p), Some(oc_sid)) => Some((s.dir.clone(), oc_sid.clone(), p.id.clone())),
+                // The session must exist, but only the request id is needed.
+                (Some(p), Some(_)) => Some(p.id.clone()),
                 _ => None,
             }
         };
-        if let Some((dir, oc_sid, pid)) = request {
-            if self.manager.is_local() {
-                self.manager
-                    .local_permission_reply(oc_sid, pid, response.to_string());
-            } else {
-                self.manager
-                    .reply_permission(dir, oc_sid, pid, response.to_string());
-            }
+        if let Some(pid) = request {
+            self.manager
+                .local_permission_reply(pid, response.to_string());
         }
         if let Some(s) = self.session_mut(id) {
             s.pending_perm = None;
@@ -2307,8 +2264,7 @@ impl App {
             return;
         }
         if !self.session_cache.contains_key(&dir) {
-            let server = self.primary_server_dir();
-            self.manager.preload_dir(server, dir);
+            self.manager.preload_dir(dir);
         }
     }
 
@@ -2317,21 +2273,14 @@ impl App {
     /// open picker updates live without flicker.
     pub fn preload_known_dirs(&mut self) {
         let dirs: Vec<PathBuf> = self.known_dirs.iter().cloned().collect();
-        let server = self.primary_server_dir();
         for d in dirs {
             if d.is_dir() {
-                self.manager.preload_dir(server.clone(), d);
+                self.manager.preload_dir(d);
             }
         }
     }
 
     /// The directory whose server we use to enumerate other folders.
-    fn primary_server_dir(&self) -> PathBuf {
-        self.focused()
-            .map(|s| s.dir.clone())
-            .unwrap_or_else(|| self.initial_dir.clone())
-    }
-
     /// Remember a directory so its sessions stay visible across folders.
     pub fn remember_dir(&mut self, dir: &Path) {
         let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
@@ -2349,12 +2298,6 @@ impl App {
             .collect();
         out.sort_by_key(|s| -s.updated_ms.unwrap_or(0));
         out
-    }
-
-    pub fn push_local_user(&mut self, id: u32, text: &str) {
-        if let Some(s) = self.session_mut(id) {
-            s.push_local_user(text);
-        }
     }
 
     /// Copy text to the system clipboard via OSC 52 (works over SSH too).
@@ -2542,72 +2485,28 @@ impl App {
                     s.dirty = true;
                 }
                 self.conv_cache.remove(&sid);
-                self.flash("view cleared (server history kept)");
+                self.flash("view cleared (history kept)");
             }
             "compact" => {
-                if self.manager.is_local() {
-                    if let Some(oc) = self.session(sid).and_then(|s| s.oc_sid.clone()) {
-                        self.manager.local_compact(oc);
-                        self.flash("compacting…");
-                    } else {
-                        self.flash("session is still connecting…");
-                    }
-                    return;
-                }
-                let req = {
-                    let Some(s) = self.session(sid) else { return };
-                    match (s.oc_sid.clone(), s.model.clone().or_else(|| self.default_model.clone())) {
-                        (Some(oc), Some(m)) => Some((s.dir.clone(), oc, m)),
-                        (Some(_), None) => {
-                            self.flash("no model available for compact");
-                            None
-                        }
-                        _ => {
-                            self.flash("session is still connecting…");
-                            None
-                        }
-                    }
-                };
-                if let Some((dir, oc, m)) = req {
-                    self.manager.summarize(dir, oc, m);
+                if let Some(oc) = self.session(sid).and_then(|s| s.oc_sid.clone()) {
+                    self.manager.local_compact(oc);
                     self.flash("compacting…");
+                } else {
+                    self.flash("session is still connecting…");
                 }
             }
             "undo" => self.open_rewind(sid),
             "redo" => self.redo(sid),
-            "share" => {
-                let req = {
-                    let Some(s) = self.session(sid) else { return };
-                    s.oc_sid.clone().map(|oc| (s.dir.clone(), oc))
-                };
-                if let Some((dir, oc)) = req {
-                    self.manager.share(dir, oc, true);
-                }
-            }
-            "unshare" => {
-                let req = {
-                    let Some(s) = self.session(sid) else { return };
-                    s.oc_sid.clone().map(|oc| (s.dir.clone(), oc))
-                };
-                if let Some((dir, oc)) = req {
-                    self.manager.share(dir, oc, false);
-                }
-            }
+            "share" => self.manager.share(true),
+            "unshare" => self.manager.share(false),
             "init" => {
-                let req = {
-                    let Some(s) = self.session(sid) else { return };
-                    s.oc_sid.clone().map(|oc| (s.dir.clone(), oc))
-                };
-                if let Some((dir, oc)) = req {
-                    let args = args.to_string();
-                    self.manager.run_command(dir, oc, "init".into(), args);
-                    self.flash("running /init…");
-                }
+                self.manager.run_command("init".into());
+                self.flash("running /init…");
             }
             "close" => self.close_session(self.focus),
             "delete" | "remove" => {
                 self.close_session(self.focus);
-                self.flash("session deleted from workspace (server history kept)");
+                self.flash("session deleted from workspace (history kept)");
             }
             "rename" => {
                 if args.is_empty() {
@@ -2642,10 +2541,6 @@ impl App {
             "push" => self.start_push(sid, args),
             "fork" => self.fork_active(),
             "theme" => self.open_theme_picker(),
-            "help" => {
-                self.open_keymap();
-                self.dirty = true;
-            }
             "quit" => {
                 if self.cfg.behavior.confirm_quit && self.is_busy() {
                     self.overlay = Overlay::ConfirmQuit;
@@ -2659,16 +2554,8 @@ impl App {
                     .iter()
                     .any(|c| c.name == other);
                 if known {
-                    let req = {
-                        let Some(s) = self.session(sid) else { return };
-                        s.oc_sid.clone().map(|oc| (s.dir.clone(), oc))
-                    };
-                    if let Some((dir, oc)) = req {
-                        let args = args.to_string();
-                        let cmd = other.to_string();
-                        self.manager.run_command(dir, oc, cmd, args);
-                        self.flash(format!("running /{other}…"));
-                    }
+                    self.manager.run_command(other.to_string());
+                    self.flash(format!("running /{other}…"));
                 } else {
                     self.flash(format!("unknown command /{other} — /help for list"));
                 }
@@ -3631,11 +3518,7 @@ impl App {
 
     /// Build rewind rows (user turns + per-turn diff stats) from a transcript.
     /// `tree_users` are `(entry_id, text)` for the local history tree.
-    fn build_rewind_rows(
-        msgs: &[Message],
-        tree_users: &[(String, String)],
-        local: bool,
-    ) -> Vec<RewindRow> {
+    fn build_rewind_rows(msgs: &[Message], tree_users: &[(String, String)]) -> Vec<RewindRow> {
         let user_idx: Vec<usize> = msgs
             .iter()
             .enumerate()
@@ -3674,16 +3557,10 @@ impl App {
                     }
                 }
             }
-            let (entry, msg_id) = if local {
-                (tree_users.get(k).map(|(e, _)| e.clone()), None)
-            } else {
-                (None, Some(msgs[i].id.clone()))
-            };
             rows.push(RewindRow {
                 index: i,
                 text,
-                entry,
-                msg_id,
+                entry: tree_users.get(k).map(|(e, _)| e.clone()),
                 adds,
                 dels,
                 files: files.len(),
@@ -3694,46 +3571,38 @@ impl App {
 
     /// Open the agy-style rewind picker for session `sid`.
     pub fn open_rewind(&mut self, sid: u32) {
-        let Some((oc, local)) = self
-            .session(sid)
-            .map(|s| (s.oc_sid.clone(), self.manager.is_local()))
-        else {
+        let Some(oc) = self.session(sid).map(|s| s.oc_sid.clone()) else {
             return;
         };
         let Some(oc) = oc else {
             self.flash("session is still connecting…");
             return;
         };
-        // Local sessions: map each user turn to its history-tree entry (the
-        // active path preserves transcript order, so index alignment holds).
-        let tree_users: Vec<(String, String)> = if local {
-            self.manager
-                .local_tree_snapshot(&oc)
-                .map(|t| {
-                    t.active_path()
-                        .into_iter()
-                        .filter(|e| e.kind == crate::tree::EntryKind::User)
-                        .map(|e| (e.id.clone(), e.text.clone()))
-                        .collect()
-                })
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        // Map each user turn to its history-tree entry (the active path
+        // preserves transcript order, so index alignment holds).
+        let tree_users: Vec<(String, String)> = self
+            .manager
+            .local_tree_snapshot(&oc)
+            .map(|t| {
+                t.active_path()
+                    .into_iter()
+                    .filter(|e| e.kind == crate::tree::EntryKind::User)
+                    .map(|e| (e.id.clone(), e.text.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
         let msgs = self
             .session(sid)
             .map(|s| s.messages.clone())
             .unwrap_or_default();
         // Entry ids only map 1:1 when the tree and transcript agree.
-        let aligned: Vec<(String, String)> = if local
-            && tree_users.len()
-                != msgs.iter().filter(|m| m.role == Role::User).count()
-        {
-            Vec::new()
-        } else {
-            tree_users
-        };
-        let rows = Self::build_rewind_rows(&msgs, &aligned, local);
+        let aligned: Vec<(String, String)> =
+            if tree_users.len() != msgs.iter().filter(|m| m.role == Role::User).count() {
+                Vec::new()
+            } else {
+                tree_users
+            };
+        let rows = Self::build_rewind_rows(&msgs, &aligned);
         if rows.is_empty() {
             self.flash("nothing to rewind");
             return;
@@ -3751,22 +3620,14 @@ impl App {
         let Some(row) = self.rewind_ui.rows.get(self.rewind_ui.selected).cloned() else {
             return;
         };
-        let Some((dir, oc, local)) = self
-            .session(sid)
-            .map(|s| (s.dir.clone(), s.oc_sid.clone(), self.manager.is_local()))
-        else {
+        let Some(oc) = self.session(sid).and_then(|s| s.oc_sid.clone()) else {
             return;
         };
-        let Some(oc) = oc else { return };
-        if local {
-            let Some(entry) = &row.entry else {
-                self.flash("history tree out of sync — use /tree");
-                return;
-            };
-            self.manager.local_rewind(oc, entry.clone());
-        } else if let Some(mid) = &row.msg_id {
-            self.manager.revert(dir, oc, mid.clone());
-        }
+        let Some(entry) = &row.entry else {
+            self.flash("history tree out of sync — use /tree");
+            return;
+        };
+        self.manager.local_rewind(oc, entry.clone());
         if let Some(s) = self.session_mut(sid) {
             let removed: Vec<Message> = s.messages.split_off(row.index.min(s.messages.len()));
             s.redo_snapshot = Some(removed);
@@ -3785,16 +3646,6 @@ impl App {
 
     /// `/redo`: restore the turn dropped by the last local rewind.
     pub fn redo(&mut self, sid: u32) {
-        if !self.manager.is_local() {
-            let req = {
-                let Some(s) = self.session(sid) else { return };
-                s.oc_sid.clone().map(|oc| (s.dir.clone(), oc))
-            };
-            if let Some((dir, oc)) = req {
-                self.manager.unrevert(dir, oc);
-            }
-            return;
-        }
         let Some((oc, removed)) = self
             .session(sid)
             .map(|s| (s.oc_sid.clone(), s.redo_snapshot.clone()))
@@ -3848,7 +3699,6 @@ impl App {
                     id: e.id.clone(),
                     depth,
                     label: label(e),
-                    kind: e.kind,
                     active: active.contains(&e.id),
                 });
                 walk(tree, &e.id, depth + 1, active, rows);
@@ -3859,7 +3709,6 @@ impl App {
                 id: r.id.clone(),
                 depth: 0,
                 label: label(r),
-                kind: r.kind,
                 active: active.contains(&r.id),
             });
             walk(tree, &r.id, 1, &active, &mut rows);
@@ -3874,30 +3723,18 @@ impl App {
             .unwrap_or_else(|| self.initial_dir.clone());
         self.remember_dir(&dir);
         self.resume_picker = ResumePickerState::default();
-        // The local backend keeps sessions as on-disk tree sidecars.
-        if self.manager.is_local() {
-            let dir_s = dir.to_string_lossy().to_string();
-            self.resume_picker.items = crate::tree::SessionTree::list_sessions()
-                .into_iter()
-                .map(|s| crate::models::OcSession {
-                    id: s.id,
-                    title: s.title,
-                    directory: s.directory.unwrap_or_else(|| dir_s.clone()),
-                    updated_ms: Some(s.updated_ms),
-                })
-                .collect();
-            self.resume_picker.loaded = true;
-            self.overlay = Overlay::ResumeSession;
-            self.dirty = true;
-            return;
-        }
-        // Show every known session first; the refresh below fills in the rest.
-        self.resume_picker.items = self.all_cached_sessions();
+        // Sessions are on-disk tree sidecars.
+        let dir_s = dir.to_string_lossy().to_string();
+        self.resume_picker.items = crate::tree::SessionTree::list_sessions()
+            .into_iter()
+            .map(|s| crate::models::OcSession {
+                id: s.id,
+                title: s.title,
+                directory: s.directory.unwrap_or_else(|| dir_s.clone()),
+                updated_ms: Some(s.updated_ms),
+            })
+            .collect();
         self.resume_picker.loaded = true;
-        self.preload_known_dirs();
-        let req = self.manager.next_req();
-        self.resume_picker.req = Some(req);
-        self.manager.list_server_sessions(req, dir.clone());
         self.overlay = Overlay::ResumeSession;
         self.dirty = true;
     }
@@ -4898,22 +4735,6 @@ impl App {
             .collect()
     }
 
-    pub fn model_choices(&self) -> Vec<String> {
-        let mut v = vec!["default".to_string()];
-        v.extend(self.providers.iter().map(|p| p.label.clone()));
-        v
-    }
-
-    pub fn model_choice_at(&self, idx: usize) -> Option<ModelRef> {
-        if idx == 0 {
-            return self.default_model.clone();
-        }
-        self.providers.get(idx - 1).map(|p| ModelRef {
-            provider_id: p.provider_id.clone(),
-            model_id: p.model_id.clone(),
-        })
-    }
-
     pub async fn execute(&mut self, cmd: Cmd) {
         match cmd {
             Cmd::NewSession => self.open_new_dialog(),
@@ -5357,7 +5178,6 @@ impl App {
                             self.viewer = Some(ViewerState {
                                 title: theme::abbreviate_path(&path),
                                 lines,
-                                raw: text.clone(),
                                 scroll: 0,
                                 jump_line: line,
                             });
@@ -5516,16 +5336,8 @@ impl App {
                     t.wait();
                 }
                 let auto = self.cfg.behavior.auto_approve_permissions;
-                let dir = self.sessions[idx].dir.clone();
-                let oc = self.sessions[idx].oc_sid.clone();
                 if auto {
-                    if let Some(oc) = oc {
-                        if self.manager.is_local() {
-                            self.manager.local_permission_reply(oc, id.clone(), "once".into());
-                        } else {
-                            self.manager.reply_permission(dir, oc, id.clone(), "once".into());
-                        }
-                    }
+                    self.manager.local_permission_reply(id.clone(), "once".into());
                 }
                 let s = &mut self.sessions[idx];
                 s.pending_perm = if auto {
@@ -5869,7 +5681,7 @@ mod harness_tests {
         let msgs = vec![u1, a1, u2];
 
         let tree_users = vec![("e2".to_string(), "first request".to_string())];
-        let rows = App::build_rewind_rows(&msgs, &tree_users, true);
+        let rows = App::build_rewind_rows(&msgs, &tree_users);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].text, "first request");
         assert_eq!(rows[0].adds, 2);
@@ -5881,10 +5693,9 @@ mod harness_tests {
         assert_eq!(rows[1].adds, 0);
         assert_eq!(rows[1].index, 2);
 
-        // Non-local rows expose the message id for OpenCode revert.
-        let rows = App::build_rewind_rows(&msgs, &[], false);
-        assert_eq!(rows[0].msg_id.as_deref(), Some("msg_u1"));
-        assert!(rows[0].entry.is_none());
+        // Without tree entries there is nothing to rewind to.
+        let rows = App::build_rewind_rows(&msgs, &[]);
+        assert!(rows[0].entry.is_none(), "no tree entry means no rewind target");
     }
 
     #[test]

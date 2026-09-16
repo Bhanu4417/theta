@@ -3,7 +3,7 @@
 use crate::app::App;
 
 use crate::session::{SessionState, SessStatus};
-use crate::theme::{pal, self};
+use crate::theme::{pal, self, SpanExt};
 use crate::ui::conversation;
 use ratatui::layout::Rect;
 use ratatui::style::{Style};
@@ -318,13 +318,21 @@ pub fn empty_hint(f: &mut ratatui::Frame, area: Rect, sess: &SessionState) {
         },
     );
 }
-trait SpanExt {
-    fn patch(self, style: Style) -> Self;
-}
-impl SpanExt for Span<'static> {
-    fn patch(self, style: Style) -> Self {
-        Span::styled(self.content, self.style.patch(style))
-    }
+/// Spans for one rendered input row: the prompt glyph / indent prefix, then the
+/// typed text. The prefix keeps its own accent color (`bar` only fills the
+/// background); the text is painted with the theme foreground, since
+/// `input_layout` produces unstyled spans and would otherwise inherit the
+/// terminal default.
+fn input_row_spans(
+    prefix: String,
+    mark: Style,
+    row: &[Span<'static>],
+    bar: Style,
+    text: Style,
+) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = vec![Span::styled(prefix, mark.patch(bar))];
+    spans.extend(row.iter().cloned().map(|sp| sp.patch(text)));
+    spans
 }
 
 fn pane_title(sess: &SessionState, focused: bool, width: u16, tick: u64) -> Line<'static> {
@@ -477,14 +485,21 @@ fn render_input(
     let bar_color = if focused { pal().border_focus } else { pal().border };
     let bar_style = Style::default().fg(bar_color).bg(pal().bg_float);
 
-    // Panel fill for every row (footer overwrites its own row after).
-    for r in 0..area.height {
+    // Panel fill. The footer paints the last row itself, so it is excluded
+    // here — filling it only to overwrite it wasted a widget per row on every
+    // frame. One widget covers the rest instead of one per row.
+    let fill_rows = area.height.saturating_sub(1);
+    if fill_rows > 0 {
+        let fill = Line::from(vec![
+            Span::styled("▌".to_string(), bar_style),
+            Span::styled(" ".repeat(w.saturating_sub(1)), bg),
+        ]);
+        let lines: Vec<Line<'static>> = std::iter::repeat_with(|| fill.clone())
+            .take(fill_rows as usize)
+            .collect();
         f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("▌".to_string(), bar_style),
-                Span::styled(" ".repeat(w.saturating_sub(1)), bg),
-            ])),
-            Rect { x: area.x, y: area.y + r, width: area.width, height: 1 },
+            Paragraph::new(lines),
+            Rect { x: area.x, y: area.y, width: area.width, height: fill_rows },
         );
     }
 
@@ -590,6 +605,8 @@ fn render_input(
     } else {
         theme::mute()
     };
+    // Foreground for the text the user is typing, on the chatbox background.
+    let input_style = theme::fg(pal().fg).patch(bg);
     let avail_w = body.width as usize - 2;
     let body_w = body.width as usize;
 
@@ -644,9 +661,7 @@ fn render_input(
             } else {
                 ("  ".to_string(), theme::mute())
             };
-            let mut spans: Vec<Span<'static>> = vec![Span::styled(prefix, mark).patch(bg)];
-            spans.extend(row.iter().cloned().map(|sp| sp.patch(bg)));
-            lines.push(Line::from(spans));
+            lines.push(Line::from(input_row_spans(prefix, mark, row, bg, input_style)));
         }
     }
     while lines.len() < body.height as usize {
@@ -854,3 +869,44 @@ fn prompt_rows(sess: &SessionState, w: usize, h: usize, bg: Style) -> Vec<Line<'
     rows
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typed_chatbox_text_uses_the_theme_foreground() {
+        let bg = Style::default().bg(pal().bg_float);
+        let row = vec![Span::raw("hello")];
+        let spans = input_row_spans(
+            format!("{} ", crate::theme::P_SYMBOL),
+            theme::bold(pal().cyan),
+            &row,
+            bg,
+            theme::fg(pal().fg).patch(bg),
+        );
+        let text = spans.last().expect("text span");
+        assert_eq!(
+            text.style.fg,
+            Some(pal().fg),
+            "typed text must use the theme foreground, not the terminal default"
+        );
+        assert_eq!(text.style.bg, Some(pal().bg_float), "on the chatbox background");
+        assert_eq!(text.content, "hello");
+    }
+
+    #[test]
+    fn prompt_glyph_keeps_its_accent_color() {
+        let bg = Style::default().bg(pal().bg_float);
+        let spans = input_row_spans(
+            format!("{} ", crate::theme::P_SYMBOL),
+            theme::bold(pal().cyan),
+            &[Span::raw("x")],
+            bg,
+            theme::fg(pal().fg).patch(bg),
+        );
+        // The prefix must not be repainted by the text style.
+        assert_eq!(spans[0].style.fg, Some(pal().cyan), "{:?}", spans[0].style);
+        assert_eq!(spans[0].style.bg, Some(pal().bg_float));
+    }
+}

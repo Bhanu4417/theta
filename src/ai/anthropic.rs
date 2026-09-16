@@ -6,7 +6,7 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 
 use crate::ai::{
-    sse_data_lines, AssistantTurn, ChatMessage, ChatRequest, FinishReason, Provider, ProviderEvent,
+    sse_data_lines, AssistantTurn, ChatRequest, FinishReason, Provider, ProviderEvent,
     Role, ToolCall,
 };
 use crate::providers::ProviderError;
@@ -333,7 +333,7 @@ fn net(e: reqwest::Error) -> ProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai::ToolSpec;
+    use crate::ai::{ChatMessage, ToolSpec};
 
     #[test]
     fn body_has_system_tools_and_tool_results() {

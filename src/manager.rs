@@ -73,10 +73,6 @@ impl Manager {
     }
 
     /// Always true: Theta's own loop is the only backend.
-    pub fn is_local(&self) -> bool {
-        true
-    }
-
     pub async fn shutdown_all(&self) {
         // No external processes to stop.
     }
@@ -88,16 +84,6 @@ impl Manager {
     /// Emit an operation result (success/failure) to the UI.
     fn result(&self, ok: bool, message: impl Into<String>) {
         self.ref_.emit(AppEvent::OpResult { ok, message: message.into() });
-    }
-
-    fn require_local(&self, what: &str) -> Option<Arc<LocalProvider>> {
-        match &self.ref_.local {
-            Some(l) => Some(l.clone()),
-            None => {
-                self.result(false, format!("{what}: the harness failed to start"));
-                None
-            }
-        }
     }
 
     // -- History tree / rewind (local) ------------------------------------
@@ -162,7 +148,7 @@ impl Manager {
     }
 
     /// Answer an interactive permission request.
-    pub fn local_permission_reply(&self, _oc_sid: String, id: String, response: String) {
+    pub fn local_permission_reply(&self, id: String, response: String) {
         if let Some(gates) = &self.ref_.local_gates {
             let decision = crate::agent::permissions::decision_for(&response);
             if !gates.permissions.reply(&id, decision) {
@@ -282,7 +268,7 @@ impl Manager {
         });
     }
 
-    pub fn abort_session(&self, _dir: PathBuf, oc_sid: String) {
+    pub fn abort_session(&self, oc_sid: String) {
         let Some(local) = self.ref_.local.clone() else { return };
         let m = self.ref_.clone();
         tokio::spawn(async move {
@@ -324,18 +310,14 @@ impl Manager {
 
     // -- Questions / permissions ------------------------------------------
 
-    pub fn reply_permission(&self, _dir: PathBuf, oc_sid: String, pid: String, response: String) {
-        self.local_permission_reply(oc_sid, pid, response);
-    }
-
-    pub fn reply_question(&self, _dir: PathBuf, id: String, answers: Vec<Vec<String>>) {
+    pub fn reply_question(&self, id: String, answers: Vec<Vec<String>>) {
         if let Some(gates) = &self.ref_.local_gates {
             let ok = gates.questions.reply(&id, answers);
             self.result(ok, if ok { "answer sent" } else { "question expired" });
         }
     }
 
-    pub fn reject_question(&self, _dir: PathBuf, id: String) {
+    pub fn reject_question(&self, id: String) {
         if let Some(gates) = &self.ref_.local_gates {
             let ok = gates.questions.reject(&id);
             self.result(ok, if ok { "question rejected" } else { "question expired" });
@@ -410,7 +392,7 @@ impl Manager {
         });
     }
 
-    pub fn preload_dir(&self, _server_dir: PathBuf, target_dir: PathBuf) {
+    pub fn preload_dir(&self, target_dir: PathBuf) {
         let m = self.ref_.clone();
         tokio::spawn(async move {
             let dir_c = target_dir.canonicalize().unwrap_or(target_dir);
@@ -420,34 +402,14 @@ impl Manager {
 
     // -- Misc commands -----------------------------------------------------
 
-    pub fn run_command(&self, _dir: PathBuf, _oc_sid: String, command: String, _arguments: String) {
+    pub fn run_command(&self, command: String) {
         self.result(
             false,
             format!("custom /{command} commands are not supported; skills auto-load"),
         );
     }
 
-    pub fn summarize(&self, _dir: PathBuf, oc_sid: String, _model: ModelRef) {
-        self.local_compact(oc_sid);
-    }
-
-    pub fn revert(&self, _dir: PathBuf, oc_sid: String, message_id: String) {
-        if let Some(local) = &self.ref_.local {
-            if local.rewind_user(&oc_sid, &message_id) {
-                self.result(true, "rewound");
-            }
-        }
-    }
-
-    pub fn unrevert(&self, _dir: PathBuf, oc_sid: String) {
-        if let Some(local) = &self.ref_.local {
-            if local.redo(&oc_sid) {
-                self.result(true, "redone");
-            }
-        }
-    }
-
-    pub fn share(&self, _dir: PathBuf, _oc_sid: String, want: bool) {
+    pub fn share(&self, want: bool) {
         self.result(
             false,
             if want {
@@ -827,10 +789,4 @@ mod tests {
         assert!(make_provider(&cfg).is_ok(), "opencode zen builds from its preset");
     }
 
-    #[tokio::test]
-    async fn manager_is_always_local() {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let m = Manager::new(tx, Config::default());
-        assert!(m.is_local());
-    }
 }

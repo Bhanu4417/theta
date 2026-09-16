@@ -58,6 +58,7 @@ pub struct LocalProvider {
 
 impl LocalProvider {
     /// Fixed-agent provider (tests, single-model use).
+    #[cfg(test)]
     pub fn new(agent: Arc<AgentLoop>, default_dir: impl Into<String>) -> Self {
         let fixed = agent.clone();
         let factory: AgentFactory = Arc::new(move |_p, _m, _a| Ok(fixed.clone()));
@@ -304,27 +305,6 @@ impl LocalProvider {
             let _ = s.tree.save(&path);
         }
         text
-    }
-
-    /// Rewind to the most recent user entry (used by the OpenCode-style
-    /// `/undo` path; the rewind overlay uses [`Self::rewind`] directly).
-    pub fn rewind_user(&self, id: &str, _message_id: &str) -> bool {
-        let entry = {
-            let sessions = self.inner.sessions.lock().unwrap();
-            let Some(s) = sessions.get(id) else {
-                return false;
-            };
-            s.tree
-                .entries
-                .iter()
-                .rev()
-                .find(|e| e.kind == crate::tree::EntryKind::User)
-                .map(|e| e.id.clone())
-        };
-        match entry {
-            Some(e) => self.rewind(id, &e).is_some(),
-            None => false,
-        }
     }
 
     /// `/redo`: restore the leaf most recently abandoned by [`Self::rewind`].

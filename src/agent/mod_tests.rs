@@ -289,8 +289,7 @@ async fn loop_runs_a_tool_then_finishes() {
     ]));
     let agent = AgentLoop::new(provider, "gpt-4o");
 
-    let (tx, mut rx_vec) = (std::sync::Arc::new(Mutex::new(Vec::<HarnessEvent>::new())), ());
-    let _ = rx_vec;
+    let tx = std::sync::Arc::new(Mutex::new(Vec::<HarnessEvent>::new()));
     let sink = tx.clone();
     let mut emit = move |e: HarnessEvent| sink.lock().unwrap().push(e);
 

@@ -77,12 +77,6 @@ pub fn load() -> Option<Workspace> {
     toml::from_str(&text).ok()
 }
 
-pub fn clear() {
-    if let Some(path) = state_path() {
-        let _ = std::fs::remove_file(path);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Transcript cache
 //

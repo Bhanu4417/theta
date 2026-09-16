@@ -107,16 +107,6 @@ pub fn tail(path: &Path, max: usize) -> Vec<String> {
     lines
 }
 
-/// One-line, newline-escaped excerpt for logs.
-pub fn snippet(s: &str, max: usize) -> String {
-    let total = s.chars().count();
-    let mut out: String = s.chars().take(max).collect();
-    if total > max {
-        out.push('…');
-    }
-    out.replace('\n', "\\n").replace('\r', "")
-}
-
 /// Log a line when `--log` is active (formats lazily).
 #[macro_export]
 macro_rules! tlog {
@@ -153,9 +143,4 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[test]
-    fn snippet_escapes_and_truncates() {
-        assert_eq!(snippet("a\nb", 10), "a\\nb");
-        assert_eq!(snippet("abcdef", 3), "abc…");
-    }
 }

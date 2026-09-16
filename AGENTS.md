@@ -5,11 +5,11 @@ edits this repository. Read it fully before making changes.
 
 ## What Theta is
 
-Theta is a **terminal client** for the OpenCode agent harness: a multi-session,
-tiled-pane TUI written in Rust (ratatui + crossterm + tokio). It does **not**
-talks to models itself: it owns the agent loop, tools, providers, permissions
-and context management. See `README.md` for the user manual and `src/` for the
-architecture.
+Theta is a **terminal-native multi-agent workspace** with its own in-process
+agent harness: a multi-session, tiled-pane TUI written in Rust (ratatui +
+crossterm + tokio). It **does not** wrap an external agent binary — it owns the
+agent loop, tools, providers, permissions and context management itself. See
+`README.md` for the user manual and `src/` for the architecture.
 
 **Architecture:** Theta **is** an independent harness now. The agent loop lives
 in `src/agent/`, providers in `src/ai/`, the local adapter in
@@ -59,7 +59,7 @@ confirmed visually.
 
 | File | Responsibility |
 | --- | --- |
-| `main.rs` | terminal setup, event loop (keys / SSE / tick), re-exec on `/refresh` |
+| `main.rs` | terminal setup, event loop (keys / `AppEvent` / tick), re-exec on `/refresh` |
 | `app.rs` | all state, key routing, overlays, commands, `AppEvent` handling |
 | `session.rs` | per-session transcript, input buffer, status, questions/queue |
 | `manager.rs` | local harness bridge: async work → `AppEvent`, event pump |
@@ -82,24 +82,32 @@ only when the transcript, width, theme, or animation tick changes.
 
 - Harness calls are fire-and-forget and report back via `AppEvent`; never block
   the event loop on I/O.
-- Keep the `Inner` mutex in `manager.rs` short — never hold it across `await`.
+- Keep the `Inner` mutex in `providers/local/mod.rs` short — never hold it
+  across `await`.
 - Overlays are modal; `Ctrl+C` / `Ctrl+Q` must work from **any** overlay.
 - Copy actions use `Ctrl+Y` (never bare `y`, which must remain typable).
 - Prefer `saturating_*` arithmetic in layout code; guard small `Rect`s.
 - Long shell tools render a determinate progress bar (parse `%` from
   `metadata.output`, else ease a time-based estimate toward 95%).
 
-## Roadmap toward an independent harness
+## The harness architecture (migration complete)
 
-Implemented as a client today; to become a harness without a rewrite:
+Theta is a complete, independent harness — the local loop replaced the external
+backend without a rewrite, and the UI was unchanged:
 
-1. Keep `events.rs` as the stable interface (the "protocol").
-2. Add a `harness` module implementing the agent loop (provider → tool calls →
-   tool results → repeat) that emits the same `AppEvent`s.
-3. Providers behind one trait (start with OpenAI-compatible); tools as
-   schema + handler (read/write/edit/bash/grep/glob/webfetch).
-4. Own context management (token counting + compaction) and permissions.
-5. (Done.) The local loop replaced the external backend; the UI was unchanged.
+1. `events.rs` is the stable interface (the "protocol") between background work
+   and the UI loop; `harness/` defines the provider-neutral `HarnessEvent` and
+   transcript model.
+2. `agent/` implements the agent loop (provider → tool calls → tool results →
+   repeat) and emits those same events.
+3. Providers implement one `ai::Provider` trait (OpenAI-compatible, Anthropic,
+   Google); tools implement the `agent::tools::Tool` trait (schema + handler:
+   read/write/edit/multiedit/bash/grep/glob/webfetch/ask/task).
+4. Context management (token counting + compaction in `agent::context`) and
+   permissions (`agent::permissions`) are owned locally.
+5. `providers/local` exposes the in-process loop behind the same
+   `AgentProvider` + `EventPump` contract, so `manager.rs` is a local-only
+   bridge.
 
 Design every new feature against the stable `HarnessEvent` interface.
 

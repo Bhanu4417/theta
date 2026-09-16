@@ -8,7 +8,7 @@ pub mod splash;
 pub mod statusbar;
 
 use crate::app::{App, Overlay};
-use crate::theme::{pal, self};
+use crate::theme::pal;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::widgets::Block;

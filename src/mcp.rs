@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
-use crate::agent::tools::{str_arg, Tool, ToolOutcome};
+use crate::agent::tools::{Tool, ToolOutcome};
 use crate::ai::ToolSpec;
 use crate::config::McpServerConfig;
 
@@ -381,7 +381,8 @@ for line in sys.stdin:
         // Without a live client we only assert the spec shape/id mapping.
         let spec_name = tool_id("srv", &info.name);
         assert_eq!(spec_name, "mcp__srv__x");
-        // str_arg is used by other tools; ensure it's importable here.
+        // str_arg is used by the built-in tools; ensure it is importable here.
+        use crate::agent::tools::str_arg;
         let _ = str_arg(&json!({"a": 1}), &["a"]);
     }
 }

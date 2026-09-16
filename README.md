@@ -1,8 +1,8 @@
 # Θ Theta
 
-**A terminal-native multi-agent workspace for [OpenCode](https://opencode.ai).**
+**A terminal-native multi-agent workspace with its own in-process agent harness.**
 
-Run multiple OpenCode sessions simultaneously in one terminal and view them as
+Run multiple agent sessions simultaneously in one terminal and view them as
 beautifully tiled, resizable panes — Tokyo at night, for your coding agents.
 
 ```text
@@ -29,7 +29,7 @@ cargo build --release
 # binary: target/release/theta
 ```
 
-Requires Rust 1.80+ and the `opencode` CLI on your `PATH`.
+Requires the stable Rust toolchain (edition 2021).
 
 Install it so you can just type `theta` anywhere:
 
@@ -77,31 +77,28 @@ Type `/` in any session input for the command menu (filter by typing,
 | `/agent [name]` | Switch agent (build, plan, …) |
 | `/new` | New session |
 | `/sessions` | Jump to another open session |
-| `/clear` | Clear the transcript view (server history kept) |
+| `/clear` | Clear the transcript view (history kept) |
 | `/compact` | Summarize the conversation |
 | `/undo` / `/redo` | Revert / re-apply the last message |
-| `/share` / `/unshare` | Share the session and get a URL |
-| `/init [focus]` | Guided AGENTS.md setup (server command) |
+| `/share` / `/unshare` | Share the session (no share links; suggests `/export`) |
+| `/init [focus]` | AGENTS.md setup — currently reports it is unsupported |
 | `/refresh` | Reload the newest build in place (soft restart) |
 | `/export [file]` | Export this session (Markdown, or JSONL if `.jsonl`) |
 | `/editor` | Compose the prompt in `$EDITOR` (also `Ctrl+G`) |
 | `/tree` | Jump to an earlier point in a local session's history tree |
 | `/push [message]` | Commit all changes and push the session's project |
 | `/rename [name]` | Rename this session |
-| `/delete` | Delete session from the workspace (server history kept) |
+| `/delete` | Delete session from the workspace (history kept) |
 | `/help` · `/quit` | Keys · quit |
 
-Custom commands defined in the project's OpenCode config are fetched from the
-server and appear in the same menu automatically. The chosen model and agent
-are used for subsequent prompts in that session and shown in the status bar.
+The chosen model and agent are used for subsequent prompts in that session and
+shown in the status bar.
 
-`/refresh` saves the workspace, shuts the per-directory servers down cleanly,
-and re-executes the `theta` binary so a freshly built version takes over
-without quitting and reopening by hand. Pending agent questions (the `ask`
-tool) and permission requests are re-fetched when sessions reconnect, so
-nothing is lost across a refresh. Questions surface as a picker — navigate
-with `↑/↓`, toggle with `Space` (multi-select), confirm with `Enter`, reject
-with `Esc`.
+`/refresh` saves the workspace and re-executes the `theta` binary so a freshly
+built version takes over without quitting and reopening by hand. Session
+history is restored from the local session tree when the new process starts.
+Questions surface as a picker — navigate with `↑/↓`, toggle with `Space`
+(multi-select), confirm with `Enter`, reject with `Esc`.
 
 `/push` is available only in a session's input box (not the global command
 palette). It stages everything in that session's directory, commits with the
@@ -114,7 +111,7 @@ the status bar, then `Git pushed "commit subject" owner/repo`.
 | Key | Action |
 | --- | --- |
 | `^N` | New session (name + directory, or resume a recent one) |
-| `^R` | Resume a previous OpenCode session (searchable list) |
+| `^R` | Resume a previous session (searchable list) |
 | `^W` | Close session |
 | `^K` | Command palette |
 | `^T` | Change tiling (auto grid / rows / columns) |
@@ -126,7 +123,7 @@ the status bar, then `Git pushed "commit subject" owner/repo`.
 | `Alt+h j k l` | Resize pane left / down / up / right (alias) |
 | `Alt+Shift+h j k l` | Move pane in a direction (alias) |
 | `Alt+1..9` | Focus nth pane |
-| `^P` | Search files (server-side, gitignore-aware) |
+| `^P` | Search files (local, gitignore-aware) |
 | `^⇧F` (or `Alt+⇧F`) | Search project content |
 | `^F` | Search current conversation |
 | `^B` | Toggle file explorer panel |
@@ -155,9 +152,10 @@ Panes auto-tile by terminal aspect: 2 → side-by-side, 3 → two over one,
 panes share separator lines. When the terminal is too small for the grid,
 the focused session stays full-screen and usable. Layouts, weights, and open sessions persist to
 `~/.local/share/theta/workspace.toml` and are restored on the next launch —
-including full transcript history replay from the OpenCode server. The
-new-session dialog skips model picking (the server default is used; change
-it any time with `/model`) and lists recent server sessions to resume.
+including full transcript history replayed from the local session tree. The
+new-session dialog skips model picking (the last model you picked, or the
+configured default, is used; change it any time with `/model`) and lists
+recent local sessions to resume.
 
 ## Usage metrics
 
@@ -322,6 +320,6 @@ src/
 └── ui/                header, panes, conversation cache, overlays
 ```
 
-Rendering is event-driven: keyboard/OpenCode events mutate state, the draw
+Rendering is event-driven: keyboard/harness events mutate state, the draw
 pass renders from a per-session line cache that rebuilds only when the
 transcript, width, or spinner tick changes.

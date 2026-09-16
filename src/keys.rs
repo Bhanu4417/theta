@@ -114,45 +114,6 @@ impl Action {
         }
     }
 
-    pub fn from_name(s: &str) -> Option<Action> {
-        Some(match s {
-            "new_session" => Action::NewSession,
-            "resume" => Action::Resume,
-            "switch" => Action::Switch,
-            "palette" => Action::Palette,
-            "close" => Action::Close,
-            "quit" => Action::Quit,
-            "maximize" => Action::Maximize,
-            "tiling" => Action::Tiling,
-            "explorer" => Action::Explorer,
-            "files" => Action::Files,
-            "project" => Action::Project,
-            "conversation" => Action::Conversation,
-            "model" => Action::Model,
-            "agent" => Action::Agent,
-            "git_diff" => Action::GitDiff,
-            "git_log" => Action::GitLog,
-            "interrupt" => Action::Interrupt,
-            "focus_next" => Action::FocusNext,
-            "focus_prev" => Action::FocusPrev,
-            "focus_left" => Action::FocusLeft,
-            "focus_right" => Action::FocusRight,
-            "focus_up" => Action::FocusUp,
-            "focus_down" => Action::FocusDown,
-            "move_left" => Action::MoveLeft,
-            "move_right" => Action::MoveRight,
-            "move_up" => Action::MoveUp,
-            "move_down" => Action::MoveDown,
-            "resize_left" => Action::ResizeLeft,
-            "resize_right" => Action::ResizeRight,
-            "resize_up" => Action::ResizeUp,
-            "resize_down" => Action::ResizeDown,
-            "keymap" => Action::Keymap,
-            "editor" => Action::Editor,
-            _ => return None,
-        })
-    }
-
     pub fn label(&self) -> &'static str {
         match self {
             Action::NewSession => "New session",
@@ -409,13 +370,6 @@ impl Keymap {
         }
     }
 
-    /// (action, spec-string) pairs for persistence — empty = unbound.
-    pub fn to_config_map(&self) -> HashMap<String, String> {
-        self.bindings
-            .iter()
-            .map(|(a, ks)| (a.name().to_string(), ks.as_ref().map(|s| s.to_str()).unwrap_or_default()))
-            .collect()
-    }
 }
 
 #[cfg(test)]

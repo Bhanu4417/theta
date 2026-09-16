@@ -1,9 +1,22 @@
 //! Theme engine: runtime palettes driving every colour in the UI.
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
+
+/// Style-preserving patch for spans: merges `style` over the span's own style,
+/// so callers can add a background without discarding the foreground. Shared by
+/// the pane and overlay renderers (it was duplicated in both).
+pub trait SpanExt {
+    fn patch(self, style: Style) -> Self;
+}
+
+impl SpanExt for Span<'static> {
+    fn patch(self, style: Style) -> Self {
+        Span::styled(self.content, self.style.patch(style))
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct Palette {
@@ -37,8 +50,6 @@ pub struct Palette {
 
     /// "Th." wordmark: T, h, dot.
     pub mark_t: Color,
-    pub mark_h: Color,
-    pub mark_dot: Color,
     /// Thinking/loader spinner gradient stops (cycled).
     pub spin_stops: [Color; 4],
 }
@@ -58,7 +69,7 @@ pub const THEMES: &[Palette] = &[
         fg: c(0xc0caf5), fg_dim: c(0x565f89), fg_mute: c(0x414868), fg_soft: c(0x9aa4c4),
         blue: c(0x7aa2f7), cyan: c(0x7dcfff), teal: c(0x73daca), purple: c(0xbb9af7),
         orange: c(0xff9e64), yellow: c(0xe0af68), green: c(0x9ece6a), red: c(0xf7768e),
-        mark_t: c(0x7aa2f7), mark_h: c(0x7aa2f7), mark_dot: c(0x7aa2f7),
+        mark_t: c(0x7aa2f7),
         spin_stops: [c(0x7dcfff), c(0x7aa2f7), c(0xbb9af7), c(0x73daca)],
     },
     // ── Theta Moon (tokyonight moon) ────────────────────────────
@@ -71,7 +82,7 @@ pub const THEMES: &[Palette] = &[
         fg: c(0xc8d3f5), fg_dim: c(0x636da2), fg_mute: c(0x49508a), fg_soft: c(0xa9b1d6),
         blue: c(0x82aaff), cyan: c(0x86e1fc), teal: c(0x4fd6be), purple: c(0xc099ff),
         orange: c(0xffc777), yellow: c(0xffc777), green: c(0xc3e88d), red: c(0xff757f),
-        mark_t: c(0x82aaff), mark_h: c(0x82aaff), mark_dot: c(0x82aaff),
+        mark_t: c(0x82aaff),
         spin_stops: [c(0x86e1fc), c(0x82aaff), c(0xc099ff), c(0x4fd6be)],
     },
     // ── One Drift (one dark) ───────────────────────────────────
@@ -84,7 +95,7 @@ pub const THEMES: &[Palette] = &[
         fg: c(0xabb2bf), fg_dim: c(0x5c6370), fg_mute: c(0x4b5263), fg_soft: c(0x9da5b4),
         blue: c(0x61afef), cyan: c(0x56b6c2), teal: c(0x56b6c2), purple: c(0xc678dd),
         orange: c(0xd19a66), yellow: c(0xe5c07b), green: c(0x98c379), red: c(0xe06c75),
-        mark_t: c(0x61afef), mark_h: c(0x61afef), mark_dot: c(0x61afef),
+        mark_t: c(0x61afef),
         spin_stops: [c(0x56b6c2), c(0x61afef), c(0xc678dd), c(0x98c379)],
     },
     // ── Rose Fjord (rose pine) ─────────────────────────────────
@@ -97,7 +108,7 @@ pub const THEMES: &[Palette] = &[
         fg: c(0xe0def4), fg_dim: c(0x6e6a86), fg_mute: c(0x514968), fg_soft: c(0x908caa),
         blue: c(0x9ccfd8), cyan: c(0x9ccfd8), teal: c(0x9ccfd8), purple: c(0xc4a7e7),
         orange: c(0xf6c177), yellow: c(0xf6c177), green: c(0x31748f), red: c(0xeb6f92),
-        mark_t: c(0xc4a7e7), mark_h: c(0xc4a7e7), mark_dot: c(0xf6c177),
+        mark_t: c(0xc4a7e7),
         spin_stops: [c(0xebbcba), c(0xc4a7e7), c(0x9ccfd8), c(0xf6c177)],
     },
     // ── Velvet Mocha (catppuccin mocha) ────────────────────────
@@ -110,7 +121,7 @@ pub const THEMES: &[Palette] = &[
         fg: c(0xcdd6f4), fg_dim: c(0x6c7086), fg_mute: c(0x585b70), fg_soft: c(0xa6adc8),
         blue: c(0x89b4fa), cyan: c(0x89dceb), teal: c(0x94e2d5), purple: c(0xcba6f7),
         orange: c(0xfab387), yellow: c(0xf9e2af), green: c(0xa6e3a1), red: c(0xf38ba8),
-        mark_t: c(0x89b4fa), mark_h: c(0x89b4fa), mark_dot: c(0x89b4fa),
+        mark_t: c(0x89b4fa),
         spin_stops: [c(0x89dceb), c(0x89b4fa), c(0xf5c2e7), c(0x94e2d5)],
     },
     // ── Ember Gruv (gruvbox dark) ──────────────────────────────
@@ -123,7 +134,7 @@ pub const THEMES: &[Palette] = &[
         fg: c(0xebdbb2), fg_dim: c(0x928374), fg_mute: c(0x665c54), fg_soft: c(0xbdae93),
         blue: c(0x83a598), cyan: c(0x8ec07c), teal: c(0x8ec07c), purple: c(0xd3869b),
         orange: c(0xfe8019), yellow: c(0xfabd2f), green: c(0xb8bb26), red: c(0xfb4934),
-        mark_t: c(0xfabd2f), mark_h: c(0xfabd2f), mark_dot: c(0xfabd2f),
+        mark_t: c(0xfabd2f),
         spin_stops: [c(0x8ec07c), c(0xfabd2f), c(0xd3869b), c(0x83a598)],
     },
     // ── Pine Grove (everforest) ────────────────────────────────
@@ -136,7 +147,7 @@ pub const THEMES: &[Palette] = &[
         fg: c(0xd3c6aa), fg_dim: c(0x859289), fg_mute: c(0x525c62), fg_soft: c(0x9da9a0),
         blue: c(0x7fbbb3), cyan: c(0x83c092), teal: c(0x83c092), purple: c(0xd699b6),
         orange: c(0xe69875), yellow: c(0xdbbc7f), green: c(0xa7c080), red: c(0xe67e80),
-        mark_t: c(0xa7c080), mark_h: c(0xa7c080), mark_dot: c(0xa7c080),
+        mark_t: c(0xa7c080),
         spin_stops: [c(0x83c092), c(0xa7c080), c(0xd699b6), c(0x7fbbb3)],
     },
     // ── Wave Garden (kanagawa) ─────────────────────────────────
@@ -149,7 +160,7 @@ pub const THEMES: &[Palette] = &[
         fg: c(0xdcd7ba), fg_dim: c(0x727169), fg_mute: c(0x54546d), fg_soft: c(0xa8a49c),
         blue: c(0x7e9cd8), cyan: c(0x7aa89f), teal: c(0x7aa89f), purple: c(0x957fb8),
         orange: c(0xffa066), yellow: c(0xffe8be), green: c(0x98bb6c), red: c(0xe46876),
-        mark_t: c(0x7e9cd8), mark_h: c(0x7e9cd8), mark_dot: c(0x7e9cd8),
+        mark_t: c(0x7e9cd8),
         spin_stops: [c(0x7aa89f), c(0x7e9cd8), c(0x957fb8), c(0xffa066)],
     },
     // ── Night Cape (dracula) ───────────────────────────────────
@@ -162,7 +173,7 @@ pub const THEMES: &[Palette] = &[
         fg: c(0xf8f8f2), fg_dim: c(0x6272a4), fg_mute: c(0x4d5472), fg_soft: c(0xbfc9d4),
         blue: c(0x8be9fd), cyan: c(0x8be9fd), teal: c(0x50fa7b), purple: c(0xbd93f9),
         orange: c(0xffb86c), yellow: c(0xf1fa8c), green: c(0x50fa7b), red: c(0xff5555),
-        mark_t: c(0xbd93f9), mark_h: c(0xbd93f9), mark_dot: c(0xff79c6),
+        mark_t: c(0xbd93f9),
         spin_stops: [c(0x8be9fd), c(0xbd93f9), c(0xff79c6), c(0x50fa7b)],
     },
     // ── Synth '84 (synthwave84) ────────────────────────────────
@@ -175,7 +186,7 @@ pub const THEMES: &[Palette] = &[
         fg: c(0xf8f8f2), fg_dim: c(0x7b6d8d), fg_mute: c(0x584a70), fg_soft: c(0xd6c7e3),
         blue: c(0x36f9f6), cyan: c(0x36f9f6), teal: c(0x72f1b8), purple: c(0xff7edb),
         orange: c(0xfe4450), yellow: c(0xfede5d), green: c(0x72f1b8), red: c(0xfe4450),
-        mark_t: c(0x36f9f6), mark_h: c(0xff7edb), mark_dot: c(0xfede5d),
+        mark_t: c(0x36f9f6),
         spin_stops: [c(0x36f9f6), c(0xff7edb), c(0xfede5d), c(0x72f1b8)],
     },
     // ── Mirage Ayu (ayu dark) ──────────────────────────────────
@@ -188,7 +199,7 @@ pub const THEMES: &[Palette] = &[
         fg: c(0xbfbdb6), fg_dim: c(0x626a73), fg_mute: c(0x4a525d), fg_soft: c(0x8a9199),
         blue: c(0x59c2ff), cyan: c(0x39bae6), teal: c(0x95e6cb), purple: c(0xd2a6ff),
         orange: c(0xffb454), yellow: c(0xffd173), green: c(0xaad94c), red: c(0xf07178),
-        mark_t: c(0x59c2ff), mark_h: c(0x59c2ff), mark_dot: c(0xffd173),
+        mark_t: c(0x59c2ff),
         spin_stops: [c(0x39bae6), c(0x59c2ff), c(0xd2a6ff), c(0xaad94c)],
     },
     // ── Vesper Noir (vesper) ───────────────────────────────────
@@ -201,7 +212,7 @@ pub const THEMES: &[Palette] = &[
         fg: c(0xffffff), fg_dim: c(0x8c8c8c), fg_mute: c(0x5f5f5f), fg_soft: c(0xb4b4b4),
         blue: c(0x99ffe4), cyan: c(0x99ffe4), teal: c(0x99ffe4), purple: c(0x9ca0a0),
         orange: c(0xffc799), yellow: c(0xffc799), green: c(0x8c9779), red: c(0xff8080),
-        mark_t: c(0xffc799), mark_h: c(0xffc799), mark_dot: c(0xffc799),
+        mark_t: c(0xffc799),
         spin_stops: [c(0x99ffe4), c(0xffc799), c(0xffffff), c(0x8c9779)],
     },
     // ── Cobalt Tide (cobalt2) ──────────────────────────────────
@@ -214,7 +225,7 @@ pub const THEMES: &[Palette] = &[
         fg: c(0xffffff), fg_dim: c(0x7f9db3), fg_mute: c(0x5c7b93), fg_soft: c(0xbfd4e2),
         blue: c(0x0088ff), cyan: c(0x00e0ff), teal: c(0x00e0ff), purple: c(0xff628c),
         orange: c(0xff9d00), yellow: c(0xffd500), green: c(0x3ad900), red: c(0xff628c),
-        mark_t: c(0x0088ff), mark_h: c(0x0088ff), mark_dot: c(0xffd500),
+        mark_t: c(0x0088ff),
         spin_stops: [c(0x00e0ff), c(0x0088ff), c(0xff628c), c(0x3ad900)],
     },
     // ── Theta Day (tokyonight day, light) ──────────────────────
@@ -227,7 +238,7 @@ pub const THEMES: &[Palette] = &[
         fg: c(0x3760bf), fg_dim: c(0x8990b3), fg_mute: c(0x9aa5ce), fg_soft: c(0x6172b0),
         blue: c(0x2e7de9), cyan: c(0x007197), teal: c(0x007197), purple: c(0x9854f1),
         orange: c(0xb15c00), yellow: c(0x8c6c3e), green: c(0x387068), red: c(0xf52a65),
-        mark_t: c(0x2e7de9), mark_h: c(0x2e7de9), mark_dot: c(0x9854f1),
+        mark_t: c(0x2e7de9),
         spin_stops: [c(0x007197), c(0x2e7de9), c(0x9854f1), c(0x387068)],
     },
 ];
@@ -271,10 +282,6 @@ pub fn set_theme(name: &str) -> bool {
 
 pub fn theme_version() -> u64 {
     VERSION.load(Ordering::Relaxed)
-}
-
-pub fn rgb_tuple(c: (u8, u8, u8)) -> Color {
-    Color::Rgb(c.0, c.1, c.2)
 }
 
 fn to_rgb(c: Color) -> (u8, u8, u8) {
@@ -400,11 +407,6 @@ pub fn theta_mark_line(row: usize) -> Line<'static> {
         }
     }
     Line::from(spans)
-}
-
-/// The Θ identity symbol as a styled span (theme cyan).
-pub fn symbol_span() -> Span<'static> {
-    Span::styled(P_SYMBOL.to_string(), Style::default().fg(pal().cyan))
 }
 
 #[cfg(test)]

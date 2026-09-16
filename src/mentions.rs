@@ -84,29 +84,6 @@ pub fn extract(text: &str, dir: &Path) -> Vec<Mention> {
     out
 }
 
-/// Prepend attached file contents to `text` for text-only backends. Content is
-/// clipped so one huge file cannot blow the context.
-pub fn inline(text: &str, mentions: &[Mention], cap_chars: usize) -> String {
-    if mentions.is_empty() {
-        return text.to_string();
-    }
-    let mut out = String::new();
-    for m in mentions {
-        let body = std::fs::read_to_string(&m.path).unwrap_or_default();
-        let clipped: String = body.chars().take(cap_chars).collect();
-        let truncated = body.chars().count() > clipped.chars().count();
-        out.push_str(&format!(
-            "<attached-file path=\"{}\">\n{}{}\n</attached-file>\n",
-            m.label,
-            clipped,
-            if truncated { "\n… [truncated]" } else { "" }
-        ));
-    }
-    out.push('\n');
-    out.push_str(text);
-    out
-}
-
 /// Turn resolved mentions into provider attachments (`file://` URLs).
 pub fn to_attachments(mentions: &[Mention]) -> Vec<Attachment> {
     mentions
@@ -220,21 +197,6 @@ mod tests {
         assert_eq!(mentions.len(), 1);
         assert_eq!(mentions[0].label, "src/main.rs");
         assert!(mentions[0].path.ends_with("src/main.rs"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn inline_prepends_capped_file_contents() {
-        let dir = tmp("inline");
-        std::fs::write(dir.join("a.txt"), "hello world").unwrap();
-        let mentions = extract("@a.txt", &dir);
-        let text = inline("explain this", &mentions, 5);
-        assert!(text.contains("<attached-file path=\"a.txt\">"));
-        assert!(text.contains("hello"));
-        assert!(text.contains("truncated"));
-        assert!(text.ends_with("explain this"));
-        // No mentions is a no-op.
-        assert_eq!(inline("hi", &[], 10), "hi");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
