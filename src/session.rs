@@ -258,6 +258,22 @@ pub struct ToolRef {
     pub part: usize,
 }
 
+/// A prompt waiting its turn.
+///
+/// It has to carry more than text: paste placeholders are expanded from
+/// `paste_parts`, which are cleared once a prompt is sent, and clipboard images
+/// cannot be re-read later. Resolving both at queue time is the only way a
+/// queued prompt sends what the user actually wrote.
+#[derive(Debug, Clone)]
+pub struct QueuedPrompt {
+    /// What the transcript shows: the text as typed, with paste placeholders.
+    pub display: String,
+    /// What the model receives, with pastes expanded.
+    pub send: String,
+    /// Files and images resolved when the prompt was queued.
+    pub attachments: Vec<crate::mentions::Attachment>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionState {
     pub id: u32,
@@ -271,8 +287,8 @@ pub struct SessionState {
     pub agent: Option<String>,
     pub slash_selected: usize,
     pub last_send: Option<(std::time::Instant, String)>,
-    pub pending_send: Option<String>,
-    pub queue: Vec<String>,
+    pub pending_send: Option<QueuedPrompt>,
+    pub queue: Vec<QueuedPrompt>,
     pub interrupt_armed: Option<std::time::Instant>,
     pub activity: Option<Activity>,
     pub cost: f64,

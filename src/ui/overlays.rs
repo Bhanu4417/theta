@@ -329,7 +329,7 @@ pub fn render_busy_choice(
 ) {
     let prompt = app
         .focused()
-        .and_then(|s| s.pending_send.clone())
+        .and_then(|s| s.pending_send.as_ref().map(|p| p.display.clone()))
         .unwrap_or_default();
     let w = 58u16.min(screen.width.saturating_sub(2)).max(24);
     let h = 8u16;

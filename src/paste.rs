@@ -205,4 +205,42 @@ mod tests {
         assert_eq!(pick_image_mime(&types).as_deref(), Some("image/png"));
         assert_eq!(pick_image_mime(&["text/plain".into()]), None);
     }
+
+    #[test]
+    fn a_queued_prompt_keeps_its_paste_content() {
+        // Bug: the queued path sent the stored text verbatim, so a prompt that
+        // carried a paste went out as the literal placeholder. Resolving at
+        // queue time is what fixes it, and that is what this asserts.
+        let placeholder = "[Pasted ~18 lines]".to_string();
+        let body = "line one\nline two\nline three";
+        let parts = vec![PastePart {
+            placeholder: placeholder.clone(),
+            content: PasteContent::Text(body.to_string()),
+        }];
+        let typed = format!("here is the bug: {placeholder}");
+
+        let queued_send = expand(&typed, &parts);
+        assert!(queued_send.contains(body), "the body must reach the model");
+        assert!(
+            !queued_send.contains("[Pasted"),
+            "the placeholder must not be sent literally: {queued_send}"
+        );
+
+        // Once parts are cleared — which is what a send does — expanding again
+        // would leave the placeholder behind. This is exactly why the prompt
+        // has to be resolved before it is queued.
+        let after_clearing: Vec<PastePart> = Vec::new();
+        let lost = expand(&typed, &after_clearing);
+        assert!(
+            lost.contains("[Pasted"),
+            "sanity: without the parts the placeholder survives, which is the bug"
+        );
+    }
+
+    #[test]
+    fn expanding_a_prompt_without_pastes_is_unchanged() {
+        let parts: Vec<PastePart> = Vec::new();
+        assert_eq!(expand("plain prompt", &parts), "plain prompt");
+    }
+
 }

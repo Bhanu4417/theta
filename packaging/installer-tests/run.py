@@ -27,8 +27,25 @@ import tarfile
 import threading
 import zipfile
 
-VERSION = "0.1.0"
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+
+
+def _version_from_manifest():
+    """The version under test, read from Cargo.toml.
+
+    Hardcoding it meant bumping the release broke these tests: the harness
+    asserted the binary printed the old number, so a version bump turned into a
+    red CI for no real reason.
+    """
+    import re
+    manifest = (REPO_ROOT / "Cargo.toml").read_text()
+    m = re.search(r'^version\s*=\s*"([^"]+)"', manifest, re.M)
+    if not m:
+        raise SystemExit("error: could not read version from Cargo.toml")
+    return m.group(1)
+
+
+VERSION = _version_from_manifest()
 
 results = []
 

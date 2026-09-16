@@ -31,7 +31,7 @@ no server to start, no daemon to babysit, no wrapper around somebody else's CLI.
 │ ✓ Searching "validate_token"  │ ◦ Editing src/db/schema.rs               │
 │                               │ ◦ Running cargo test                     │
 │                               │                                          │
-│ build · claude-sonnet-4       │ plan · deepseek-v4.1-flash               │
+│ build · deepseek-v4.1-flash   │ plan · muse-spark-1.3-contributor        │
 │ ctx 4% · $0.0012 · ~/app      │ ctx 11% · $0.0004 · ~/app                │
 ├───────────────────────────────┼──────────────────────────────────────────┤
 │ Θ Ask this agent…             │ Θ Ask this agent…                        │
@@ -279,15 +279,15 @@ Your transcript on disk keeps everything. Tune it with
 
 ```toml
 [ai]
-provider = "anthropic"          # a preset id, or set base_url for any
-base_url = ""                   # OpenAI-compatible endpoint
-api_key_env = "ANTHROPIC_API_KEY"
-model = "claude-sonnet-4-20250514"
+provider = "openai"             # a preset id, or set base_url for anything else
+base_url = ""                   # an OpenAI-compatible endpoint overrides the preset
+api_key_env = "OPENAI_API_KEY"
+model = "gpt-4o"
 max_retries = 3                 # transient failures, exponential backoff
 retry_base_ms = 500
-timeout_secs = 300              # 0 disables
-max_turns = 200                 # tool rounds per turn; 0 = unlimited
-reasoning_effort = ""           # minimal | low | medium | high
+timeout_secs = 300              # idle read timeout; 0 disables
+max_turns = 0                   # tool rounds per turn; 0 = no limit
+reasoning_effort = ""           # none | minimal | low | medium | high | xhigh | max
 
 [compaction]
 enabled = true
@@ -301,7 +301,7 @@ model = ""                      # optional cheap model for summaries
 [ui]
 restore = true                  # reopen your last workspace
 explorer_width = 32
-history_limit = 100
+history_limit = 200
 
 [behavior]
 auto_approve_permissions = false
@@ -313,7 +313,7 @@ local_permissions = "allow"     # allow | ask | deny | read-only
 Per-model overrides, when one model needs different budgets:
 
 ```toml
-[compaction.model_overrides."anthropic/claude-sonnet-4-20250514"]
+[compaction.model_overrides."openai/gpt-4o"]
 reserve_tokens = 200000
 ```
 

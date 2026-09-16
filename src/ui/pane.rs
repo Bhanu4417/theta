@@ -591,7 +591,7 @@ fn render_input(
     let queue_h = queue_shown as u16;
     let mut lines: Vec<Line<'static>> = Vec::new();
     for q in sess.queue.iter().take(queue_shown) {
-        lines.push(queued_line(q, body_w, bg));
+        lines.push(queued_line(&q.display, body_w, bg));
     }
 
     let input_max = (body.height as usize).saturating_sub(queue_shown).max(1);

@@ -8,7 +8,7 @@ use crate::manager::Manager;
 use crate::models::{GrepMatch, ModelEntry, ModelRef, OcSession};
 use crate::panes::{Dir, PaneGrid};
 use crate::persist;
-use crate::session::{Activity, InputState, PendingPermission, PendingQuestion, SessionState, SessStatus};
+use crate::session::{QueuedPrompt, Activity, InputState, PendingPermission, PendingQuestion, SessionState, SessStatus};
 use crate::theme::{pal, self};
 use crate::ui::conversation;
 use crossterm::event::{
@@ -799,18 +799,37 @@ impl App {
                     return;
                 }
             }
+            // Resolve pastes and attachments up front. The queued path sends
+            // the stored text verbatim, so if this happened later — after
+            // `paste_parts` were cleared — a queued prompt would send the
+            // literal `[Pasted ~18 lines]` placeholder instead of its content.
+            let expanded = crate::paste::expand(&text, &s.paste_parts);
+            let mut attachments = Self::attachments_for(&s.dir, &expanded);
+            attachments.extend(crate::paste::attachments(&text, &s.paste_parts));
+            s.paste_parts.clear();
+            let queued = QueuedPrompt {
+                display: text.clone(),
+                send: expanded.clone(),
+                attachments: attachments.clone(),
+            };
+
             if s.status.is_busy() {
-                s.pending_send = Some(text.clone());
+                // Never overwrite a prompt that is already waiting: doing so
+                // silently discarded it when a second message was sent before
+                // the first was answered.
+                if s.pending_send.is_some() {
+                    s.queue.push(queued);
+                    s.dirty = true;
+                    self.flash("queued behind the pending prompt");
+                    return;
+                }
+                s.pending_send = Some(queued);
                 s.dirty = true;
                 self.busy_choice = 0;
                 self.overlay = Overlay::BusyChoice;
                 self.dirty = true;
                 return;
             }
-            let expanded = crate::paste::expand(&text, &s.paste_parts);
-            let mut attachments = Self::attachments_for(&s.dir, &expanded);
-            attachments.extend(crate::paste::attachments(&text, &s.paste_parts));
-            s.paste_parts.clear();
             s.last_send = Some((
                 std::time::Instant::now(),
                 text.clone(),
@@ -1071,17 +1090,17 @@ impl App {
         self.dirty = true;
     }
 
-    fn send_text_now(&mut self, id: u32, text: &str) {
+    fn send_text_now(&mut self, id: u32, prompt: &QueuedPrompt) {
         let (dir, oc_sid, model, agent) = {
             let Some(s) = self.session_mut(id) else { return };
-            s.push_local_user(text);
+            s.push_local_user(&prompt.display);
             s.last_error = None;
             if matches!(s.status, SessStatus::Idle | SessStatus::Error(_)) {
                 s.status = SessStatus::Working;
             }
             s.stick_bottom = true;
             s.tool_cursor = None;
-            s.last_send = Some((std::time::Instant::now(), text.to_string()));
+            s.last_send = Some((std::time::Instant::now(), prompt.display.clone()));
             s.dirty = true;
             (
                 s.dir.clone(),
@@ -1090,10 +1109,16 @@ impl App {
                 s.agent.clone(),
             )
         };
-        self.start_task(id, text);
-        let attachments = Self::attachments_for(&dir, text);
-        self.manager
-            .send_prompt(dir, oc_sid, text.to_string(), model, agent, attachments);
+        // `display` fills the transcript; `send` is what the model sees.
+        self.start_task(id, &prompt.display);
+        self.manager.send_prompt(
+            dir,
+            oc_sid,
+            prompt.send.clone(),
+            model,
+            agent,
+            prompt.attachments.clone(),
+        );
     }
 
     fn drain_queue(&mut self, id: u32) {
@@ -1109,7 +1134,7 @@ impl App {
     }
 
     pub fn confirm_busy_choice(&mut self, id: u32, choice: usize) {
-        let Some(text) = self.session_mut(id).and_then(|s| s.pending_send.take()) else {
+        let Some(prompt) = self.session_mut(id).and_then(|s| s.pending_send.take()) else {
             self.overlay = Overlay::None;
             return;
         };
@@ -1117,7 +1142,7 @@ impl App {
         if choice == 0 {
             let busy = self.session(id).map(|s| s.status.is_busy()).unwrap_or(false);
             if let Some(s) = self.session_mut(id) {
-                s.queue.push(text);
+                s.queue.push(prompt);
                 s.dirty = true;
             }
             if busy {
@@ -1131,10 +1156,10 @@ impl App {
                 .map(|s| s.provider.capabilities().native_fork)
                 .unwrap_or(false);
             if can_fork {
-                self.fork_with_prompt(id, text);
+                self.fork_with_prompt(id, prompt);
             } else {
                 if let Some(s) = self.session_mut(id) {
-                    s.queue.push(text);
+                    s.queue.push(prompt);
                     s.dirty = true;
                 }
                 self.flash("provider can't fork — queued instead");
@@ -1143,8 +1168,8 @@ impl App {
         self.dirty = true;
     }
 
-    fn fork_with_prompt(&mut self, id: u32, text: String) {
-        self.begin_fork(id, Some(text), false);
+    fn fork_with_prompt(&mut self, id: u32, prompt: QueuedPrompt) {
+        self.begin_fork(id, Some(prompt.display), false);
     }
 
     pub fn fork_active(&mut self) {
@@ -3837,8 +3862,8 @@ impl App {
                     KeyCode::Enter => self.confirm_busy_choice(id, self.busy_choice.min(1)),
                     KeyCode::Esc => {
                         if let Some(s) = self.session_mut(id) {
-                            if let Some(text) = s.pending_send.take() {
-                                s.input.buf = text;
+                            if let Some(p) = s.pending_send.take() {
+                                s.input.buf = p.display;
                                 s.input.cursor = s.input.buf.chars().count();
                             }
                             s.dirty = true;
@@ -4624,7 +4649,15 @@ impl App {
                     }
                     if let Some(pos) = self.pending_fork.iter().position(|(fid, _)| *fid == sid) {
                         let (_, text) = self.pending_fork.remove(pos);
-                        self.send_text_now(sid, &text);
+                        let dir = self
+                            .session(sid)
+                            .map(|s| s.dir.clone())
+                            .unwrap_or_default();
+                        let attachments = Self::attachments_for(&dir, &text);
+                        self.send_text_now(
+                            sid,
+                            &QueuedPrompt { display: text.clone(), send: text, attachments },
+                        );
                     }
                 }
             }
@@ -4854,7 +4887,15 @@ impl App {
                     return;
                 }
                 if send_to_agent && !output.trim().is_empty() {
-                    self.send_text_now(id, &output);
+                    let dir = self
+                        .session(id)
+                        .map(|s| s.dir.clone())
+                        .unwrap_or_default();
+                    let attachments = Self::attachments_for(&dir, &output);
+                    self.send_text_now(
+                        id,
+                        &QueuedPrompt { display: output.clone(), send: output, attachments },
+                    );
                 }
                 self.dirty = true;
             }
