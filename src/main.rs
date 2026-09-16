@@ -62,46 +62,25 @@ struct Args {
 fn usage() -> &'static str {
     "Θ theta — terminal coding agent (local harness, multi-session)
 
-
-
 USAGE:
-
     theta [OPTIONS] [DIR]
 
-
-
 ARGS:
-
     [DIR]              Open with an initial session in DIR
 
-
-
 OPTIONS:
-
     --no-restore       Do not restore the last workspace
-
     --log              Open/tail the newest debug log (request → provider/model)
-
     --run              Start the TUI (with --log: record to the log file)
-
     -p, --print        Run one prompt headlessly and print the reply
-
     --json             With --print, emit events as JSON lines
-
     --check-ai [PROV…] Live-verify provider credentials (default: [ai].provider)
-
     --help             Show this help
-
     --version          Show version
 
-
-
 KEYS:
-
     ^N new session   ^K palette   ^P files   ^⇧F project   ^F conversation
-
     ^B explorer      ^Space maximize   Tab focus   Alt+hjkl resize   F1 help
-
 "
 }
 
