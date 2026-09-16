@@ -420,6 +420,9 @@ pub struct App {
     pub dirty: bool,
     pub should_quit: bool,
     pub restart: bool,
+    /// When set, quit (and re-exec) after this instant so the `/refresh` flash
+    /// is actually drawn before the process replaces itself.
+    pub refresh_quit_at: Option<Instant>,
     pub git_cache: GitCache,
     pub git_display: Option<GitInfo>,
     pub conv_cache: HashMap<u32, conversation::Cache>,
@@ -493,6 +496,7 @@ impl App {
             dirty: true,
             should_quit: false,
             restart: false,
+            refresh_quit_at: None,
             git_cache: GitCache::new(),
             git_display: None,
             conv_cache: HashMap::new(),
@@ -1238,7 +1242,9 @@ impl App {
     pub fn request_refresh(&mut self) {
         self.save_workspace();
         self.restart = true;
-        self.should_quit = true;
+        // Don't quit this instant: the event loop would exit before drawing the
+        // flash, so `/refresh` looked like it did nothing. Give it a beat.
+        self.refresh_quit_at = Some(Instant::now() + Duration::from_millis(700));
         self.flash("refreshing — reloading the newest build…");
         self.dirty = true;
     }
@@ -5269,6 +5275,15 @@ impl App {
         }
         self.persist_scroll_if_changed();
 
+        // `/refresh`: after the flash has had a moment to render, replace the
+        // process with the newest build.
+        if let Some(at) = self.refresh_quit_at {
+            if Instant::now() >= at {
+                self.should_quit = true;
+                self.dirty = true;
+            }
+        }
+
         let pushing = self
             .sessions
             .iter()
@@ -5679,6 +5694,18 @@ mod login_tests {
     #[test]
     fn logs_slash_command_is_registered() {
         assert!(builtin_slash_items().iter().any(|i| i.name == "logs"));
+    }
+
+    #[tokio::test]
+    async fn refresh_defers_the_quit_so_the_flash_renders() {
+        let mut app = test_app();
+        app.request_refresh();
+        assert!(app.restart, "refresh must re-exec after the loop exits");
+        assert!(
+            !app.should_quit,
+            "quitting immediately would skip the flash frame entirely"
+        );
+        assert!(app.refresh_quit_at.is_some(), "the quit is scheduled, not immediate");
     }
 
     #[test]

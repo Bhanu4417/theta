@@ -238,6 +238,10 @@ impl AgentLoop {
         let run_id = local_run_id();
         let mut failed: std::collections::HashMap<(String, String), usize> =
             std::collections::HashMap::new();
+        // Consecutive identical tool calls, successful or not: a real loop must
+        // be stopped or the agent "keeps going on the same thing forever".
+        let mut last_call_sig: Option<String> = None;
+        let mut same_call_repeats: usize = 0;
         let mut last_msg_id = String::new();
 
         let turn_limit = if self.max_turns == 0 { usize::MAX } else { self.max_turns };
@@ -482,7 +486,7 @@ impl AgentLoop {
                             text: format!(
                                 "(no output — {why}. Try again, or set `[ai] reasoning_effort = \"low\"`.)"
                             ),
-                            synthetic: true,
+                            synthetic: false,
                         },
                     })));
                 }
@@ -574,6 +578,39 @@ impl AgentLoop {
                     emit(HarnessEvent::SessionIdle);
                     return Ok(());
                 }
+                // Doom-loop guard: the same call with the same arguments over
+                // and over (even when it succeeds) means no progress is being
+                // made. Stop with a visible notice so the user can redirect.
+                let sig = format!("{:?}\u{0}{}", call.name, call.arguments);
+                if last_call_sig.as_deref() == Some(sig.as_str()) {
+                    same_call_repeats += 1;
+                } else {
+                    last_call_sig = Some(sig);
+                    same_call_repeats = 1;
+                }
+                if same_call_repeats >= MAX_IDENTICAL_TOOL_CALLS {
+                    crate::tlog!(
+                        "STOP repetitive loop: {} x{} (turn {})",
+                        call.name,
+                        same_call_repeats,
+                        turn
+                    );
+                    emit(HarnessEvent::Transcript(TranscriptUpdate::Part(Part {
+                        id: format!("{msg_id}-loop"),
+                        message_id: msg_id.to_string(),
+                        kind: PartKind::Text {
+                            text: format!(
+                                "(stopped: repeated the same `{}` call {}× with identical \
+                                 arguments — likely a loop. Send a message to redirect.)",
+                                call.name, same_call_repeats
+                            ),
+                            synthetic: false,
+                        },
+                    })));
+                    emit(HarnessEvent::AssistantFinished);
+                    emit(HarnessEvent::SessionIdle);
+                    return Ok(());
+                }
                 let ok = self
                     .run_tool_call(
                         &msg_id,
@@ -606,7 +643,7 @@ impl AgentLoop {
                                      it is unlikely to succeed on a retry.)",
                                     call.name, *n
                                 ),
-                                synthetic: true,
+                                synthetic: false,
                             },
                         })));
                         emit(HarnessEvent::AssistantFinished);
@@ -636,7 +673,7 @@ impl AgentLoop {
                      continue, or raise `[ai] max_turns`.)",
                     self.max_turns
                 ),
-                synthetic: true,
+                synthetic: false,
             },
         })));
         emit(HarnessEvent::SessionIdle);
@@ -981,6 +1018,10 @@ fn is_parallel_safe(tool: &str) -> bool {
 }
 
 const MAX_REPEATED_TOOL_FAILURES: usize = 3;
+
+/// Consecutive identical tool calls (same name and arguments) before the loop
+/// is stopped as a repetitive no-progress loop.
+const MAX_IDENTICAL_TOOL_CALLS: usize = 4;
 
 pub(crate) fn resp_log(
     label: &str,

@@ -364,7 +364,7 @@ async fn loop_stops_at_max_turns_instead_of_spinning() {
     let told = events.iter().any(|e| match e {
         HarnessEvent::Transcript(TranscriptUpdate::Part(p)) => matches!(
             &p.kind,
-            PartKind::Text { text, synthetic: true } if text.contains("max_turns")
+            PartKind::Text { text, synthetic: false } if text.contains("max_turns")
         ),
         _ => false,
     });
@@ -1013,7 +1013,7 @@ async fn repeated_failing_tool_call_stops_the_loop_early() {
     let stopped = evs.iter().any(|e| match e {
         HarnessEvent::Transcript(TranscriptUpdate::Part(p)) => matches!(
             &p.kind,
-            PartKind::Text { text, synthetic: true }
+            PartKind::Text { text, synthetic: false }
                 if text.contains("failed") && text.contains("same arguments")
         ),
         _ => false,
@@ -1071,7 +1071,7 @@ async fn turn_limit_stops_with_a_visible_notice() {
     let noticed = evs.iter().any(|e| match e {
         HarnessEvent::Transcript(TranscriptUpdate::Part(p)) => matches!(
             &p.kind,
-            PartKind::Text { text, synthetic: true } if text.contains("max_turns")
+            PartKind::Text { text, synthetic: false } if text.contains("max_turns")
         ),
         _ => false,
     });
@@ -1524,4 +1524,59 @@ async fn read_only_tool_calls_run_concurrently_not_in_series() {
         .filter_map(|m| m.tool_call_id.clone())
         .collect();
     assert_eq!(ids, vec!["c0", "c1", "c2"]);
+}
+
+/// Always asks for the same *succeeding* tool call — a no-progress loop that
+/// the failure-based guard would never catch.
+struct SuccessfulLoopProvider;
+
+impl Provider for SuccessfulLoopProvider {
+    fn id(&self) -> &'static str {
+        "successful-loop"
+    }
+    fn stream<'a>(
+        &'a self,
+        _request: ChatRequest,
+        _on_event: &'a mut (dyn FnMut(ProviderEvent) + Send),
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<AssistantTurn, ProviderError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            Ok(AssistantTurn {
+                text: String::new(),
+                tool_calls: vec![call("c1", "bash", r#"{"command":"echo hi"}"#)],
+                finish: Some(FinishReason::ToolCalls),
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn repeated_succeeding_tool_call_is_stopped_as_a_loop() {
+    use crate::harness::transcript::PartKind;
+    use crate::harness::TranscriptUpdate;
+
+    let agent = AgentLoop::new(Box::new(SuccessfulLoopProvider), "test").with_max_turns(0);
+    let dir = std::env::temp_dir();
+    let mut history = Vec::new();
+    let events = std::sync::Arc::new(Mutex::new(Vec::<HarnessEvent>::new()));
+    let sink = events.clone();
+    let mut emit = move |e: HarnessEvent| sink.lock().unwrap().push(e);
+    agent.run_turn(&mut history, "go", &dir, &mut emit).await.unwrap();
+
+    let evs = events.lock().unwrap();
+    let noticed = evs.iter().any(|e| match e {
+        HarnessEvent::Transcript(TranscriptUpdate::Part(p)) => matches!(
+            &p.kind,
+            PartKind::Text { text, synthetic: false } if text.contains("likely a loop")
+        ),
+        _ => false,
+    });
+    assert!(noticed, "an endless repeat of a succeeding call must stop with a notice");
+    let rounds = evs
+        .iter()
+        .filter(|e| matches!(e, HarnessEvent::ToolStarted { .. }))
+        .count();
+    assert!(rounds <= 6, "should stop quickly, got {rounds} rounds");
+    assert!(evs.iter().any(|e| matches!(e, HarnessEvent::SessionIdle)));
 }
