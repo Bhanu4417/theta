@@ -46,6 +46,8 @@ try {
 }
 
 $Repo = 'Bhanu4417/theta'
+
+$AuthHeaders = @{ 'User-Agent' = 'theta-installer' }
 $Bin = 'theta'
 $BinName = 'Theta'
 
@@ -103,7 +105,7 @@ if (-not $Version) {
     Write-Say 'Resolving the latest version...'
     try {
         $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" `
-            -Headers @{ 'User-Agent' = 'theta-installer' }
+            -Headers $AuthHeaders
         $Version = $release.tag_name
     } catch {
         Stop-Die "could not determine the latest version ($_). Set -Version."
@@ -134,9 +136,24 @@ try {
     Write-Say 'Downloading...'
     $zip = Join-Path $tmp $asset
     try {
-        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -Headers $AuthHeaders
     } catch {
-        Stop-Die "download failed: $url`n$_"
+        @"
+error: could not download $asset
+
+  $url
+
+This usually means one of:
+  * the release does not exist yet. Check:
+      https://github.com/$Repo/releases
+  * there is no network access to github.com.
+  * the repository is not publicly readable. Anonymous downloads only work for
+    public repositories; build from source instead:
+      git clone https://github.com/$Repo; cd theta; cargo build --release
+
+  ($_)
+"@ | Write-Error
+        exit 1
     }
 
     Write-Say 'Verifying checksum...'

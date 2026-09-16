@@ -99,8 +99,8 @@ if command -v curl >/dev/null 2>&1; then
     fetch() { curl -fsSL "$1" -o "$2"; }
     fetch_stdout() { curl -fsSL "$1"; }
 elif command -v wget >/dev/null 2>&1; then
-    fetch() { wget -qO "$2" "$1"; }
-    fetch_stdout() { wget -qO- "$1"; }
+    fetch() { wget -q -O "$2" "$1"; }
+    fetch_stdout() { wget -q -O- "$1"; }
 else
     die "needs curl or wget"
 fi
@@ -137,7 +137,24 @@ tmp=$(mktemp -d 2>/dev/null || mktemp -d -t theta) || die "cannot create a temp 
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
 say "Downloading…"
-fetch "$URL" "$tmp/$ASSET" || die "download failed: $URL"
+if ! fetch "$URL" "$tmp/$ASSET"; then
+    # A 404 is ambiguous on GitHub: either the release does not exist, or the
+    # repository is private and the request was not authenticated.
+    cat >&2 <<EOF
+error: could not download $ASSET
+
+  $URL
+
+This usually means one of:
+  * the release does not exist yet. Check:
+      https://github.com/$REPO/releases
+  * there is no network access to github.com.
+  * the repository is not publicly readable. Anonymous downloads only work for
+    public repositories; build from source instead:
+      git clone https://github.com/$REPO && cd theta && cargo build --release
+EOF
+    exit 1
+fi
 
 say "Verifying checksum…"
 if fetch "$URL.sha256" "$tmp/$ASSET.sha256" 2>/dev/null; then

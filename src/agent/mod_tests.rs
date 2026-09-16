@@ -744,7 +744,7 @@ impl Provider for CancelMidStream {
             }
             Ok(AssistantTurn {
                 text: String::new(),
-                tool_calls: vec![call("c1", "bash", r#"{"command":"echo hi"}"#)],
+                tool_calls: vec![call("c1", "read", r#"{"path":"/tmp/x"}"#)],
                 finish: Some(FinishReason::ToolCalls),
             })
         })
@@ -1048,10 +1048,12 @@ async fn turn_limit_stops_with_a_visible_notice() {
             Box::pin(async move {
                 let mut n = self.n.lock().unwrap();
                 *n += 1;
-                let args = format!(r#"{{"command":"echo {}"}}"#, *n);
+                // A distinct path each round: the turn limit, not a guard,
+                // is what must stop this.
+                let args = format!(r#"{{"path":"/tmp/{n}"}}"#);
                 Ok(AssistantTurn {
                     text: String::new(),
-                    tool_calls: vec![call("c1", "bash", &args)],
+                    tool_calls: vec![call("c1", "read", &args)],
                     finish: Some(FinishReason::ToolCalls),
                 })
             })
@@ -1059,7 +1061,9 @@ async fn turn_limit_stops_with_a_visible_notice() {
     }
 
     let agent = AgentLoop::new(Box::new(VaryingProvider { n: Mutex::new(0) }), "test")
-        .with_max_turns(4);
+        .with_max_turns(4)
+        .with_tools(vec![std::sync::Arc::new(AlwaysOkTool { name: "read" })
+            as std::sync::Arc<dyn crate::agent::tools::Tool>]);
     let dir = std::env::temp_dir();
     let mut history = Vec::new();
     let events = std::sync::Arc::new(Mutex::new(Vec::<HarnessEvent>::new()));
@@ -1526,6 +1530,32 @@ async fn read_only_tool_calls_run_concurrently_not_in_series() {
     assert_eq!(ids, vec!["c0", "c1", "c2"]);
 }
 
+/// Always succeeds, in-process. Used by tests that need a *successful* tool
+/// call on every platform — `bash` does not exist on Windows, so a test driving
+/// it there exercises the failure path instead.
+struct AlwaysOkTool {
+    name: &'static str,
+}
+
+impl crate::agent::tools::Tool for AlwaysOkTool {
+    fn spec(&self) -> crate::ai::ToolSpec {
+        crate::ai::ToolSpec {
+            name: self.name.into(),
+            description: "always succeeds".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+    fn run<'a>(
+        &'a self,
+        _input: &'a serde_json::Value,
+        _cwd: &'a std::path::Path,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = crate::agent::tools::ToolOutcome> + Send + 'a>,
+    > {
+        Box::pin(async move { crate::agent::tools::ToolOutcome::ok("ok") })
+    }
+}
+
 /// Always asks for the same *succeeding* tool call — a no-progress loop that
 /// the failure-based guard would never catch.
 struct SuccessfulLoopProvider;
@@ -1544,7 +1574,9 @@ impl Provider for SuccessfulLoopProvider {
         Box::pin(async move {
             Ok(AssistantTurn {
                 text: String::new(),
-                tool_calls: vec![call("c1", "bash", r#"{"command":"echo hi"}"#)],
+                // Names the in-process tool the test installs, so the call
+                // succeeds instead of failing as an unknown tool.
+                tool_calls: vec![call("c1", "read", r#"{"path":"/tmp/x"}"#)],
                 finish: Some(FinishReason::ToolCalls),
             })
         })
@@ -1556,7 +1588,12 @@ async fn repeated_succeeding_tool_call_is_stopped_as_a_loop() {
     use crate::harness::transcript::PartKind;
     use crate::harness::TranscriptUpdate;
 
-    let agent = AgentLoop::new(Box::new(SuccessfulLoopProvider), "test").with_max_turns(0);
+    // An in-process tool, so the repeated call *succeeds* on every platform
+    // and the identical-call guard is the one that fires.
+    let agent = AgentLoop::new(Box::new(SuccessfulLoopProvider), "test")
+        .with_max_turns(0)
+        .with_tools(vec![std::sync::Arc::new(AlwaysOkTool { name: "read" })
+            as std::sync::Arc<dyn crate::agent::tools::Tool>]);
     let dir = std::env::temp_dir();
     let mut history = Vec::new();
     let events = std::sync::Arc::new(Mutex::new(Vec::<HarnessEvent>::new()));
