@@ -127,7 +127,11 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     if args.version {
-        println!("theta 0.1.0");
+        // From Cargo.toml, so it can never drift from the released version. It
+        // was hardcoded, which meant `--version` (used by the release smoke
+        // test and the installers' post-install check) reported a stale number
+        // no matter which version was actually built.
+        println!("theta {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
 
