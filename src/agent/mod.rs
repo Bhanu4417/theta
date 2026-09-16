@@ -491,6 +491,55 @@ impl AgentLoop {
                 return Ok(());
             }
 
+            // Start the read-only calls together before walking the list.
+            // A turn that asks for several reads or searches would otherwise
+            // wait on each in series; these touch nothing, so running them at
+            // once is safe and strictly faster.
+            let mut ready: Vec<Option<tools::ToolOutcome>> =
+                (0..turn_result.tool_calls.len()).map(|_| None).collect();
+            {
+                let batch: Vec<(usize, String, Value)> = turn_result
+                    .tool_calls
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| {
+                        if !is_parallel_safe(&c.name) {
+                            return false;
+                        }
+                        // Only when no permission prompt is needed: a prompt
+                        // must be asked on the sequential path.
+                        let input: Value =
+                            serde_json::from_str(&c.arguments).unwrap_or(json!({}));
+                        self.permission.check(&c.name, &input, cwd)
+                            == PermissionDecision::Allow
+                    })
+                    .map(|(i, c)| {
+                        (
+                            i,
+                            c.name.clone(),
+                            serde_json::from_str(&c.arguments).unwrap_or(json!({})),
+                        )
+                    })
+                    .collect();
+
+                if batch.len() > 1 {
+                    let tools = &self.tools;
+                    let futs = batch.iter().map(|(i, name, input)| {
+                        let i = *i;
+                        async move {
+                            let outcome = match tools.iter().find(|t| t.spec().name == *name) {
+                                Some(t) => t.run(input, cwd).await,
+                                None => tools::ToolOutcome::err(format!("unknown tool: {name}")),
+                            };
+                            (i, outcome)
+                        }
+                    });
+                    for (i, outcome) in futures::future::join_all(futs).await {
+                        ready[i] = Some(outcome);
+                    }
+                }
+            }
+
             for (i, call) in turn_result.tool_calls.iter().enumerate() {
                 if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                     for pending in &turn_result.tool_calls[i..] {
@@ -526,7 +575,16 @@ impl AgentLoop {
                     return Ok(());
                 }
                 let ok = self
-                    .run_tool_call(&msg_id, call, cwd, history, emit, journal, snapshots)
+                    .run_tool_call(
+                        &msg_id,
+                        call,
+                        cwd,
+                        ready[i].take(),
+                        history,
+                        emit,
+                        journal,
+                        snapshots,
+                    )
                     .await;
                 if !ok {
                     let key = (call.name.clone(), call.arguments.clone());
@@ -785,6 +843,7 @@ impl AgentLoop {
         msg_id: &str,
         call: &ToolCall,
         cwd: &Path,
+        precomputed: Option<tools::ToolOutcome>,
         history: &mut Vec<ChatMessage>,
         emit: &mut F,
         journal: &mut Vec<ChatMessage>,
@@ -803,7 +862,10 @@ impl AgentLoop {
             });
         }
 
-        let outcome = if call.name == "ask" {
+        let outcome = if let Some(done) = precomputed {
+            // Already executed concurrently with its siblings.
+            done
+        } else if call.name == "ask" {
             self.run_ask(msg_id, call, &input, emit).await
         } else {
             let tool = self.tools.iter().find(|t| t.spec().name == call.name);
@@ -909,6 +971,13 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// Tools that only observe: no filesystem mutation, so several may run
+/// concurrently without racing each other. This is exactly the set a model
+/// tends to request in one batch (read three files, grep two patterns).
+fn is_parallel_safe(tool: &str) -> bool {
+    matches!(tool, "read" | "grep" | "glob" | "webfetch")
 }
 
 const MAX_REPEATED_TOOL_FAILURES: usize = 3;

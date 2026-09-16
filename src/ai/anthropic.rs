@@ -25,6 +25,13 @@ impl Anthropic {
 
     pub fn with_base(base: impl Into<String>, api_key: Option<String>) -> Self {
         let client = reqwest::Client::builder()
+            // Nagle's algorithm would coalesce small SSE frames, adding latency
+            // to every streamed token.
+            .tcp_nodelay(true)
+            // Reuse connections aggressively: a multi-turn session otherwise
+            // pays a fresh TLS handshake per request.
+            .pool_max_idle_per_host(8)
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
             .expect("reqwest client");
@@ -117,18 +124,32 @@ pub fn build_body(req: &ChatRequest, stream: bool) -> Value {
         "stream": stream,
     });
     if !system.is_empty() {
-        body["system"] = json!(system.join("\n\n"));
+        // Sent as content blocks with a cache breakpoint: the system prompt and
+        // tools are identical on every turn of a session, so caching them turns
+        // a full prefill into a cache read.
+        body["system"] = json!([{
+            "type": "text",
+            "text": system.join("\n\n"),
+            "cache_control": { "type": "ephemeral" }
+        }]);
     }
     if !req.tools.is_empty() {
+        let last = req.tools.len() - 1;
         body["tools"] = Value::Array(
             req.tools
                 .iter()
-                .map(|t| {
-                    json!({
+                .enumerate()
+                .map(|(i, t)| {
+                    let mut v = json!({
                         "name": t.name,
                         "description": t.description,
                         "input_schema": t.parameters,
-                    })
+                    });
+                    // A breakpoint on the final tool caches the whole block.
+                    if i == last {
+                        v["cache_control"] = json!({ "type": "ephemeral" });
+                    }
+                    v
                 })
                 .collect(),
         );
@@ -360,12 +381,40 @@ mod tests {
             ..Default::default()
         };
         let b = build_body(&req, true);
-        assert_eq!(b["system"], "be brief");
+        // The system prompt is a content block carrying a cache breakpoint, so
+        // the unchanged prefix is read from cache instead of re-prefilled.
+        assert_eq!(b["system"][0]["type"], "text");
+        assert_eq!(b["system"][0]["text"], "be brief");
+        assert_eq!(b["system"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(b["messages"][1]["content"][0]["type"], "tool_use");
         assert_eq!(b["messages"][1]["content"][0]["input"]["path"], "/a");
         assert_eq!(b["messages"][2]["content"][0]["type"], "tool_result");
         assert_eq!(b["tools"][0]["input_schema"]["type"], "object");
+        // The breakpoint goes on the last tool so the whole block is cached.
+        assert_eq!(b["tools"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(b["max_tokens"], 1000);
+    }
+
+    #[test]
+    fn caching_is_added_only_where_anthropic_allows_it() {
+        let mut req = ChatRequest {
+            model: "m".into(),
+            messages: vec![ChatMessage::system("s"), ChatMessage::user("hi")],
+            tools: vec![
+                ToolSpec { name: "a".into(), description: "a".into(), parameters: json!({}) },
+                ToolSpec { name: "b".into(), description: "b".into(), parameters: json!({}) },
+            ],
+            ..Default::default()
+        };
+        let b = build_body(&req, true);
+        // Exactly one tool breakpoint, on the last definition.
+        assert!(b["tools"][0].get("cache_control").is_none());
+        assert_eq!(b["tools"][1]["cache_control"]["type"], "ephemeral");
+
+        // No system prompt means no system block at all, not an empty one.
+        req.messages = vec![ChatMessage::user("hi")];
+        let b = build_body(&req, true);
+        assert!(b.get("system").is_none());
     }
 
     #[test]

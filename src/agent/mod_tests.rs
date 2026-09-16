@@ -1306,3 +1306,195 @@ fn context_overflow_errors_are_recognized() {
         );
     }
 }
+
+/// Requests several read-only tools at once, so the concurrent batch runs.
+struct ParallelReadProvider {
+    n: Mutex<usize>,
+}
+
+impl Provider for ParallelReadProvider {
+    fn id(&self) -> &'static str {
+        "parallel-read"
+    }
+    fn stream<'a>(
+        &'a self,
+        _request: ChatRequest,
+        _on_event: &'a mut (dyn FnMut(ProviderEvent) + Send),
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<AssistantTurn, ProviderError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let mut n = self.n.lock().unwrap();
+            *n += 1;
+            if *n > 1 {
+                return Ok(AssistantTurn {
+                    text: "done".into(),
+                    tool_calls: vec![],
+                    finish: Some(FinishReason::Stop),
+                });
+            }
+            // Four reads in one turn: exactly the batch that benefits.
+            let calls = (0..4)
+                .map(|i| {
+                    call(
+                        &format!("c{i}"),
+                        "read",
+                        &format!(r#"{{"path":"/nonexistent/{i}.rs"}}"#),
+                    )
+                })
+                .collect();
+            Ok(AssistantTurn {
+                text: String::new(),
+                tool_calls: calls,
+                finish: Some(FinishReason::ToolCalls),
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn read_only_tools_in_one_turn_all_run_and_keep_their_order() {
+    use crate::harness::transcript::PartKind;
+    use crate::harness::TranscriptUpdate;
+
+    let agent = AgentLoop::new(Box::new(ParallelReadProvider { n: Mutex::new(0) }), "test");
+    let dir = std::env::temp_dir();
+    let mut history = Vec::new();
+    let events = std::sync::Arc::new(Mutex::new(Vec::<HarnessEvent>::new()));
+    let sink = events.clone();
+    let mut emit = move |e: HarnessEvent| sink.lock().unwrap().push(e);
+    agent.run_turn(&mut history, "go", &dir, &mut emit).await.unwrap();
+
+    // Every call produced a result, in the order the model asked for them.
+    let results: Vec<String> = history
+        .iter()
+        .filter(|m| m.role == crate::ai::Role::Tool)
+        .filter_map(|m| m.tool_call_id.clone())
+        .collect();
+    assert_eq!(results, vec!["c0", "c1", "c2", "c3"], "order must be preserved");
+
+    // And each one was reported to the UI.
+    let evs = events.lock().unwrap();
+    let tool_parts = evs
+        .iter()
+        .filter(|e| match e {
+            HarnessEvent::Transcript(TranscriptUpdate::Part(p)) => {
+                matches!(&p.kind, PartKind::Tool(_))
+            }
+            _ => false,
+        })
+        .count();
+    assert_eq!(tool_parts, 4, "every tool must be reported");
+}
+
+#[test]
+fn parallel_safe_is_limited_to_read_only_tools() {
+    // Writes must never run concurrently: two edits to one file would race.
+    for t in ["read", "grep", "glob", "webfetch"] {
+        assert!(super::is_parallel_safe(t), "{t} should be parallel-safe");
+    }
+    for t in ["write", "edit", "multiedit", "bash", "ask", "task"] {
+        assert!(!super::is_parallel_safe(t), "{t} must stay sequential");
+    }
+}
+
+/// A `read`-named tool that stalls, so the concurrent batch is measurable.
+struct SlowReadTool {
+    delay: std::time::Duration,
+}
+
+impl crate::agent::tools::Tool for SlowReadTool {
+    fn spec(&self) -> crate::ai::ToolSpec {
+        crate::ai::ToolSpec {
+            name: "read".into(),
+            description: "slow".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+    fn run<'a>(
+        &'a self,
+        input: &'a serde_json::Value,
+        _cwd: &'a std::path::Path,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = crate::agent::tools::ToolOutcome> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            tokio::time::sleep(self.delay).await;
+            crate::agent::tools::ToolOutcome::ok(
+                input.get("path").and_then(|p| p.as_str()).unwrap_or("?"),
+            )
+        })
+    }
+}
+
+struct ThreeReadsProvider {
+    n: Mutex<usize>,
+}
+
+impl Provider for ThreeReadsProvider {
+    fn id(&self) -> &'static str {
+        "three-reads"
+    }
+    fn stream<'a>(
+        &'a self,
+        _request: ChatRequest,
+        _on_event: &'a mut (dyn FnMut(ProviderEvent) + Send),
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<AssistantTurn, ProviderError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let mut n = self.n.lock().unwrap();
+            *n += 1;
+            if *n > 1 {
+                return Ok(AssistantTurn {
+                    text: "done".into(),
+                    tool_calls: vec![],
+                    finish: Some(FinishReason::Stop),
+                });
+            }
+            Ok(AssistantTurn {
+                text: String::new(),
+                tool_calls: (0..3)
+                    .map(|i| call(&format!("c{i}"), "read", &format!(r#"{{"path":"p{i}"}}"#)))
+                    .collect(),
+                finish: Some(FinishReason::ToolCalls),
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn read_only_tool_calls_run_concurrently_not_in_series() {
+    const DELAY_MS: u64 = 200;
+    const CALLS: u64 = 3;
+
+    let tool = SlowReadTool { delay: std::time::Duration::from_millis(DELAY_MS) };
+    let agent = AgentLoop::new(Box::new(ThreeReadsProvider { n: Mutex::new(0) }), "test")
+        .with_tools(vec![
+            std::sync::Arc::new(tool) as std::sync::Arc<dyn crate::agent::tools::Tool>
+        ]);
+
+    let dir = std::env::temp_dir();
+    let mut history = Vec::new();
+    let mut emit = |_e: HarnessEvent| {};
+
+    let started = std::time::Instant::now();
+    agent.run_turn(&mut history, "go", &dir, &mut emit).await.unwrap();
+    let elapsed = started.elapsed();
+
+    // Serial execution would take CALLS x DELAY_MS. Concurrent execution takes
+    // about one delay; allow generous slack for CI scheduling.
+    let serial = std::time::Duration::from_millis(DELAY_MS * CALLS);
+    assert!(
+        elapsed < serial.mul_f64(0.75),
+        "3 x {DELAY_MS}ms tool calls took {elapsed:?}; expected concurrent (~{DELAY_MS}ms), \
+         serial would be {serial:?}"
+    );
+    // And all results are still present, in order.
+    let ids: Vec<String> = history
+        .iter()
+        .filter(|m| m.role == crate::ai::Role::Tool)
+        .filter_map(|m| m.tool_call_id.clone())
+        .collect();
+    assert_eq!(ids, vec!["c0", "c1", "c2"]);
+}

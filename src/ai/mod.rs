@@ -284,15 +284,23 @@ pub async fn stream_with_retry(
 pub(crate) fn sse_data_lines(buf: &mut Vec<u8>, chunk: &[u8]) -> Vec<String> {
     buf.extend_from_slice(chunk);
     let mut out = Vec::new();
-    while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-        let line: Vec<u8> = buf.drain(..=pos).collect();
-        let line = String::from_utf8_lossy(&line[..line.len().saturating_sub(1)]);
+    // Scan with a cursor and drain once at the end. Draining per line shifted
+    // the whole remaining buffer every time, which is quadratic — noticeable
+    // when a large tool argument arrives as one long line.
+    let mut start = 0usize;
+    while let Some(rel) = buf[start..].iter().position(|&b| b == b'\n') {
+        let end = start + rel;
+        let line = String::from_utf8_lossy(&buf[start..end]);
         if let Some(data) = line.strip_prefix("data:") {
             let data = data.trim();
             if !data.is_empty() {
                 out.push(data.to_string());
             }
         }
+        start = end + 1;
+    }
+    if start > 0 {
+        buf.drain(..start);
     }
     out
 }

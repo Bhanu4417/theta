@@ -179,6 +179,27 @@ first-class nodes that rebuild the model context.
 
 Sessions persist to `~/.local/share/theta/sessions/<id>.jsonl`.
 
+### Why it stays responsive
+
+Latency work is not one thing, so it is attacked at each layer:
+
+- **Reasoning effort is sent on every provider.** Left unset, a reasoning model
+  decides for itself how long to think, and models default high. A configured
+  `reasoning_effort` is translated per provider — `reasoning_effort` on
+  OpenAI-compatible endpoints, a thinking budget on Anthropic, a
+  `thinkingBudget` on Gemini (`minimal` disables thinking outright).
+- **Only what changed is re-rendered.** Each message's rendered lines are cached
+  and reused, so streaming a reply costs one message of work rather than the
+  whole transcript. On a 509-message session that is ~100x less per token.
+- **Independent tool calls run concurrently.** A turn that reads three files or
+  runs two searches no longer waits on each in series. Mutating tools stay
+  sequential so they cannot race.
+- **Connections are pooled and un-buffered.** TCP_NODELAY, HTTP/2 and aggressive
+  connection reuse, so a turn does not pay a fresh TLS handshake or wait on
+  Nagle's algorithm for each streamed frame.
+- **Anthropic prompts are cached.** The system prompt and tool schemas carry
+  cache breakpoints, turning a full prefill into a cache read.
+
 ### Keeping long sessions affordable
 
 Every request re-sends the conversation, so anything left in context is paid
