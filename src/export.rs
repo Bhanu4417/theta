@@ -1,5 +1,3 @@
-//! Session export to Markdown or JSONL.
-
 use crate::harness::transcript::{Message, PartKind, Role};
 
 fn role_label(role: Role) -> &'static str {
@@ -9,7 +7,6 @@ fn role_label(role: Role) -> &'static str {
     }
 }
 
-/// Render a transcript as readable Markdown.
 pub fn markdown(messages: &[Message]) -> String {
     let mut out = String::from("# Theta session\n\n");
     for m in messages {
@@ -47,7 +44,6 @@ pub fn markdown(messages: &[Message]) -> String {
     out
 }
 
-/// Render a transcript as JSONL (one message per line).
 pub fn jsonl(messages: &[Message]) -> String {
     let mut out = String::new();
     for m in messages {
@@ -59,7 +55,6 @@ pub fn jsonl(messages: &[Message]) -> String {
     out
 }
 
-/// A sensible default export filename.
 pub fn default_filename(session_name: &str, jsonl_out: bool) -> String {
     let mut slug: String = session_name
         .chars()

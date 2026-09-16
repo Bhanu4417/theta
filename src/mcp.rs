@@ -1,13 +1,3 @@
-//! Minimal MCP (Model Context Protocol) client over stdio.
-//!
-//! Each configured server is spawned once; its tools are exposed to the local
-//! agent as `mcp__<server>__<tool>`. The transport is newline-delimited
-//! JSON-RPC 2.0. Requests are sequential per server (guarded by a mutex), which
-//! keeps the reader simple: read lines, skip notifications, match the id.
-//!
-//! Errors are contained: a server that fails to start or misbehaves is logged
-//! and skipped, never panicking the agent.
-
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
@@ -22,7 +12,6 @@ use crate::agent::tools::{Tool, ToolOutcome};
 use crate::ai::ToolSpec;
 use crate::config::McpServerConfig;
 
-/// One tool advertised by an MCP server.
 #[derive(Debug, Clone, PartialEq)]
 pub struct McpToolInfo {
     pub name: String,
@@ -30,7 +19,6 @@ pub struct McpToolInfo {
     pub schema: Value,
 }
 
-/// A live stdio MCP server.
 pub struct McpClient {
     server: String,
     _child: Child,
@@ -40,7 +28,6 @@ pub struct McpClient {
 }
 
 impl McpClient {
-    /// Spawn and initialize a server. Best-effort: returns an error to skip.
     pub fn connect(name: &str, cfg: &McpServerConfig) -> Result<Self> {
         if cfg.command.trim().is_empty() {
             return Err(anyhow!("mcp server '{name}' has no command"));
@@ -82,8 +69,6 @@ impl McpClient {
         Ok(())
     }
 
-    /// Send a request and wait for its response, skipping notifications and
-    /// unrelated ids.
     fn request(&self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.send(method, params, Some(id))?;
@@ -103,7 +88,7 @@ impl McpClient {
                 continue;
             };
             if v.get("id").and_then(|i| i.as_i64()) != Some(id) {
-                continue; // notification or stale response
+                continue; 
             }
             if let Some(err) = v.get("error") {
                 return Err(anyhow!(
@@ -138,7 +123,6 @@ impl McpClient {
         Ok(parse_tools(&result))
     }
 
-    /// Call a tool, flattening text content blocks into one string.
     pub fn call_tool(&self, name: &str, arguments: Value) -> Result<String> {
         let result = self.request(
             "tools/call",
@@ -148,7 +132,6 @@ impl McpClient {
     }
 }
 
-/// Parse a `tools/list` result into tool info (pure; unit-tested).
 pub fn parse_tools(result: &Value) -> Vec<McpToolInfo> {
     result
         .get("tools")
@@ -175,7 +158,6 @@ pub fn parse_tools(result: &Value) -> Vec<McpToolInfo> {
         .unwrap_or_default()
 }
 
-/// Flatten a `tools/call` result's content blocks into text (pure).
 pub fn flatten_content(result: &Value) -> String {
     let mut out = Vec::new();
     if let Some(items) = result.get("content").and_then(|c| c.as_array()) {
@@ -203,7 +185,6 @@ pub fn flatten_content(result: &Value) -> String {
     }
 }
 
-/// A tool-name-safe id: `mcp__<server>__<tool>` with non-word chars replaced.
 pub fn tool_id(server: &str, tool: &str) -> String {
     let clean = |s: &str| {
         s.chars()
@@ -214,7 +195,6 @@ pub fn tool_id(server: &str, tool: &str) -> String {
     id.chars().take(64).collect()
 }
 
-/// An MCP tool exposed through the local agent's [`Tool`] interface.
 pub struct McpTool {
     client: Arc<Mutex<McpClient>>,
     id: String,
@@ -234,7 +214,6 @@ impl McpTool {
 impl Tool for McpTool {
     fn spec(&self) -> ToolSpec {
         let mut schema = self.tool.schema.clone();
-        // MCP schemas are JSON Schema already; ensure it looks like an object.
         if !schema.is_object() || schema.get("type").is_none() {
             schema = json!({ "type": "object", "properties": {} });
         }
@@ -254,7 +233,6 @@ impl Tool for McpTool {
             let client = self.client.clone();
             let name = self.real_name().to_string();
             let args = input.clone();
-            // Blocking JSON-RPC on a blocking thread; never blocks the loop.
             match tokio::task::spawn_blocking(move || {
                 client.lock().unwrap().call_tool(&name, args)
             })
@@ -268,8 +246,6 @@ impl Tool for McpTool {
     }
 }
 
-/// Connect every enabled server and return their tools. Failures are logged
-/// and skipped so one bad server can't take down the agent.
 pub fn connect_all(cfg: &HashMap<String, McpServerConfig>) -> Vec<Arc<dyn Tool>> {
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
     for (name, sc) in cfg {
@@ -335,7 +311,6 @@ mod tests {
         if !mock_server_available() {
             return;
         }
-        // A tiny MCP server: initialize, tools/list, tools/call.
         let script = r#"
 import sys, json
 def send(o):
@@ -378,10 +353,8 @@ for line in sys.stdin:
             description: "d".into(),
             schema: json!({ "type": "object", "properties": {} }),
         };
-        // Without a live client we only assert the spec shape/id mapping.
         let spec_name = tool_id("srv", &info.name);
         assert_eq!(spec_name, "mcp__srv__x");
-        // str_arg is used by the built-in tools; ensure it is importable here.
         use crate::agent::tools::str_arg;
         let _ = str_arg(&json!({"a": 1}), &["a"]);
     }

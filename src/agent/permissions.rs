@@ -1,9 +1,3 @@
-//! Interactive permission handling for the local agent loop.
-//!
-//! When a tool is gated as `Ask`, the loop emits `PermissionAsked` and awaits a
-//! decision here; the UI answers through the manager. This is the local
-//! equivalent of the OpenCode permission flow.
-
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -21,14 +15,12 @@ impl Broker {
         Self::default()
     }
 
-    /// Register a request, returning the receiver the loop awaits on.
     pub fn register(&self, id: String) -> oneshot::Receiver<PermissionDecision> {
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
         rx
     }
 
-    /// Answer a pending request. Returns false if it is unknown/expired.
     pub fn reply(&self, id: &str, decision: PermissionDecision) -> bool {
         match self.pending.lock().unwrap().remove(id) {
             Some(tx) => tx.send(decision).is_ok(),
@@ -41,7 +33,6 @@ impl Broker {
     }
 }
 
-/// Map a UI permission response (`once`/`always`/`reject`) to a decision.
 pub fn decision_for(response: &str) -> PermissionDecision {
     match response {
         "reject" => PermissionDecision::Deny,
@@ -49,15 +40,12 @@ pub fn decision_for(response: &str) -> PermissionDecision {
     }
 }
 
-/// The answer to a pending `ask` question.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QuestionAnswer {
     Answered(Vec<Vec<String>>),
     Rejected,
 }
 
-/// Tracks `ask`-tool questions the loop is waiting on. The UI answers through
-/// the manager, mirroring the permission broker.
 #[derive(Default)]
 pub struct QuestionBroker {
     pending: Mutex<HashMap<String, oneshot::Sender<QuestionAnswer>>>,
@@ -105,7 +93,6 @@ mod tests {
         assert!(b.reply("p1", PermissionDecision::Allow));
         assert_eq!(rx.await.unwrap(), PermissionDecision::Allow);
         assert_eq!(b.pending_count(), 0);
-        // Unknown ids are rejected.
         assert!(!b.reply("missing", PermissionDecision::Deny));
     }
 
@@ -115,7 +102,6 @@ mod tests {
         let rx = b.register("q1".into());
         assert!(b.reply("q1", vec![vec!["Yes".into()]]));
         assert_eq!(rx.await.unwrap(), QuestionAnswer::Answered(vec![vec!["Yes".into()]]));
-        // Rejection and unknown ids.
         let rx = b.register("q2".into());
         assert!(b.reject("q2"));
         assert_eq!(rx.await.unwrap(), QuestionAnswer::Rejected);

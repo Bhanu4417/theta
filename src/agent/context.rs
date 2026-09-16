@@ -1,17 +1,3 @@
-//! Context compaction, mirroring Pi's `core/compaction` architecture.
-//!
-//! - `should_compact` triggers at `contextWindow - reserveTokens`.
-//! - `find_cut_point` walks backwards accumulating estimated message sizes,
-//!   cutting only at user/assistant messages (never a tool result), and
-//!   detects a **split turn** when the cut lands mid-turn.
-//! - `prepare` collects `messagesToSummarize` + `turnPrefixMessages`,
-//!   the previous summary, `tokensBefore` and file operations.
-//! - summaries use Pi's structured prompt (initial vs iterative update) with
-//!   the conversation wrapped in `<conversation>` and the prior summary in
-//!   `<previous-summary>`.
-//! - file tracking is cumulative (`read` minus `written`/`edited`).
-//! - branch summarization reuses the same serialization for tree navigation.
-
 use std::collections::{BTreeSet, HashMap};
 
 use serde_json::Value;
@@ -22,7 +8,6 @@ use crate::harness::transcript::TokenUsage;
 pub const SUMMARY_OPEN: &str = "<conversation-summary>";
 pub const SUMMARY_CLOSE: &str = "</conversation-summary>";
 
-/// Maximum characters for a tool result in serialized summaries (Pi's value).
 pub const TOOL_RESULT_MAX_CHARS: usize = 2000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,7 +29,6 @@ impl Default for CompactionSettings {
 
 pub type ModelOverrides = HashMap<String, (Option<u64>, Option<u64>)>;
 
-/// Resolve effective settings for `model` (Pi's independent per-field fallback).
 pub fn resolve_settings(
     base: CompactionSettings,
     overrides: &ModelOverrides,
@@ -63,17 +47,13 @@ pub fn resolve_settings(
     s
 }
 
-// ---------------------------------------------------------------------------
-// Token accounting (Pi: calculateContextTokens / estimateTokens)
-// ---------------------------------------------------------------------------
 
-/// Prompt-side context size for an assistant usage.
 pub fn calculate_context_tokens(usage: TokenUsage) -> u64 {
     usage.context()
 }
 
 pub fn estimate_tokens(text: &str) -> u64 {
-    ((text.chars().count() as u64) + 3) / 4 + 1
+    (text.chars().count() as u64).div_ceil(4) + 1
 }
 
 pub fn message_tokens(m: &ChatMessage) -> u64 {
@@ -88,8 +68,6 @@ pub fn total_tokens(messages: &[ChatMessage]) -> u64 {
     messages.iter().map(message_tokens).sum()
 }
 
-/// Pi's `estimateContextTokens`: prefer the last assistant's real usage as the
-/// base and estimate only the messages after it; otherwise estimate everything.
 pub fn estimate_context_tokens(messages: &[ChatMessage]) -> u64 {
     if let Some(i) = messages
         .iter()
@@ -102,7 +80,6 @@ pub fn estimate_context_tokens(messages: &[ChatMessage]) -> u64 {
     total_tokens(messages)
 }
 
-/// Pi's trigger: `contextTokens > contextWindow - reserveTokens`.
 pub fn should_compact(context_tokens: u64, context_window: u64, s: &CompactionSettings) -> bool {
     if context_window == 0 {
         return false;
@@ -110,15 +87,11 @@ pub fn should_compact(context_tokens: u64, context_window: u64, s: &CompactionSe
     context_tokens > context_window.saturating_sub(s.reserve_tokens)
 }
 
-// ---------------------------------------------------------------------------
-// Cut points and turn detection (Pi: findCutPoint / isTurnStart)
-// ---------------------------------------------------------------------------
 
 pub fn is_summary(m: &ChatMessage) -> bool {
     m.role == Role::System && m.text.trim_start().starts_with(SUMMARY_OPEN)
 }
 
-/// System messages before any prior summary are preserved verbatim.
 pub fn system_prefix(messages: &[ChatMessage]) -> usize {
     messages
         .iter()
@@ -126,12 +99,10 @@ pub fn system_prefix(messages: &[ChatMessage]) -> usize {
         .count()
 }
 
-/// A message a cut may land on (user/assistant; never a tool result or system).
 fn is_cut_point(m: &ChatMessage) -> bool {
     matches!(m.role, Role::User | Role::Assistant)
 }
 
-/// A user message starts a turn.
 fn is_turn_start(m: &ChatMessage) -> bool {
     m.role == Role::User
 }
@@ -146,14 +117,11 @@ fn find_turn_start(messages: &[ChatMessage], index: usize, start: usize) -> Opti
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CutPoint {
-    /// First message to keep.
     pub first_kept: usize,
-    /// User message that starts the turn being split (when splitting).
     pub turn_start: Option<usize>,
     pub is_split_turn: bool,
 }
 
-/// Walk backwards keeping `keep_recent_tokens`, cutting only at valid points.
 pub fn find_cut_point(
     messages: &[ChatMessage],
     start: usize,
@@ -192,9 +160,6 @@ pub fn find_cut_point(
     }
 }
 
-// ---------------------------------------------------------------------------
-// File operations (Pi: FileOperations / computeFileLists / formatFileOperations)
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FileOps {
@@ -208,7 +173,6 @@ impl FileOps {
         self.read.is_empty() && self.written.is_empty() && self.edited.is_empty()
     }
 
-    /// Pi: only `read`/`write`/`edit` tool calls contribute.
     pub fn extract_from_message(&mut self, m: &ChatMessage) {
         if m.role != Role::Assistant {
             return;
@@ -238,7 +202,6 @@ impl FileOps {
         ops
     }
 
-    /// Parse `<read-files>` / `<modified-files>` from a previous summary.
     pub fn from_summary(text: &str) -> Self {
         let mut ops = FileOps::default();
         for path in block_entries(text, "read-files") {
@@ -256,7 +219,6 @@ impl FileOps {
         self.edited.extend(other.edited.iter().cloned());
     }
 
-    /// (files only read, modified files) — sorted; read excludes modified.
     pub fn compute_lists(&self) -> (Vec<String>, Vec<String>) {
         let modified: BTreeSet<&String> = self.written.iter().chain(self.edited.iter()).collect();
         let read_only: Vec<String> = self
@@ -269,8 +231,6 @@ impl FileOps {
         (read_only, modified_files)
     }
 
-    /// Pi's `formatFileOperations`: leading blank lines, sections only if
-    /// non-empty.
     pub fn format(&self) -> String {
         let (read, modified) = self.compute_lists();
         let mut sections = Vec::new();
@@ -316,9 +276,6 @@ fn block_entries(text: &str, tag: &str) -> Vec<String> {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// Serialization (Pi: serializeConversation)
-// ---------------------------------------------------------------------------
 
 fn truncate_for_summary(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
@@ -329,8 +286,6 @@ fn truncate_for_summary(text: &str, max: usize) -> String {
     format!("{head}\n\n[... {truncated} more characters truncated]")
 }
 
-/// Serialize a span as text so the summarizer treats it as data, not a
-/// conversation to continue.
 pub fn serialize_conversation(messages: &[ChatMessage], tool_result_cap: usize) -> String {
     let mut parts: Vec<String> = Vec::new();
     for m in messages {
@@ -375,7 +330,6 @@ pub fn serialize_conversation(messages: &[ChatMessage], tool_result_cap: usize) 
     parts.join("\n\n")
 }
 
-/// `k=v, k=v` rendering of a tool-call argument object (Pi uses `JSON.stringify`).
 fn args_kv(args: &str) -> String {
     let Ok(Value::Object(map)) = serde_json::from_str::<Value>(args) else {
         return args.to_string();
@@ -413,9 +367,6 @@ pub fn strip_summary_markers(text: &str) -> String {
     out.trim().to_string()
 }
 
-// ---------------------------------------------------------------------------
-// Prompts (Pi verbatim)
-// ---------------------------------------------------------------------------
 
 pub const SUMMARIZATION_SYSTEM_PROMPT: &str = "You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.\n\nDo NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.";
 
@@ -427,8 +378,6 @@ pub const TURN_PREFIX_SUMMARIZATION_PROMPT: &str = "This is the PREFIX of a turn
 
 pub const BRANCH_SUMMARY_PROMPT: &str = "Summarize the work on this branch so it can be carried into a different branch. Cover the goal, what was attempted, decisions made, dead ends, and any files touched. Do not continue the conversation.";
 
-/// Build the summarization request text: `<conversation>` + optional
-/// `<previous-summary>` + the initial/update prompt (+ custom focus).
 pub fn summarization_user_message(
     conversation: &str,
     previous_summary: Option<&str>,
@@ -451,20 +400,12 @@ pub fn summarization_user_message(
     out
 }
 
-/// Hard cap on the summary output. A structured summary never needs the full
-/// `reserveTokens` budget; without a cap, reasoning models can grind for
-/// minutes emitting hidden reasoning, which made `/compact` feel hung. Keeping
-/// this small makes compaction quick for **every** model.
 pub const SUMMARY_MAX_TOKENS_CAP: u64 = 4_096;
 
-/// Summary token cap: `min(0.8 * reserveTokens, SUMMARY_MAX_TOKENS_CAP)`.
 pub fn summary_max_tokens(reserve_tokens: u64) -> u64 {
-    (reserve_tokens * 4 / 5).min(SUMMARY_MAX_TOKENS_CAP).max(256)
+    (reserve_tokens * 4 / 5).clamp(256, SUMMARY_MAX_TOKENS_CAP)
 }
 
-// ---------------------------------------------------------------------------
-// Preparation
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Preparation {
@@ -477,11 +418,8 @@ pub struct Preparation {
     pub file_ops: FileOps,
 }
 
-/// Pi's `prepareCompaction`: choose the cut, gather the summary spans, previous
-/// summary, `tokensBefore` and cumulative file operations.
 pub fn prepare(messages: &[ChatMessage], settings: &CompactionSettings) -> Option<Preparation> {
     let prefix = system_prefix(messages);
-    // Boundary starts after the previous summary (iterative fold-forward).
     let (previous_raw, previous_summary, boundary_start) =
         match messages.iter().rposition(is_summary) {
             Some(i) => {
@@ -536,10 +474,6 @@ pub fn prepare(messages: &[ChatMessage], settings: &CompactionSettings) -> Optio
     })
 }
 
-/// Make the message list valid for providers: every assistant `tool_call`
-/// must be followed by a matching tool output, and orphan tool outputs are
-/// dropped. An interrupted turn can otherwise leave a dangling call that makes
-/// every later request fail (OpenAI chat and Responses both reject it).
 pub fn repair_tool_calls(messages: &mut Vec<ChatMessage>) {
     let mut declared: HashMap<String, bool> = HashMap::new();
     for m in messages.iter() {
@@ -570,7 +504,7 @@ pub fn repair_tool_calls(messages: &mut Vec<ChatMessage>) {
                 .map(|id| declared.contains_key(id))
                 .unwrap_or(false);
             if !known {
-                continue; // orphan output with no call
+                continue; 
             }
         }
         if m.role == Role::Assistant && !m.tool_calls.is_empty() {
@@ -592,8 +526,6 @@ pub fn repair_tool_calls(messages: &mut Vec<ChatMessage>) {
     *messages = out;
 }
 
-/// Replace `messages[system_prefix..first_kept]` with a summary message,
-/// preserving the leading system prefix and the kept tail.
 pub fn apply_summary(messages: &mut Vec<ChatMessage>, first_kept: usize, summary: &str) {
     let start = system_prefix(messages);
     if first_kept <= start {
@@ -607,11 +539,7 @@ pub fn apply_summary(messages: &mut Vec<ChatMessage>, first_kept: usize, summary
     messages.extend(kept);
 }
 
-// ---------------------------------------------------------------------------
-// Branch summarization (Pi: branch-summarization)
-// ---------------------------------------------------------------------------
 
-/// Serialize the newest entries of an abandoned branch up to a token budget.
 pub fn branch_summary_input(branch: &[ChatMessage], budget_tokens: u64, cap: usize) -> Option<String> {
     if branch.is_empty() {
         return None;
@@ -646,7 +574,6 @@ mod tests {
 
     #[test]
     fn repair_adds_missing_tool_outputs_and_drops_orphans() {
-        // Interrupted turn: assistant asked for a tool but no output recorded.
         let mut msgs = vec![
             ChatMessage::system("sys"),
             user("q"),
@@ -656,12 +583,10 @@ mod tests {
         assert_eq!(msgs.len(), 4);
         assert_eq!(msgs[3].role, Role::Tool);
         assert_eq!(msgs[3].tool_call_id.as_deref(), Some("c1"));
-        // A second pass is idempotent.
         let before = msgs.clone();
         repair_tool_calls(&mut msgs);
         assert_eq!(msgs, before);
 
-        // Orphan tool output (no matching call) is removed.
         let mut msgs = vec![
             ChatMessage::system("sys"),
             user("q"),
@@ -670,7 +595,6 @@ mod tests {
         repair_tool_calls(&mut msgs);
         assert_eq!(msgs.len(), 2);
 
-        // A complete pair is untouched.
         let mut msgs = vec![
             user("q"),
             ChatMessage::assistant("", vec![call("c1", "read", "{}")]),
@@ -684,19 +608,17 @@ mod tests {
     #[test]
     fn trigger_matches_pi_formula() {
         let s = CompactionSettings::default();
-        assert!(should_compact(20_000, 30_000, &s)); // > 30000-16384
+        assert!(should_compact(20_000, 30_000, &s)); 
         assert!(!should_compact(10_000, 30_000, &s));
         assert!(!should_compact(1, 0, &s));
     }
 
     #[test]
     fn cut_point_lands_on_valid_boundary_and_flags_split_turn() {
-        // system + a turn: user, assistant(tool call), tool result, assistant.
         let mut msgs = vec![ChatMessage::system("sys"), user("q")];
         msgs.push(ChatMessage::assistant("", vec![call("c", "read", "{\"path\":\"/a\"}")]));
         msgs.push(ChatMessage::tool_result("c", "data ".repeat(200)));
         msgs.push(asst("final"));
-        // Small budget keeps only the tail; the cut must never be the tool result.
         let cut = find_cut_point(&msgs, 1, msgs.len(), 10);
         assert_ne!(msgs[cut.first_kept].role, Role::Tool);
     }
@@ -735,10 +657,8 @@ mod tests {
         let settings = CompactionSettings { reserve_tokens: 0, keep_recent_tokens: 200, tool_result_cap: 2000 };
         let prep = prepare(&msgs, &settings).expect("prepare");
         assert_eq!(prep.previous_summary.as_deref(), Some("OLD"));
-        // The previous summary's file is carried forward.
         assert!(prep.file_ops.read.contains("/old.rs"));
-        // The summarized span starts after the previous summary message.
-        assert!(!prep.messages_to_summarize.iter().any(|m| is_summary(m)));
+        assert!(!prep.messages_to_summarize.iter().any(is_summary));
     }
 
     #[test]
@@ -788,20 +708,17 @@ mod tests {
         let initial = summarization_user_message("[User]: hi", None, None);
         assert!(initial.contains("structured context checkpoint"));
         assert!(!initial.contains("previous-summary"));
-        // Bounded by SUMMARY_MAX_TOKENS_CAP so compaction stays fast.
         assert_eq!(summary_max_tokens(16_384), SUMMARY_MAX_TOKENS_CAP);
-        // A small reserve still scales down (never below 256).
         assert_eq!(summary_max_tokens(256), 256);
     }
 
     #[test]
     fn split_turn_is_detected_for_one_huge_turn() {
-        // A single turn whose assistant/tool work exceeds the keep budget.
         let mut msgs = vec![ChatMessage::system("sys")];
         msgs.push(user("do a very long thing"));
         for i in 0..12 {
             msgs.push(ChatMessage::assistant(
-                &"a".repeat(400),
+                "a".repeat(400),
                 vec![call(&format!("c{i}"), "bash", "{\"command\":\"go\"}")],
             ));
             msgs.push(ChatMessage::tool_result(format!("c{i}"), "r".repeat(400)));
@@ -811,7 +728,6 @@ mod tests {
         assert!(prep.is_split_turn, "cut landed mid-turn");
         assert!(prep.messages_to_summarize.is_empty(), "no complete turns to summarize");
         assert!(!prep.turn_prefix.is_empty(), "turn prefix is summarized separately");
-        // The retained suffix still starts on a valid boundary.
         assert!(matches!(msgs[prep.first_kept].role, Role::User | Role::Assistant));
     }
 

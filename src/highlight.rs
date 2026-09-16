@@ -1,5 +1,3 @@
-//! Syntax highlighting via syntect with a Tokyo Night color theme.
-
 use ratatui::style::{Color, Modifier, Style};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -19,14 +17,12 @@ pub struct Highlighter {
 
 static HL: RwLock<Option<(u64, Highlighter)>> = RwLock::new(None);
 
-/// Cache of rendered diffs (keyed by patch/width/theme hash).
 static DIFF_CACHE: RwLock<Option<HashMap<u64, Arc<Vec<Line<'static>>>>>> = RwLock::new(None);
 
 fn current() -> (u64, Highlighter) {
     (crate::theme::theme_version(), Highlighter::build())
 }
 
-/// Returns a snapshot rebuilt automatically when the theme changes.
 pub fn get() -> std::sync::RwLockReadGuard<'static, Option<(u64, Highlighter)>> {
     loop {
         {
@@ -44,7 +40,6 @@ pub fn get() -> std::sync::RwLockReadGuard<'static, Option<(u64, Highlighter)>> 
                 *g = Some(current());
             }
         }
-        // fall through to the read path on the next loop iteration
         {
             let g = HL.read().expect("hl lock");
             if g.is_some() {
@@ -78,9 +73,11 @@ impl Highlighter {
     fn build() -> Self {
         let ps = SyntaxSet::load_defaults_newlines();
         let p = crate::theme::pal();
-        let mut settings = ThemeSettings::default();
-        settings.foreground = Some(color(p.fg));
-        settings.background = Some(color(p.code_bg));
+        let settings = ThemeSettings {
+            foreground: Some(color(p.fg)),
+            background: Some(color(p.code_bg)),
+            ..ThemeSettings::default()
+        };
 
         let it = FontStyle::ITALIC;
         let scopes = vec![
@@ -131,19 +128,15 @@ impl Highlighter {
             .unwrap_or_else(|| self.ps.find_syntax_plain_text())
     }
 
-    /// Highlight code into per-line owned spans (no trailing newline).
     pub fn highlight_code(&self, code: &str, lang: &str) -> Vec<Vec<Span<'static>>> {
         self.highlight_impl(code, "", lang)
     }
 
-    /// Highlight a file by extension; returns per-line owned spans.
     pub fn highlight_file(&self, path: &str, content: &str) -> Vec<Vec<Span<'static>>> {
         self.highlight_impl(content, path, "")
     }
 
     fn highlight_impl(&self, content: &str, path: &str, lang: &str) -> Vec<Vec<Span<'static>>> {
-        // Defensive cap: highlighting is synchronous, so a very large input
-        // would block the UI for a long time. Render such content plainly.
         const MAX_HIGHLIGHT_BYTES: usize = 512 * 1024;
         if content.len() > MAX_HIGHLIGHT_BYTES {
             return content
@@ -199,7 +192,6 @@ fn syntect_to_ratatui(c: syntect::highlighting::Color) -> Color {
     Color::Rgb(c.r, c.g, c.b)
 }
 
-/// Diff text → colored lines (+ green, - red, @@ blue, headers dim).
 pub fn diff_lines(diff: &str) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     for raw in diff.lines() {
@@ -219,10 +211,6 @@ pub fn diff_lines(diff: &str) -> Vec<Line<'static>> {
     out
 }
 
-// ---------------------------------------------------------------------------
-// OpenCode-style diff view: line numbers, syntax colours, tinted add/remove
-// backgrounds. Renders split when wide enough, unified otherwise.
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DKind {
@@ -291,7 +279,6 @@ fn parse_unified(patch: &str) -> Vec<Hunk> {
             *old += 1;
             *new += 1;
         } else if raw.starts_with('\\') {
-            // "\ No newline at end of file" — ignore
         } else {
             lines.push(DLine { kind: DKind::Ctx, old: *old, new: *new, text: raw.to_string() });
             *old += 1;
@@ -377,12 +364,7 @@ fn tint(mut spans: Vec<Span<'static>>, bg: Option<Color>) -> Vec<Span<'static>> 
     spans
 }
 
-/// Render a unified diff the way the OpenCode TUI does: line numbers, `+`/`-`
-/// signs, syntax-highlighted content and tinted add/remove backgrounds.
-/// `split` requests a side-by-side view (used when the pane is wide).
 pub fn diff_view(patch: &str, file: &str, width: usize, split: bool) -> Vec<Line<'static>> {
-    // Diffs are immutable and rendered on every spinner tick; cache the
-    // highlighted result (keyed by content, width, layout and theme).
     let key = {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         patch.hash(&mut h);
@@ -485,7 +467,7 @@ fn render_split(hunks: &[Hunk], file: &str, width: usize) -> Vec<Line<'static>> 
     let add_bg = added_bg();
     let del_bg = removed_bg();
     let pane_bg = pal().bg;
-    let sep_w = 3usize; // " │ "
+    let sep_w = 3usize; 
     let pane_w = width.saturating_sub(sep_w);
     let left_w = pane_w / 2;
     let right_w = pane_w - left_w;
@@ -552,7 +534,6 @@ fn render_side(
     tint(spans, Some(bg))
 }
 
-/// Pair removed/added runs so they line up side by side; context is shared.
 fn split_rows(lines: &[DLine]) -> Vec<(Option<&DLine>, Option<&DLine>)> {
     let mut out: Vec<(Option<&DLine>, Option<&DLine>)> = Vec::new();
     let mut i = 0usize;
@@ -573,7 +554,6 @@ fn split_rows(lines: &[DLine]) -> Vec<(Option<&DLine>, Option<&DLine>)> {
             i += 1;
         }
         if dels.is_empty() && adds.is_empty() {
-            // Unknown kind (shouldn't happen); consume to avoid a loop.
             i += 1;
             continue;
         }
@@ -594,7 +574,7 @@ mod diff_tests {
 --- /a/b.rs\n\
 +++ /a/b.rs\n\
 @@ -142,7 +142,6 @@\n\
- binary = \"opencode\"\n\
+ binary = \"server\"\n\
  port_base = 4310\n\
 -keep_alive = true\n\
  \n\
@@ -612,16 +592,13 @@ mod diff_tests {
         assert!(!u.is_empty());
         let s = diff_view(PATCH, "/a/b.rs", 120, true);
         assert!(!s.is_empty());
-        // A hit must be byte-identical to the first render.
         let u2 = diff_view(PATCH, "/a/b.rs", 80, false);
         assert_eq!(u.len(), u2.len());
     }
 
     #[test]
     fn tolerates_partial_and_empty() {
-        // Empty input renders nothing (no panic).
         assert!(diff_view("", "/x.rs", 40, false).is_empty());
-        // A header-only hunk is still renderable.
         assert!(!diff_view("@@ -1,1 +1,1 @@\n", "/x.rs", 40, false).is_empty());
     }
 }

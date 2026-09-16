@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%" role="img" aria-label="Theta">
+  <title>Theta</title>
+  <rect width="512" height="512" rx="96" fill="#12131a"/>
+  <path fill="#e0dbce" shape-rendering="crispEdges" d="M 80 64
+           H 304
+           V 128
+           H 208
+           V 448
+           H 144
+           V 128
+           H 80
+           Z"/>
+  <path fill="#e0dbce" shape-rendering="crispEdges" d="M 304 224
+           H 368
+           V 256
+           H 400
+           V 288
+           H 432
+           V 448
+           H 368
+           V 320
+           H 336
+           V 288
+           H 304
+           V 448
+           H 240
+           V 128
+           H 304
+           V 224
+           Z"/>
+</svg>

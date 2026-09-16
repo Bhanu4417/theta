@@ -1,10 +1,3 @@
-//! Theta's own in-process backend: the local agent loop exposed behind the
-//! same `AgentProvider` + `EventPump` contract as OpenCode.
-//!
-//! It needs no server. `send_message` spawns a turn that emits neutral
-//! `RoutedEvent`s on an internal channel; `pump` forwards them to the manager,
-//! so the rest of the app cannot tell local turns from OpenCode ones.
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -26,21 +19,14 @@ struct LocalSession {
     session: ProviderSession,
     tree: SessionTree,
     cancel: Arc<AtomicBool>,
-    /// The agent currently serving this session (may change when the user
-    /// picks a different model).
     agent: Arc<AgentLoop>,
-    /// `(provider, model, agent)` the session's agent was built for.
     agent_key: (String, String, String),
-    /// Leaves abandoned by `/undo`, newest last, for `/redo`.
     redo: Vec<String>,
 }
 
-/// Builds an agent for a `(provider, model, agent)` triple. The manager supplies
-/// a factory so picking a model or agent rebuilds the adapter on demand.
 pub type AgentFactory =
     Arc<dyn Fn(&str, &str, &str) -> Result<Arc<AgentLoop>, ProviderError> + Send + Sync>;
 
-/// Everything the adapter needs, shared across its (async) methods.
 struct Inner {
     factory: AgentFactory,
     default_agent: Arc<AgentLoop>,
@@ -57,7 +43,6 @@ pub struct LocalProvider {
 }
 
 impl LocalProvider {
-    /// Fixed-agent provider (tests, single-model use).
     #[cfg(test)]
     pub fn new(agent: Arc<AgentLoop>, default_dir: impl Into<String>) -> Self {
         let fixed = agent.clone();
@@ -66,7 +51,6 @@ impl LocalProvider {
         Self::with_factory(factory, agent, ("".into(), model, String::new()), default_dir)
     }
 
-    /// Provider whose agent can be rebuilt per `(provider, model)` selection.
     pub fn with_factory(
         factory: AgentFactory,
         default_agent: Arc<AgentLoop>,
@@ -88,20 +72,16 @@ impl LocalProvider {
         }
     }
 
-    /// Choose (building if needed) the agent for a session keyed by
-    /// `(provider, model)`. Caller must hold no lock on `sessions`.
     fn agent_for(
         &self,
         desired: &(String, String, String),
     ) -> Result<Arc<AgentLoop>, ProviderError> {
-        // Fast path: the default agent already matches.
         if desired == &self.inner.default_key {
             return Ok(self.inner.default_agent.clone());
         }
         (self.inner.factory)(&desired.0, &desired.1, &desired.2)
     }
 
-    /// Pre-create a session id without sending anything (used by connect).
     pub fn register(&self, dir: &str, title: &str) -> ProviderSession {
         let n = self.seq.fetch_add(1, Ordering::Relaxed);
         let id = format!("theta-local-{n}");
@@ -129,8 +109,6 @@ impl LocalProvider {
         session
     }
 
-    /// Adopt an existing on-disk session (resume): load its tree, replay the
-    /// visible history into the transcript, and register it under `id`.
     pub fn adopt(&self, id: &str, dir: &str, title: &str) -> ProviderSession {
         let dir = if dir.is_empty() { self.default_dir.clone() } else { dir.to_string() };
         let session = ProviderSession {
@@ -157,8 +135,6 @@ impl LocalProvider {
         session
     }
 
-    /// Re-emit a stored transcript atomically so a resumed pane shows prior turns
-    /// without flickering through intermediate incremental frames.
     fn replay(&self, sid: &str, tree: &SessionTree) {
         if tree.is_empty() {
             return;
@@ -188,7 +164,6 @@ impl LocalProvider {
         let mut messages = tree.context();
         self.emit_event(id, HarnessEvent::CompactionStarted);
         let Some((summary, tokens_before, tail)) = agent.force_compact(&mut messages).await else {
-            // Nothing to compact; put the untouched tree back.
             if let Some(s) = self.inner.sessions.lock().unwrap().get_mut(id) {
                 s.tree = tree;
             }
@@ -216,23 +191,17 @@ impl LocalProvider {
         });
     }
 
-    /// Force every session's agent to be rebuilt on its next turn (used after
-    /// credentials change, so a newly added key takes effect).
     pub fn invalidate_agents(&self) {
         let mut sessions = self.inner.sessions.lock().unwrap();
         for s in sessions.values_mut() {
-            // A key no real selection can equal, so the next send rebuilds.
             s.agent_key = ("\u{0}invalid".to_string(), String::new(), String::new());
         }
     }
 
-    /// Snapshot a session's history tree (for the `/tree` overlay).
     pub fn tree_snapshot(&self, id: &str) -> Option<SessionTree> {
         self.inner.sessions.lock().unwrap().get(id).map(|s| s.tree.clone())
     }
 
-    /// Navigate a session to an earlier entry, optionally injecting a branch
-    /// summary of the abandoned work.
     pub fn navigate(&self, id: &str, entry: &str, summary: Option<String>) -> bool {
         let mut sessions = self.inner.sessions.lock().unwrap();
         let Some(s) = sessions.get_mut(id) else {
@@ -247,8 +216,6 @@ impl LocalProvider {
         ok
     }
 
-    /// Navigate backwards, summarizing the abandoned branch with the model and
-    /// carrying it forward as a branch-summary node (Pi's tree navigation).
     pub async fn navigate_auto(&self, id: &str, entry: &str) -> bool {
         let (input, agent) = {
             let sessions = self.inner.sessions.lock().unwrap();
@@ -261,7 +228,6 @@ impl LocalProvider {
             if old == entry {
                 return true;
             }
-            // Only summarize when jumping to an ancestor (backwards).
             let input = if s.tree.is_ancestor(entry, &old) {
                 s.tree.branch_summary_input(&old, Some(entry), 20_000, 2_000)
             } else {
@@ -280,17 +246,12 @@ impl LocalProvider {
         self.navigate(id, entry, summary)
     }
 
-    /// `/undo`: move the active leaf to just before `entry`, remembering the
-    /// old leaf so `/redo` can restore it. The abandoned branch stays on disk
-    /// (history is never deleted). Returns the rewound user text when `entry`
-    /// is a user entry, so the UI can put it back in the chatbox.
     pub fn rewind(&self, id: &str, entry: &str) -> Option<String> {
         let mut sessions = self.inner.sessions.lock().unwrap();
         let s = sessions.get_mut(id)?;
         let text = s.tree.node(entry).map(|e| e.text.clone());
         let target = s.tree.node(entry).and_then(|e| e.parent.clone());
         let old = s.tree.leaf.clone()?;
-        // Restore the working tree to the state before the rewound turns.
         s.tree.restore_files_after(target.as_deref());
         match target {
             Some(t) => {
@@ -307,7 +268,6 @@ impl LocalProvider {
         text
     }
 
-    /// `/redo`: restore the leaf most recently abandoned by [`Self::rewind`].
     pub fn redo(&self, id: &str) -> bool {
         let mut sessions = self.inner.sessions.lock().unwrap();
         let Some(s) = sessions.get_mut(id) else {
@@ -317,7 +277,6 @@ impl LocalProvider {
             return false;
         };
         if !s.tree.set_leaf(&leaf) {
-            // The leaf no longer exists; push it back so state stays consistent.
             s.redo.push(leaf);
             return false;
         }
@@ -355,8 +314,6 @@ impl AgentProvider for LocalProvider {
         agent: Option<String>,
         attachments: &[crate::mentions::Attachment],
     ) -> Result<(), ProviderError> {
-        // Split attachments: images become vision content parts; everything
-        // else is inlined as text into the prompt.
         let mut text_atts = Vec::new();
         let mut images = Vec::new();
         for a in attachments {
@@ -371,14 +328,10 @@ impl AgentProvider for LocalProvider {
         } else {
             crate::mentions::inline_attachments(text, &text_atts, 20_000)
         };
-        // Resolve the model the user picked and rebuild the session's agent if
-        // it changed. This is what makes the model picker work on the local
-        // backend.
         let mut desired = match model {
             Some(m) => (m.provider, m.model, String::new()),
             None => self.inner.default_key.clone(),
         };
-        // Fall back to the session's default agent when the caller didn't pick.
         if desired.2.is_empty() {
             desired.2 = self.inner.default_key.2.clone();
         }
@@ -410,7 +363,6 @@ impl AgentProvider for LocalProvider {
                 entry.agent.clone(),
             )
         };
-        // Rebuild the prompt from the active branch, then run.
         let mut history = tree.context();
 
         let inner = self.inner.clone();
@@ -418,7 +370,6 @@ impl AgentProvider for LocalProvider {
         let sid = session.id.clone();
         let cwd = PathBuf::from(&dir);
 
-        // Run the turn on its own task; events stream back through `pump`.
         tokio::spawn(async move {
             let mut emit = {
                 let tx = tx.clone();
@@ -448,13 +399,10 @@ impl AgentProvider for LocalProvider {
                 });
                 let _ = tx.send(RoutedEvent { session_id: Some(sid.clone()), event: HarnessEvent::SessionIdle });
             }
-            // Record the turn in the session tree and persist it.
             tree.append(&ChatMessage::user(&text));
             for m in &journal {
                 tree.append(m);
             }
-            // Attach the turn's file pre-images to its last node so `/undo` can
-            // restore the working tree.
             if !snapshots.is_empty() {
                 if let Some(last) = tree.entries.last_mut() {
                     last.snapshots = snapshots;
@@ -481,8 +429,6 @@ impl AgentProvider for LocalProvider {
         Ok(())
     }
 
-    /// Provider-native fork: duplicate the active branch into a new session id
-    /// (the source is untouched). `at` pins the copy to an ancestor entry.
     async fn fork(
         &self,
         session: &ProviderSession,
@@ -498,7 +444,6 @@ impl AgentProvider for LocalProvider {
             (s.tree.clone(), s.session.directory.clone())
         };
         if let Some(entry) = at {
-            // Pin the fork: drop everything after `entry` on the active path.
             let keep: Vec<String> = tree
                 .active_path()
                 .into_iter()
@@ -589,7 +534,6 @@ mod tests {
     #[tokio::test]
     async fn local_provider_streams_a_turn_through_the_pump() {
         let dir = std::env::temp_dir().to_string_lossy().to_string();
-        // Keep session-tree sidecars out of the real data dir.
         let session_dir = std::env::temp_dir().join(format!("theta-sessions-{}", std::process::id()));
         std::env::set_var("THETA_SESSION_DIR", &session_dir);
         let provider = OneShot {
@@ -605,7 +549,6 @@ mod tests {
         let agent = Arc::new(AgentLoop::new(Box::new(provider), "gpt-4o"));
         let local = Arc::new(LocalProvider::new(agent, &dir));
 
-        // Start the pump first (like the manager does), then send.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let pump_local = local.clone();
         let pump_task = tokio::spawn(async move {
@@ -618,7 +561,6 @@ mod tests {
             .unwrap();
         local.send_message(&session, "hi", None, None, &[]).await.unwrap();
 
-        // Collect until we see SessionIdle (the loop's terminal event).
         let mut seen = Vec::new();
         loop {
             let ev = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
@@ -636,16 +578,13 @@ mod tests {
         assert!(seen.iter().any(|e| e.event == crate::harness::HarnessEvent::AssistantFinished));
         pump_task.abort();
 
-        // The turn is recorded as a history tree with user + assistant nodes.
         let tree = local.tree_snapshot(&session.id).expect("tree");
         assert!(tree.entries.len() >= 2, "entries: {}", tree.entries.len());
         assert_eq!(tree.entries[0].kind, crate::tree::EntryKind::User);
         assert!(tree.entries.iter().any(|e| e.kind == crate::tree::EntryKind::Assistant));
-        // The active branch rebuilds into a usable prompt.
         let ctx = tree.context();
         assert!(ctx.iter().any(|m| m.role == crate::ai::Role::User && m.text == "hi"));
 
-        // Navigating to the first (user) entry succeeds and moves the leaf.
         let first = tree.entries[0].id.clone();
         assert!(local.navigate(&session.id, &first, None));
         assert_eq!(local.tree_snapshot(&session.id).unwrap().leaf.as_deref(), Some(first.as_str()));
@@ -677,7 +616,6 @@ mod tests {
             .unwrap();
 
         local.send_message(&session, "hello", None, None, &[]).await.unwrap();
-        // Wait for the spawned turn to record itself in the tree.
         for _ in 0..100 {
             let done = local
                 .tree_snapshot(&session.id)
@@ -703,7 +641,6 @@ mod tests {
             after.entries.iter().any(|e| e.kind == EntryKind::BranchSummary),
             "navigation added a branch-summary node"
         );
-        // The abandoned work is carried forward into the rebuilt context.
         let ctx = after.context();
         assert!(ctx.iter().any(|m| m.text.contains("bye")), "summary present in context");
 
@@ -718,7 +655,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&session_dir);
         std::env::set_var("THETA_SESSION_DIR", &session_dir);
 
-        // The provider answers both the turn and the summarization request.
         let provider = OneShot {
             turns: Mutex::new(
                 vec![
@@ -947,12 +883,10 @@ mod tests {
         assert_eq!(dst.entries.len(), src.entries.len());
         assert!(dst.context().iter().any(|m| m.text == "hello"));
 
-        // Pin a fork at the first (user) entry.
         let first = src.entries[0].id.clone();
         let pinned = local.fork(&session, Some(&first)).await.unwrap();
         let ptree = local.tree_snapshot(&pinned.id).unwrap();
         assert_eq!(ptree.entries.len(), 1);
-        // Source is unchanged.
         assert_eq!(local.tree_snapshot(&session.id).unwrap().entries.len(), src.entries.len());
 
         let _ = std::fs::remove_dir_all(&session_dir);
@@ -1043,7 +977,6 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert_eq!(std::fs::read_to_string(dir.join("made.txt")).unwrap(), "hello");
-        // The pre-image (file did not exist) is recorded on the turn's node.
         let tree = local.tree_snapshot(&session.id).unwrap();
         assert!(tree.entries.iter().any(|e| !e.snapshots.is_empty()), "snapshot recorded");
 
@@ -1068,7 +1001,6 @@ mod tests {
         let local = LocalProvider::new(agent, "/tmp");
         let err = local.resume_session("nope").await.unwrap_err();
         assert!(matches!(err, ProviderError::SessionNotFound(_)));
-        // The local backend now advertises fork/resume/permissions/questions.
         assert!(local.capabilities().native_fork);
         assert!(local.capabilities().native_resume);
     }

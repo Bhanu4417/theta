@@ -1,11 +1,3 @@
-//! Provider-independent agent interface.
-//!
-//! Theta's harness talks to agent runtimes through this boundary. The first
-//! (and only, for now) implementation is the OpenCode adapter in
-//! [`opencode`]. New providers are added by implementing [`AgentProvider`]
-//! and declaring [`ProviderCapabilities`]; the UI/harness never depend on
-//! provider protocol details.
-
 pub mod local;
 
 use crate::harness::HarnessEvent;
@@ -13,78 +5,50 @@ use std::fmt;
 use std::pin::Pin;
 use tokio::sync::mpsc::UnboundedSender;
 
-/// Identifies which agent runtime a Theta session is backed by. This is
-/// provider metadata — the Theta session itself has its own identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum ProviderKind {
     #[default]
-    OpenCode,
-    /// Theta's own in-process agent loop.
     Local,
 }
 
 impl ProviderKind {
     pub fn id(self) -> &'static str {
         match self {
-            ProviderKind::OpenCode => "opencode",
             ProviderKind::Local => "local",
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            ProviderKind::OpenCode => "OpenCode",
             ProviderKind::Local => "Theta",
         }
     }
 
     pub fn from_id(s: &str) -> Option<Self> {
         match s {
-            "opencode" => Some(ProviderKind::OpenCode),
             "local" => Some(ProviderKind::Local),
             _ => None,
         }
     }
 
-    /// Capabilities for this provider, computed without I/O.
     pub fn capabilities(self) -> ProviderCapabilities {
         match self {
-            ProviderKind::OpenCode => ProviderCapabilities::OPENCODE,
             ProviderKind::Local => ProviderCapabilities::LOCAL,
         }
     }
 }
 
-/// What a provider can actually do. The harness branches on these instead of
-/// assuming every provider behaves like OpenCode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderCapabilities {
-    /// Can re-attach to a previously created provider session.
     pub native_resume: bool,
-    /// Can duplicate a session with its context (provider-native).
     pub native_fork: bool,
-    /// Streams assistant output incrementally.
     pub streaming: bool,
-    /// Emits interactive permission requests.
     pub permissions: bool,
-    /// Emits interactive `ask` questions.
     pub questions: bool,
-    /// Provides file read/diff content.
     pub filesystem: bool,
 }
 
 impl ProviderCapabilities {
-    pub const OPENCODE: Self = Self {
-        native_resume: true,
-        native_fork: true,
-        streaming: true,
-        permissions: true,
-        questions: true,
-        filesystem: true,
-    };
-
-    /// Theta's own loop: streaming, file tools, permissions/questions, resume
-    /// and fork are all handled in-process.
     pub const LOCAL: Self = Self {
         native_resume: true,
         native_fork: true,
@@ -95,27 +59,14 @@ impl ProviderCapabilities {
     };
 }
 
-/// Categorized provider failures. Provider-specific errors are converted into
-/// these before reaching the UI, so the harness never surfaces raw protocol
-/// strings.
 #[derive(Debug, Clone)]
 pub enum ProviderError {
-    /// The runtime/binary is not reachable or not installed.
-    ///
-    /// Part of the error taxonomy the retry classifier treats as transient
-    /// (`ai::is_retryable_provider_error`); kept so providers can report a
-    /// temporarily-down backend.
     #[allow(dead_code)]
     Unavailable(String),
-    /// The requested session no longer exists.
     SessionNotFound(String),
-    /// Transport/connection failure.
     Transport(String),
-    /// The provider replied in a shape we could not understand.
     Protocol(String),
-    /// Authentication/authorization failure.
     Auth(String),
-    /// The provider does not support the requested operation.
     Unsupported(String),
 }
 
@@ -134,8 +85,6 @@ impl fmt::Display for ProviderError {
 
 impl std::error::Error for ProviderError {}
 
-/// A provider-owned session handle. The `id` is opaque and only meaningful to
-/// the provider; Theta tracks its own session identity separately.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderSession {
     pub provider: ProviderKind,
@@ -143,10 +92,6 @@ pub struct ProviderSession {
     pub directory: String,
 }
 
-/// Everything the harness needs to ask a provider for a fresh session.
-///
-/// Used by the `AgentProvider` contract below; the local manager creates
-/// sessions through `LocalProvider` directly, so this is exercised by tests.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct SessionConfig {
@@ -154,47 +99,28 @@ pub struct SessionConfig {
     pub title: String,
 }
 
-/// A provider-scoped model id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelId {
     pub provider: String,
     pub model: String,
 }
 
-// ---------------------------------------------------------------------------
-// Event streaming contract
-// ---------------------------------------------------------------------------
 
-/// A provider-neutral event plus the native session id it belongs to; the
-/// harness routes it to the right Theta session. Adapters never speak `AppEvent`
-/// — this is the neutral currency they emit.
 #[derive(Debug, Clone)]
 pub struct RoutedEvent {
     pub session_id: Option<String>,
     pub event: HarnessEvent,
 }
 
-/// Where an adapter's event pump delivers [`RoutedEvent`]s.
 pub type EventSink = UnboundedSender<RoutedEvent>;
 
-/// Event delivery is part of the provider contract. Lifecycle operations live
-/// on [`AgentProvider`]; this trait owns the *inbound* side: each adapter runs
-/// its native event transport (SSE for OpenCode, CLI output for others) and
-/// yields provider-neutral routed events. Pumping is one live connection; the
-/// supervisor decides reconnect policy, so implementations must not retry
-/// internally.
 pub trait EventPump {
-    /// Pump native events until the connection ends cleanly (`Ok`) or breaks
-    /// (`Err`). Delivery targets `out`. The returned future is `Send`, so a
-    /// supervisor can drive it on a spawned task.
     fn pump(
         &self,
         out: EventSink,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<(), ProviderError>> + Send + '_>>;
 }
 
-/// Forward through an `Arc` so shared providers (e.g. the local loop) satisfy
-/// the same contract.
 impl<T: EventPump + ?Sized> EventPump for std::sync::Arc<T> {
     fn pump(
         &self,
@@ -204,14 +130,7 @@ impl<T: EventPump + ?Sized> EventPump for std::sync::Arc<T> {
     }
 }
 
-/// The interface every agent runtime adapter implements.
-///
-/// This is intentionally small: session lifecycle, messaging and interruption.
-/// The inbound side (event streaming) lives on [`EventPump`]; together they
-/// are the complete adapter contract.
 pub trait AgentProvider {
-    /// Adapter contract: exercised by the local provider's tests rather than
-    /// the production path, which drives `LocalProvider` directly.
     #[allow(dead_code)]
     fn kind(&self) -> ProviderKind;
 
@@ -226,9 +145,6 @@ pub trait AgentProvider {
 
     async fn resume_session(&self, provider_id: &str) -> Result<ProviderSession, ProviderError>;
 
-    /// `attachments` are `(label, absolute path)` pairs from `@file` mentions.
-    /// Backends that understand file parts (OpenCode) use them; text-only
-    /// backends receive the content inlined by the manager.
     async fn send_message(
         &self,
         session: &ProviderSession,
@@ -240,7 +156,6 @@ pub trait AgentProvider {
 
     async fn interrupt(&self, session: &ProviderSession) -> Result<(), ProviderError>;
 
-    /// Provider-native fork, when [`ProviderCapabilities::native_fork`] holds.
     async fn fork(
         &self,
         session: &ProviderSession,
@@ -250,7 +165,6 @@ pub trait AgentProvider {
 
 #[cfg(test)]
 pub mod testing {
-    //! A fully in-memory provider used by harness tests. No model calls.
 
     use super::*;
     use crate::harness::HarnessEvent;
@@ -270,8 +184,6 @@ pub mod testing {
             Self::default()
         }
 
-        /// A deterministic provider-neutral event script worth of a small
-        /// agent turn. Used to drive the harness/UI without a real provider.
         pub fn script(&self) -> Vec<HarnessEvent> {
             use crate::harness::transcript::{
                 Part, PartKind, ToolInfo, ToolStatus, TranscriptUpdate,
@@ -316,7 +228,6 @@ pub mod testing {
         }
     }
 
-    /// The pump half of the contract, so the mock can test supervisors.
     impl crate::providers::EventPump for MockProvider {
         fn pump(
             &self,
@@ -338,7 +249,7 @@ pub mod testing {
 
     impl AgentProvider for MockProvider {
         fn kind(&self) -> ProviderKind {
-            ProviderKind::OpenCode
+            ProviderKind::Local
         }
 
         async fn create_session(
@@ -408,8 +319,6 @@ mod tests {
     use super::testing::MockProvider;
     use super::*;
 
-    /// Step-1 contract check: an adapter's event pump yields neutral routed
-    /// events through the sink, and ends letting the supervisor reconnect.
     #[tokio::test]
     async fn event_pump_contract_delivers_routed_events() {
         let p = MockProvider::new();
@@ -447,7 +356,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(s.provider, ProviderKind::OpenCode);
+        assert_eq!(s.provider, ProviderKind::Local);
         p.send_message(&s, "hello", None, None, &[]).await.unwrap();
         assert_eq!(p.sent.lock().unwrap().as_slice(), &["hello".to_string()]);
         p.interrupt(&s).await.unwrap();
@@ -479,15 +388,12 @@ mod tests {
 
     #[test]
     fn capabilities_and_ids() {
-        assert_eq!(ProviderKind::OpenCode.id(), "opencode");
-        assert_eq!(
-            ProviderKind::from_id("opencode"),
-            Some(ProviderKind::OpenCode)
-        );
+        assert_eq!(ProviderKind::Local.id(), "local");
+        assert_eq!(ProviderKind::from_id("local"), Some(ProviderKind::Local));
         assert_eq!(ProviderKind::from_id("nope"), None);
         assert_eq!(
-            ProviderKind::OpenCode.capabilities(),
-            ProviderCapabilities::OPENCODE
+            ProviderKind::Local.capabilities(),
+            ProviderCapabilities::LOCAL
         );
     }
 
@@ -524,7 +430,6 @@ mod tests {
                 other => lifecycle.push(other),
             }
         }
-        // The mock drove the same neutral render path OpenCode would.
         let cache = crate::ui::conversation::build_cache(&s, 60, 0);
         let text: String = cache
             .lines

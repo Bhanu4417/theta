@@ -1,5 +1,3 @@
-//! Google Gemini provider (`:streamGenerateContent`, SSE).
-
 use std::collections::HashMap;
 
 use futures::StreamExt;
@@ -15,7 +13,6 @@ pub struct Google {
     api_key: Option<String>,
     base_url: String,
     client: reqwest::Client,
-    /// Total per-request timeout; `None` means no limit.
     timeout: Option<std::time::Duration>,
 }
 
@@ -33,7 +30,6 @@ impl Google {
         }
     }
 
-    /// List model ids from `{base_url}/v1beta/models` (Gemini ListModels).
     pub async fn fetch_models(&self) -> Result<Vec<String>, ProviderError> {
         let url = format!("{}/v1beta/models", self.base_url);
         let mut req = self.client.get(&url).timeout(std::time::Duration::from_secs(20));
@@ -60,8 +56,6 @@ impl Google {
     }
 }
 
-/// Map tool-call ids to names by scanning assistant messages (Gemini's
-/// `functionResponse` needs the function name, not an id).
 fn tool_names(messages: &[ChatMessage]) -> HashMap<String, String> {
     let mut map = HashMap::new();
     for m in messages {
@@ -72,7 +66,6 @@ fn tool_names(messages: &[ChatMessage]) -> HashMap<String, String> {
     map
 }
 
-/// Build the `:streamGenerateContent` body (pure, testable).
 pub fn build_body(req: &ChatRequest) -> Value {
     let names = tool_names(&req.messages);
     let mut system: Option<String> = None;

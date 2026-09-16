@@ -1,9 +1,3 @@
-//! Opt-in debug logging (`theta --log`).
-//!
-//! Writes a timestamped line per event to a file under the user's data dir,
-//! so it works from any working directory. Disabled by default and cheap to
-//! check, so instrumentation can stay in the hot paths.
-
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -12,13 +6,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 static LOG: OnceLock<Mutex<File>> = OnceLock::new();
 
-/// Directory holding `--log` files.
 pub fn logs_dir() -> PathBuf {
     let base = dirs::data_dir().unwrap_or_else(std::env::temp_dir);
     base.join("theta").join("logs")
 }
 
-/// Where `--log` writes by default: `<data>/theta/logs/theta-<epoch>.log`.
 pub fn default_path() -> PathBuf {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -27,7 +19,6 @@ pub fn default_path() -> PathBuf {
     logs_dir().join(format!("theta-{secs}.log"))
 }
 
-/// The most recently modified `.log` file, for `theta --log`.
 pub fn newest_log(dir: &Path) -> Option<PathBuf> {
     let mut best: Option<(SystemTime, PathBuf)> = None;
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
@@ -82,8 +73,6 @@ pub fn write(line: &str) {
     }
 }
 
-/// The last `max` lines of `path`, reading at most the trailing 4 MiB so a
-/// long-running log cannot stall the render/tick path.
 pub fn tail(path: &Path, max: usize) -> Vec<String> {
     use std::io::Read;
     const MAX_BYTES: u64 = 4 * 1024 * 1024;
@@ -107,7 +96,6 @@ pub fn tail(path: &Path, max: usize) -> Vec<String> {
     lines
 }
 
-/// Log a line when `--log` is active (formats lazily).
 #[macro_export]
 macro_rules! tlog {
     ($($arg:tt)*) => {

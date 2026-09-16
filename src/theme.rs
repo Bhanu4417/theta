@@ -1,13 +1,8 @@
-//! Theme engine: runtime palettes driving every colour in the UI.
-
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
-/// Style-preserving patch for spans: merges `style` over the span's own style,
-/// so callers can add a background without discarding the foreground. Shared by
-/// the pane and overlay renderers (it was duplicated in both).
 pub trait SpanExt {
     fn patch(self, style: Style) -> Self;
 }
@@ -48,9 +43,7 @@ pub struct Palette {
     pub green: Color,
     pub red: Color,
 
-    /// "Th." wordmark: T, h, dot.
     pub mark_t: Color,
-    /// Thinking/loader spinner gradient stops (cycled).
     pub spin_stops: [Color; 4],
 }
 
@@ -59,7 +52,6 @@ const fn c(hex: u32) -> Color {
 }
 
 pub const THEMES: &[Palette] = &[
-    // ── Theta default (Tokyo Night) ─────────────────────────────
     Palette {
         name: "theta-night",
         label: "Theta Night",
@@ -72,7 +64,6 @@ pub const THEMES: &[Palette] = &[
         mark_t: c(0x7aa2f7),
         spin_stops: [c(0x7dcfff), c(0x7aa2f7), c(0xbb9af7), c(0x73daca)],
     },
-    // ── Theta Moon (tokyonight moon) ────────────────────────────
     Palette {
         name: "theta-moon",
         label: "Theta Moon",
@@ -85,7 +76,6 @@ pub const THEMES: &[Palette] = &[
         mark_t: c(0x82aaff),
         spin_stops: [c(0x86e1fc), c(0x82aaff), c(0xc099ff), c(0x4fd6be)],
     },
-    // ── One Drift (one dark) ───────────────────────────────────
     Palette {
         name: "one-drift",
         label: "One Drift",
@@ -98,7 +88,6 @@ pub const THEMES: &[Palette] = &[
         mark_t: c(0x61afef),
         spin_stops: [c(0x56b6c2), c(0x61afef), c(0xc678dd), c(0x98c379)],
     },
-    // ── Rose Fjord (rose pine) ─────────────────────────────────
     Palette {
         name: "rose-fjord",
         label: "Rose Fjord",
@@ -111,7 +100,6 @@ pub const THEMES: &[Palette] = &[
         mark_t: c(0xc4a7e7),
         spin_stops: [c(0xebbcba), c(0xc4a7e7), c(0x9ccfd8), c(0xf6c177)],
     },
-    // ── Velvet Mocha (catppuccin mocha) ────────────────────────
     Palette {
         name: "velvet-mocha",
         label: "Velvet Mocha",
@@ -124,7 +112,6 @@ pub const THEMES: &[Palette] = &[
         mark_t: c(0x89b4fa),
         spin_stops: [c(0x89dceb), c(0x89b4fa), c(0xf5c2e7), c(0x94e2d5)],
     },
-    // ── Ember Gruv (gruvbox dark) ──────────────────────────────
     Palette {
         name: "ember-gruv",
         label: "Ember Gruv",
@@ -137,7 +124,6 @@ pub const THEMES: &[Palette] = &[
         mark_t: c(0xfabd2f),
         spin_stops: [c(0x8ec07c), c(0xfabd2f), c(0xd3869b), c(0x83a598)],
     },
-    // ── Pine Grove (everforest) ────────────────────────────────
     Palette {
         name: "pine-grove",
         label: "Pine Grove",
@@ -150,7 +136,6 @@ pub const THEMES: &[Palette] = &[
         mark_t: c(0xa7c080),
         spin_stops: [c(0x83c092), c(0xa7c080), c(0xd699b6), c(0x7fbbb3)],
     },
-    // ── Wave Garden (kanagawa) ─────────────────────────────────
     Palette {
         name: "wave-garden",
         label: "Wave Garden",
@@ -163,7 +148,6 @@ pub const THEMES: &[Palette] = &[
         mark_t: c(0x7e9cd8),
         spin_stops: [c(0x7aa89f), c(0x7e9cd8), c(0x957fb8), c(0xffa066)],
     },
-    // ── Night Cape (dracula) ───────────────────────────────────
     Palette {
         name: "night-cape",
         label: "Night Cape",
@@ -176,7 +160,6 @@ pub const THEMES: &[Palette] = &[
         mark_t: c(0xbd93f9),
         spin_stops: [c(0x8be9fd), c(0xbd93f9), c(0xff79c6), c(0x50fa7b)],
     },
-    // ── Synth '84 (synthwave84) ────────────────────────────────
     Palette {
         name: "synth-84",
         label: "Synth '84",
@@ -189,7 +172,6 @@ pub const THEMES: &[Palette] = &[
         mark_t: c(0x36f9f6),
         spin_stops: [c(0x36f9f6), c(0xff7edb), c(0xfede5d), c(0x72f1b8)],
     },
-    // ── Mirage Ayu (ayu dark) ──────────────────────────────────
     Palette {
         name: "mirage-ayu",
         label: "Mirage Ayu",
@@ -202,7 +184,6 @@ pub const THEMES: &[Palette] = &[
         mark_t: c(0x59c2ff),
         spin_stops: [c(0x39bae6), c(0x59c2ff), c(0xd2a6ff), c(0xaad94c)],
     },
-    // ── Vesper Noir (vesper) ───────────────────────────────────
     Palette {
         name: "vesper-noir",
         label: "Vesper Noir",
@@ -215,7 +196,6 @@ pub const THEMES: &[Palette] = &[
         mark_t: c(0xffc799),
         spin_stops: [c(0x99ffe4), c(0xffc799), c(0xffffff), c(0x8c9779)],
     },
-    // ── Cobalt Tide (cobalt2) ──────────────────────────────────
     Palette {
         name: "cobalt-tide",
         label: "Cobalt Tide",
@@ -228,7 +208,6 @@ pub const THEMES: &[Palette] = &[
         mark_t: c(0x0088ff),
         spin_stops: [c(0x00e0ff), c(0x0088ff), c(0xff628c), c(0x3ad900)],
     },
-    // ── Theta Day (tokyonight day, light) ──────────────────────
     Palette {
         name: "theta-day",
         label: "Theta Day",
@@ -248,7 +227,6 @@ static PALETTES: &[Palette] = THEMES;
 
 static VERSION: AtomicU64 = AtomicU64::new(1);
 
-/// The active palette (copied — cheap).
 pub fn pal() -> Palette {
     *CURRENT.read().expect("theme lock")
 }
@@ -269,7 +247,6 @@ pub fn theme_label(name: &str) -> String {
         .unwrap_or_else(|| name.to_string())
 }
 
-/// Switch theme by name; bumps the highlight version so syntax colours rebuild.
 pub fn set_theme(name: &str) -> bool {
     if let Some(p) = THEMES.iter().find(|t| t.name == name) {
         *CURRENT.write().expect("theme lock") = *p;
@@ -291,7 +268,6 @@ fn to_rgb(c: Color) -> (u8, u8, u8) {
     }
 }
 
-/// Linear blend: `t` of `a` mixed over `b` (0 = all b, 1 = all a).
 pub fn blend(a: Color, b: Color, t: f32) -> Color {
     let (ar, ag, ab) = to_rgb(a);
     let (br, bg, bb) = to_rgb(b);
@@ -300,7 +276,6 @@ pub fn blend(a: Color, b: Color, t: f32) -> Color {
     Color::Rgb(mix(ar, br), mix(ag, bg), mix(ab, bb))
 }
 
-/// Style helpers reading the active palette.
 pub fn fg(c: Color) -> Style {
     Style::default().fg(c)
 }
@@ -319,12 +294,10 @@ pub fn bold(c: Color) -> Style {
 
 pub const SPINNER: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
 
-/// Spinner frame for the given tick.
 pub fn spin(tick: u64) -> &'static str {
     SPINNER[(tick % SPINNER.len() as u64) as usize]
 }
 
-/// Smoothly cycling colour for spinners and accents (theme gradient).
 pub fn spin_rgb(tick: u64) -> Color {
     let stops = pal().spin_stops;
     let segs = stops.len();
@@ -340,7 +313,6 @@ pub fn spin_rgb(tick: u64) -> Color {
     Color::Rgb(mix(ar, br), mix(ag, bg_), mix(ab, bb))
 }
 
-/// Abbreviate a path with `~` for the home directory.
 pub fn abbreviate_path(path: &str) -> String {
     if let Some(home) = dirs::home_dir() {
         let home = home.to_string_lossy().to_string();
@@ -354,14 +326,12 @@ pub fn abbreviate_path(path: &str) -> String {
     path.to_string()
 }
 
-/// The Θ identity glyph used across the UI.
 pub const P_SYMBOL: &str = "Θ";
 
-/// The "Th." wordmark — compact, mono-colour using the theme accent.
 pub const MARK_W: usize = 27;
 pub const MARK_H: usize = 8;
 
-type MarkSeg = (usize, usize); // (col_start, col_end) inclusive
+type MarkSeg = (usize, usize); 
 
 fn mark_segs(row: usize) -> &'static [MarkSeg] {
     match row {
@@ -374,14 +344,13 @@ fn mark_segs(row: usize) -> &'static [MarkSeg] {
     }
 }
 
-/// One styled row of the "Th." wordmark (theme accent colour).
 pub fn theta_mark_line(row: usize) -> Line<'static> {
     let p = pal();
     let accent = p.mark_t;
     let mut cells: Vec<bool> = vec![false; MARK_W];
     for &(c0, c1) in mark_segs(row) {
-        for c in c0..=c1.min(MARK_W - 1) {
-            cells[c] = true;
+        for cell in cells.iter_mut().take(c1.min(MARK_W - 1) + 1).skip(c0) {
+            *cell = true;
         }
     }
     let mut spans: Vec<Span> = Vec::new();

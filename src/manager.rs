@@ -1,12 +1,3 @@
-//! Manager: owns the in-process local harness and bridges async work to the UI
-//! event loop. All methods are fire-and-forget; results arrive as `AppEvent`s
-//! on the shared channel.
-//!
-//! Theta is its own harness now: there is no external agent server. The
-//! [`LocalProvider`] (Theta's agent loop + tools) is the only backend; it
-//! streams neutral [`crate::providers::RoutedEvent`]s that this module forwards
-//! to the UI.
-
 use crate::config::Config;
 use crate::events::{AppEvent, ReqId};
 use crate::models::{GrepMatch, ModelRef, OcSession};
@@ -19,16 +10,11 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone)]
 struct ManagerRef {
     tx: tokio::sync::mpsc::UnboundedSender<AppEvent>,
-    /// Live config; the agent factory reads it so `/login` changes take effect
-    /// without restarting sessions.
     cfg: Arc<Mutex<Config>>,
-    /// Theta's in-process agent backend.
     local: Option<Arc<LocalProvider>>,
-    /// Interactive gates (permissions + questions).
     local_gates: Option<LocalGates>,
 }
 
-/// Shared interactive gates wired into every locally-built agent.
 #[derive(Clone)]
 pub struct LocalGates {
     pub permissions: Arc<crate::agent::permissions::Broker>,
@@ -72,21 +58,17 @@ impl Manager {
         }
     }
 
-    /// Always true: Theta's own loop is the only backend.
     pub async fn shutdown_all(&self) {
-        // No external processes to stop.
     }
 
     pub fn tx(&self) -> tokio::sync::mpsc::UnboundedSender<AppEvent> {
         self.ref_.tx.clone()
     }
 
-    /// Emit an operation result (success/failure) to the UI.
     fn result(&self, ok: bool, message: impl Into<String>) {
         self.ref_.emit(AppEvent::OpResult { ok, message: message.into() });
     }
 
-    // -- History tree / rewind (local) ------------------------------------
 
     pub fn local_tree(&self, oc_sid: String) {
         if let Some(local) = &self.ref_.local {
@@ -101,15 +83,12 @@ impl Manager {
         self.ref_.local.as_ref()?.tree_snapshot(oc_sid)
     }
 
-    /// Rebuild agents on next use (after `/login` changes credentials).
     pub fn reload_credentials(&self) {
         if let Some(local) = &self.ref_.local {
             local.invalidate_agents();
         }
     }
 
-    /// Update the live provider/model/endpoint and rebuild agents on next use.
-    /// Empty strings leave the existing value unchanged.
     pub fn set_ai(&self, provider: &str, model: &str, base_url: &str) {
         {
             let mut c = self.ref_.cfg.lock().unwrap();
@@ -124,17 +103,14 @@ impl Manager {
         self.reload_credentials();
     }
 
-    /// Rewind a session to just before `entry`; returns the user text.
     pub fn local_rewind(&self, oc_sid: String, entry: String) -> Option<String> {
         self.ref_.local.as_ref()?.rewind(&oc_sid, &entry)
     }
 
-    /// Restore the leaf most recently abandoned by [`Self::local_rewind`].
     pub fn local_redo(&self, oc_sid: String) -> bool {
         self.ref_.local.as_ref().is_some_and(|l| l.redo(&oc_sid))
     }
 
-    /// Force compaction of a session (`/compact`).
     pub fn local_compact(&self, oc_sid: String) {
         let Some(local) = self.ref_.local.clone() else {
             self.result(false, "compaction requires the local harness");
@@ -147,7 +123,6 @@ impl Manager {
         });
     }
 
-    /// Answer an interactive permission request.
     pub fn local_permission_reply(&self, id: String, response: String) {
         if let Some(gates) = &self.ref_.local_gates {
             let decision = crate::agent::permissions::decision_for(&response);
@@ -157,7 +132,6 @@ impl Manager {
         }
     }
 
-    /// Jump the history tree to an earlier entry (`/tree`).
     pub fn local_navigate(&self, oc_sid: String, entry: String) {
         if let Some(local) = &self.ref_.local {
             let l = local.clone();
@@ -171,9 +145,7 @@ impl Manager {
         self.req_seq.fetch_add(1, Ordering::Relaxed)
     }
 
-    // -- Session lifecycle -------------------------------------------------
 
-    /// Connect (or restore) a Theta session.
     pub fn connect_session(
         &self,
         req: ReqId,
@@ -204,8 +176,6 @@ impl Manager {
                 base: "theta".into(),
             });
             m.emit(AppEvent::OcCreated { req, session: session.clone() });
-            // Seed the picker with the active provider's catalog entries, then
-            // fetch live models from every provider the user has logged into.
             let cfg = m.cfg();
             let active = cfg.ai.provider.to_ascii_lowercase();
             let providers = crate::ai::discovery::catalog_entries_for(Some(&active));
@@ -221,8 +191,6 @@ impl Manager {
                     .map(|(name, description)| crate::models::AgentInfo { name, description })
                     .collect(),
             });
-            // Live discovery can take a moment (one HTTP call per logged-in
-            // provider); it must not hold up session creation.
             let live = crate::ai::discovery::discover_models(&cfg).await;
             m.emit(AppEvent::ProvidersListed {
                 dir: dir_c,
@@ -308,7 +276,6 @@ impl Manager {
         });
     }
 
-    // -- Questions / permissions ------------------------------------------
 
     pub fn reply_question(&self, id: String, answers: Vec<Vec<String>>) {
         if let Some(gates) = &self.ref_.local_gates {
@@ -324,7 +291,6 @@ impl Manager {
         }
     }
 
-    // -- Search / files ----------------------------------------------------
 
     pub fn search_files(&self, req: ReqId, dir: PathBuf, query: String) {
         let m = self.ref_.clone();
@@ -365,10 +331,7 @@ impl Manager {
         });
     }
 
-    // -- Providers / sessions list ----------------------------------------
 
-    /// Query every configured provider for its live model list and hand the
-    /// merged result to the model picker.
     pub fn refresh_providers(&self, dir: PathBuf) {
         let m = self.ref_.clone();
         tokio::spawn(async move {
@@ -400,7 +363,6 @@ impl Manager {
         });
     }
 
-    // -- Misc commands -----------------------------------------------------
 
     pub fn run_command(&self, command: String) {
         self.result(
@@ -421,7 +383,6 @@ impl Manager {
     }
 }
 
-/// Local sessions are on-disk tree sidecars.
 fn local_sessions() -> Vec<OcSession> {
     crate::tree::SessionTree::list_sessions()
         .into_iter()
@@ -434,14 +395,11 @@ fn local_sessions() -> Vec<OcSession> {
         .collect()
 }
 
-/// Build the local harness from config.
 fn build_local_provider(
     cfg_shared: &Arc<Mutex<Config>>,
 ) -> Result<(LocalProvider, Option<LocalGates>), ProviderError> {
     let cfg = cfg_shared.lock().unwrap().clone();
     let gates = local_gates(&cfg, true);
-    // MCP servers are connected once and their tools shared across every agent
-    // we build (model/agent switches included).
     let mcp_tools: Arc<Vec<Arc<dyn crate::agent::tools::Tool>>> =
         Arc::new(crate::mcp::connect_all(&cfg.mcp));
     if !mcp_tools.is_empty() {
@@ -455,8 +413,6 @@ fn build_local_provider(
         crate::agent::agents::default_name(),
         &mcp_tools,
     )?;
-    // Picking a different model/agent (or a `/login` change) rebuilds the
-    // adapter on demand from the *live* config.
     let broker = gates.clone();
     let factory_cfg = cfg_shared.clone();
     let factory: crate::providers::local::AgentFactory =
@@ -464,8 +420,6 @@ fn build_local_provider(
             let mut c = factory_cfg.lock().unwrap().clone();
             if !provider.is_empty() {
                 c.ai.provider = provider.to_string();
-                // A named provider uses its preset endpoint; only `custom`
-                // keeps the configured `base_url`.
                 if provider != "custom" {
                     c.ai.base_url = String::new();
                 }
@@ -491,7 +445,6 @@ fn build_local_provider(
     Ok((local, gates))
 }
 
-/// The model a provider config resolves to (`ai.model`, else the preset default).
 fn resolved_model(cfg: &Config, provider_id: &str) -> String {
     if cfg.ai.model.trim().is_empty() {
         default_model_for(provider_id).to_string()
@@ -500,7 +453,6 @@ fn resolved_model(cfg: &Config, provider_id: &str) -> String {
     }
 }
 
-/// Build the in-process agent from config (also used by headless modes).
 pub fn build_agent(
     cfg: &Config,
     interactive: bool,
@@ -518,17 +470,12 @@ pub fn build_agent(
     Ok((agent, gates))
 }
 
-/// Construct the LLM provider selected by `[ai]`.
 pub fn make_provider(cfg: &Config) -> Result<Box<dyn crate::ai::Provider>, ProviderError> {
     let provider_id = cfg.ai.provider.to_ascii_lowercase();
     let model = resolved_model(cfg, &provider_id);
-    // Bound every request so a stalled gateway can never hang the agent (or
-    // `/compact`) forever. `ai.timeout_secs = 0` disables the limit.
     make_provider_for_model(cfg, &model)
 }
 
-/// Construct a provider for an explicit model on the configured provider
-/// (used for the dedicated compaction model).
 pub fn make_provider_for_model(
     cfg: &Config,
     model: &str,
@@ -542,12 +489,6 @@ pub fn make_provider_for_model(
     Ok(provider)
 }
 
-/// Interactive gates shared across every agent in a session.
-///
-/// Always present in the TUI: the question broker powers the `ask` tool
-/// regardless of the permission mode (with permissive `allow` defaults there
-/// are simply no permission prompts). Headless runs have no UI to answer, so
-/// they get none.
 fn local_gates(_cfg: &Config, interactive: bool) -> Option<LocalGates> {
     if interactive {
         Some(LocalGates {
@@ -575,7 +516,6 @@ fn build_agent_with(
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let registry =
         crate::extensions::Registry::discover(&crate::extensions::Registry::default_roots(&cwd));
-    // System prompt = base + agent prompt + project context files + skills.
     let mut appendix = format!("\n\n{}", def.system_prompt);
     appendix.push_str(&crate::extensions::load_context_files(&cwd));
     appendix.push_str(&registry.system_appendix());
@@ -591,8 +531,6 @@ fn build_agent_with(
         .map(|(k, v)| (k.clone(), (v.reserve_tokens, v.keep_recent_tokens)))
         .collect();
     let settings = crate::agent::context::resolve_settings(base, &overrides, &model);
-    // Optional dedicated summarizer model: keeps `/compact` fast and cheap
-    // regardless of the session model.
     let compactor = if cfg.compaction.model.trim().is_empty() {
         None
     } else {
@@ -605,7 +543,6 @@ fn build_agent_with(
             }
         }
     };
-    // Named agents restrict the tool set (plan/explore are read-only).
     let all_tools = crate::agent::tools::default_tools();
     let mut tools = crate::agent::agents::tools_for(&def, all_tools);
     if def.tools == crate::agent::agents::ToolSet::All {
@@ -621,8 +558,6 @@ fn build_agent_with(
     if let Some((provider, model)) = compactor {
         agent = agent.with_compaction_model(provider, model);
     }
-    // Permissions: an agent preset (e.g. read-only) wins; otherwise the config
-    // mode, with interactive `ask` for the TUI and auto-allow headless.
     let mode = if def.permission != "inherit" {
         def.permission
     } else {
@@ -662,10 +597,8 @@ fn gate_for(mode: &str, interactive: bool) -> Box<dyn crate::agent::tools::Permi
     }
 }
 
-/// Sensible default model per provider when `ai.model` is unset.
 pub(crate) fn default_model_for(provider: &str) -> &'static str {
     match provider {
-        // OpenCode's own gateways.
         "opencode" | "opencode-zen" | "zen" => "glm-4.7",
         "opencode-go" | "go" => "deepseek-v4.1-flash",
         "anthropic" | "claude" => "claude-3-7-sonnet-20250219",
@@ -680,8 +613,6 @@ pub(crate) fn default_model_for(provider: &str) -> &'static str {
     }
 }
 
-/// Supervisor for the local adapter's event pump. Neutral routed events are
-/// converted into `AppEvent::Harness` — the only place that mapping happens.
 fn spawn_event_pump<P>(provider: P, tx: tokio::sync::mpsc::UnboundedSender<AppEvent>)
 where
     P: crate::providers::EventPump + Send + Sync + 'static,
@@ -689,7 +620,6 @@ where
     tokio::spawn(async move {
         let sink = wrap_sink(tx);
         loop {
-            // A closed stream means the provider is gone; stop pumping.
             if provider.pump(sink.clone()).await.is_err() {
                 return;
             }
@@ -698,8 +628,6 @@ where
     });
 }
 
-/// Bridge between the neutral [`crate::providers::RoutedEvent`] sink an adapter
-/// expects and the app's `AppEvent` channel.
 fn wrap_sink(
     tx: tokio::sync::mpsc::UnboundedSender<AppEvent>,
 ) -> tokio::sync::mpsc::UnboundedSender<crate::providers::RoutedEvent> {
@@ -723,8 +651,6 @@ mod tests {
 
     #[test]
     fn interactive_sessions_always_wire_a_question_broker() {
-        // The `ask` tool needs the question broker even when permissions are
-        // permissive (`allow`), where there are no permission prompts at all.
         for mode in ["allow", "ask", "read-only", "deny"] {
             let mut cfg = Config::default();
             cfg.behavior.local_permissions = mode.into();
@@ -768,7 +694,6 @@ mod tests {
         assert_eq!(c.ai.provider, "custom");
         assert_eq!(c.ai.model, "my-model");
         assert_eq!(c.ai.base_url, "https://example.test/v1");
-        // Empty strings leave existing values (except base_url, which clears).
         m.set_ai("", "", "");
         let c = m.ref_.cfg();
         assert_eq!(c.ai.provider, "custom");

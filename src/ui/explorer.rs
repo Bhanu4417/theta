@@ -1,5 +1,3 @@
-//! File explorer side panel.
-
 use crate::app::App;
 use crate::theme::{pal, self};
 use ratatui::layout::Rect;

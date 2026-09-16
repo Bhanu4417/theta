@@ -1,5 +1,3 @@
-//! Session pane frame: header title, transcript, input box.
-
 use crate::app::App;
 
 use crate::session::{SessionState, SessStatus};
@@ -46,7 +44,6 @@ pub fn render(f: &mut ratatui::Frame, app: &mut App, area: Rect, sid: u32, focus
         return;
     }
 
-    // Layout: conversation (min), separator row, input rows.
     let w = inner.width as usize;
     let input_rows = input_height(sess, w, inner.height as usize);
     let conv_h = inner.height.saturating_sub(input_rows);
@@ -57,7 +54,6 @@ pub fn render(f: &mut ratatui::Frame, app: &mut App, area: Rect, sid: u32, focus
         height: conv_h,
     };
 
-    // Cache rebuild (drop the session borrow first).
     let width = conv_area.width.max(10);
     let stale = {
         let dirty = app.session(sid).map(|s| s.dirty).unwrap_or(true);
@@ -127,7 +123,6 @@ pub fn render(f: &mut ratatui::Frame, app: &mut App, area: Rect, sid: u32, focus
         }
     }
 
-    // Input area.
     let input_area = Rect {
         x: inner.x + 1,
         y: inner.y + conv_h,
@@ -135,7 +130,6 @@ pub fn render(f: &mut ratatui::Frame, app: &mut App, area: Rect, sid: u32, focus
         height: input_rows,
     };
 
-    // Slash-command popup above the input.
     let input_text = app
         .session(sid)
         .map(|s| s.input.text().to_string())
@@ -148,7 +142,6 @@ pub fn render(f: &mut ratatui::Frame, app: &mut App, area: Rect, sid: u32, focus
         }
     }
 
-    // `@file` mention popup above the input.
     if focused {
         if let Some(s) = app.session(sid) {
             if !s.mention_results.is_empty() {
@@ -258,7 +251,6 @@ fn render_slash_popup(
                 sp.style = sp.style.bg(pal().selection);
             }
         }
-        // fill the row with panel background
         let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
         if used < w {
             spans.push(Span::styled(" ".repeat(w - used), bg));
@@ -270,7 +262,6 @@ fn render_slash_popup(
     }
 }
 
-/// Render a hint for empty transcripts: the Th. mark + plain description.
 pub fn empty_hint(f: &mut ratatui::Frame, area: Rect, sess: &SessionState) {
     if area.height < 4 || area.width < 20 {
         return;
@@ -283,7 +274,6 @@ pub fn empty_hint(f: &mut ratatui::Frame, area: Rect, sess: &SessionState) {
     let mark_h = crate::theme::MARK_H as u16;
     let icon_w = crate::theme::MARK_W as u16;
     if area.height >= mark_h + 3 && area.width >= icon_w + 4 {
-        // Left-aligned, like the homescreen.
         let total = mark_h + 2;
         let y = area.y + (area.height - total) / 2;
         let x = area.x + 4;
@@ -305,7 +295,7 @@ pub fn empty_hint(f: &mut ratatui::Frame, area: Rect, sess: &SessionState) {
         return;
     }
 
-    let lines = vec![Line::from(""), Line::from(hint)];
+    let lines = vec![Line::from(""), hint];
     let hh = lines.len() as u16;
     let v = (area.height as usize).saturating_sub(lines.len()) / 2;
     f.render_widget(
@@ -318,11 +308,6 @@ pub fn empty_hint(f: &mut ratatui::Frame, area: Rect, sess: &SessionState) {
         },
     );
 }
-/// Spans for one rendered input row: the prompt glyph / indent prefix, then the
-/// typed text. The prefix keeps its own accent color (`bar` only fills the
-/// background); the text is painted with the theme foreground, since
-/// `input_layout` produces unstyled spans and would otherwise inherit the
-/// terminal default.
 fn input_row_spans(
     prefix: String,
     mark: Style,
@@ -340,8 +325,6 @@ fn pane_title(sess: &SessionState, focused: bool, width: u16, tick: u64) -> Line
         SessStatus::Connecting => (theme::spin(tick).to_string(), theme::fg(pal().fg_dim)),
         SessStatus::Idle => ("○".to_string(), theme::mute()),
         SessStatus::Working | SessStatus::Thinking => {
-            // The focused pane's spinner lives on the in-flight message in
-            // the chat; keep the title static to avoid double animation.
             if focused {
                 ("●".to_string(), Style::default().fg(pal().cyan))
             } else {
@@ -382,9 +365,6 @@ fn pane_title(sess: &SessionState, focused: bool, width: u16, tick: u64) -> Line
     Line::from(spans)
 }
 
-/// Lay out the input buffer as a line-based, word-wrapped grid and report the
-/// cursor's visual row/column. Each `\n` produces a new line (including a
-/// trailing empty one), so Shift+Enter visibly moves the cursor down.
 fn input_layout(buf: &str, width: usize, cursor: usize) -> (Vec<Vec<Span<'static>>>, usize, usize) {
     let width = width.max(4);
     let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
@@ -423,7 +403,7 @@ fn input_layout(buf: &str, width: usize, cursor: usize) -> (Vec<Vec<Span<'static
             matched = true;
         }
         rows.extend(wrapped);
-        offset += line_len + 1; // +1 for the newline
+        offset += line_len + 1; 
     }
     if !matched && !rows.is_empty() {
         crow = rows.len() - 1;
@@ -433,10 +413,7 @@ fn input_layout(buf: &str, width: usize, cursor: usize) -> (Vec<Vec<Span<'static
 }
 
 pub fn input_height(sess: &SessionState, w: usize, total_h: usize) -> u16 {
-    // Box: prompt/queued rows + input at top + blank + footer + bottom pad.
-    let max = (total_h.saturating_sub(1)).max(4).min(18) as usize;
-    // Interactive prompts need room for their options + hint; the old 4 rows
-    // left a single body line so the options were clipped off-screen.
+    let max = (total_h.saturating_sub(1)).clamp(4, 18);
     if sess.pending_question.is_some() {
         let opts = sess
             .pending_question
@@ -450,7 +427,6 @@ pub fn input_height(sess: &SessionState, w: usize, total_h: usize) -> u16 {
             .and_then(|pq| pq.current())
             .map(|q| q.custom)
             .unwrap_or(false) as usize;
-        // header + question + options + optional custom + hint
         return ((opts + custom + 4 + 3).min(max).max(6)) as u16;
     }
     if sess.pending_perm.is_some() {
@@ -460,7 +436,6 @@ pub fn input_height(sess: &SessionState, w: usize, total_h: usize) -> u16 {
     let text_rows = if sess.input.is_empty() {
         1
     } else {
-        // Must match the wrap width used in `render_input`.
         input_layout(&sess.input.buf, w.saturating_sub(5).max(8), 0)
             .0
             .len()
@@ -485,9 +460,6 @@ fn render_input(
     let bar_color = if focused { pal().border_focus } else { pal().border };
     let bar_style = Style::default().fg(bar_color).bg(pal().bg_float);
 
-    // Panel fill. The footer paints the last row itself, so it is excluded
-    // here — filling it only to overwrite it wasted a widget per row on every
-    // frame. One widget covers the rest instead of one per row.
     let fill_rows = area.height.saturating_sub(1);
     if fill_rows > 0 {
         let fill = Line::from(vec![
@@ -503,7 +475,6 @@ fn render_input(
         );
     }
 
-    // Footer (one above the bottom pad): agent · model left, folder · usage right.
     let agent = sess.agent.clone().unwrap_or_else(|| "build".to_string());
     let agent_len = agent.chars().count();
     let model_label = sess
@@ -518,9 +489,6 @@ fn render_input(
         .unwrap_or_else(|| "default model".to_string());
     let dir = theme::abbreviate_path(&sess.dir.to_string_lossy());
 
-    // Usage sits immediately left of the folder path, so a pane reads
-    // `12k ctx · $0.0012 · ~/proj/app`: context size first (as a percentage
-    // when the model's limit is known), then cost, then the directory.
     let mut right_parts: Vec<String> = Vec::new();
     if sess.ctx_tokens > 0 {
         right_parts.push(match context_limit_for(app, sess) {
@@ -580,8 +548,6 @@ fn render_input(
         Rect { x: area.x, y: footer_y, width: area.width, height: 1 },
     );
 
-    // Content rows: a blank top pad (like OpenCode's `paddingTop`), the input,
-    // then a gap before the footer.
     let body = Rect {
         x: area.x + 1,
         y: area.y + 1,
@@ -592,8 +558,6 @@ fn render_input(
         return;
     }
 
-    // Permission requests and agent questions render right in the chatbox,
-    // like OpenCode's prompt — never a clipped floating box.
     if sess.pending_perm.is_some() || sess.pending_question.is_some() {
         let rows = prompt_rows(sess, body.width as usize, body.height as usize, bg);
         f.render_widget(Paragraph::new(rows), body);
@@ -605,12 +569,10 @@ fn render_input(
     } else {
         theme::mute()
     };
-    // Foreground for the text the user is typing, on the chatbox background.
     let input_style = theme::fg(pal().fg).patch(bg);
     let avail_w = body.width as usize - 2;
     let body_w = body.width as usize;
 
-    // Queued prompts are pinned above the input, each labelled "— queued".
     let queue_shown = sess.queue.len().min(body.height.saturating_sub(1) as usize);
     let queue_h = queue_shown as u16;
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -620,7 +582,6 @@ fn render_input(
 
     let input_max = (body.height as usize).saturating_sub(queue_shown).max(1);
     let input_start = lines.len();
-    // Cursor row/col within the wrapped input (set when the input is shown).
     let mut cursor_row = 0usize;
     let mut cursor_col = 0usize;
     let mut rendered_start = 0usize;
@@ -631,7 +592,7 @@ fn render_input(
                 Style::default().fg(theme::spin_rgb(app.tick)),
             )
             .patch(bg),
-            Span::styled("connecting to opencode…".to_string(), theme::dim()).patch(bg),
+            Span::styled("connecting…".to_string(), theme::dim()).patch(bg),
         ]));
     } else if sess.input.is_empty() {
         lines.push(Line::from(vec![
@@ -644,18 +605,12 @@ fn render_input(
         cursor_row = cr;
         cursor_col = cc;
         let max_rows = input_max;
-        let start = if cursor_row + 1 >= max_rows {
-            cursor_row + 1 - max_rows
-        } else {
-            0
-        };
+        let start = (cursor_row + 1).saturating_sub(max_rows);
         rendered_start = start;
         for (i, row) in rows_wrapped.iter().enumerate().skip(start) {
             if lines.len() >= input_start + max_rows {
                 break;
             }
-            // Θ marks the first input line only; wrapped lines align under
-            // the text so the prompt glyph never repeats.
             let (prefix, mark) = if i == 0 {
                 (format!("{} ", crate::theme::P_SYMBOL), prompt_style)
             } else {
@@ -670,8 +625,6 @@ fn render_input(
     lines.truncate(body.height as usize);
     f.render_widget(Paragraph::new(lines), body);
 
-    // Keep the caret visible whenever the box is active — including when it
-    // is empty, so the focused input always reads as ready for typing.
     if allow_cursor && sess.status != SessStatus::Connecting && sess.pending_perm.is_none() {
         let vis_row = cursor_row.saturating_sub(rendered_start);
         let px = body.x + 2 + (cursor_col as u16).min(avail_w as u16);
@@ -682,9 +635,6 @@ fn render_input(
     }
 }
 
-/// A queued prompt row: text on the left, a muted "— queued" label right.
-/// The model's context window for a session, when the provider list knows it.
-/// Falls back to the workspace default model before giving up.
 fn context_limit_for(app: &App, sess: &SessionState) -> Option<u64> {
     let want = sess.model.as_ref().or(app.default_model.as_ref())?;
     app.providers
@@ -709,8 +659,6 @@ fn queued_line(text: &str, w: usize, bg: Style) -> Line<'static> {
     ])
 }
 
-/// Rows for a pending permission or agent question, rendered in the input
-/// body (the "chatbox") the way OpenCode presents prompts.
 fn prompt_rows(sess: &SessionState, w: usize, h: usize, bg: Style) -> Vec<Line<'static>> {
     let mut rows: Vec<Line<'static>> = Vec::new();
     let text_w = w.saturating_sub(2).max(8);
@@ -790,7 +738,6 @@ fn prompt_rows(sess: &SessionState, w: usize, h: usize, bg: Style) -> Vec<Line<'
         rows.push(Line::from(sp));
     }
 
-    // Leave one row for the hint.
     let max_rows = h.saturating_sub(1);
     for (i, o) in options.iter().enumerate() {
         if rows.len() >= max_rows {
@@ -905,7 +852,6 @@ mod tests {
             bg,
             theme::fg(pal().fg).patch(bg),
         );
-        // The prefix must not be repainted by the text style.
         assert_eq!(spans[0].style.fg, Some(pal().cyan), "{:?}", spans[0].style);
         assert_eq!(spans[0].style.bg, Some(pal().bg_float));
     }

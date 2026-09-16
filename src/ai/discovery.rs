@@ -1,12 +1,3 @@
-//! Live model discovery for the `/model` picker.
-//!
-//! `/login` stores a key per provider. After login (and when the picker opens)
-//! each provider with a usable key is asked for its model list once, the result
-//! is persisted to a cache, and later picker opens read the cache instead of
-//! hitting the network again. Logging in again with a new key invalidates that
-//! provider's cache entry so it is re-fetched. The built-in catalog is the
-//! fallback, so the picker is never empty.
-
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -18,7 +9,6 @@ use crate::config::Config;
 use crate::credentials::Credentials;
 use crate::models::ModelEntry;
 
-/// Persisted model lists, keyed by provider id (`~/.cache/theta/models.json`).
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct ModelCache {
     #[serde(default)]
@@ -29,14 +19,12 @@ struct ModelCache {
 struct CachedModels {
     #[serde(default)]
     fetched_ms: i64,
-    /// Fingerprint of the key used, so a new login triggers a re-fetch.
     #[serde(default)]
     key_fp: String,
     #[serde(default)]
     models: Vec<String>,
 }
 
-/// Serializes cache file writes (discovery can run for several sessions).
 static CACHE_LOCK: Mutex<()> = Mutex::new(());
 
 fn cache_path() -> Option<PathBuf> {
@@ -60,7 +48,6 @@ fn save_cache(cache: &ModelCache) {
     let _ = std::fs::write(&path, text);
 }
 
-/// Non-reversible fingerprint of a key, used to detect a changed credential.
 fn key_fingerprint(key: Option<&str>) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -75,8 +62,6 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Drop the cached models for `provider`. Call after `/login` stores a new key
-/// so the next `/model` open re-fetches exactly once.
 pub fn invalidate(provider: &str) {
     let mut cache = load_cache();
     if cache.providers.remove(provider).is_some() {
@@ -84,15 +69,12 @@ pub fn invalidate(provider: &str) {
     }
 }
 
-/// Drop the entire cache (used by tests and a future `/model refresh`).
 pub fn invalidate_all() {
     if let Some(path) = cache_path() {
         let _ = std::fs::remove_file(path);
     }
 }
 
-/// Providers offered by `/login` (and queried for models), in the OpenCode
-/// CLI's order: `(id, label, env var)`.
 pub const PROVIDERS: &[(&str, &str, &str)] = &[
     ("opencode", "OpenCode Zen", "OPENCODE_API_KEY"),
     ("opencode-go", "OpenCode Go", "OPENCODE_API_KEY"),
@@ -111,7 +93,6 @@ pub const PROVIDERS: &[(&str, &str, &str)] = &[
     ("ollama", "Ollama (local)", ""),
 ];
 
-/// Env var for a provider id, or `None` when it is not a preset.
 pub fn env_for(provider: &str) -> Option<&'static str> {
     PROVIDERS
         .iter()
@@ -128,14 +109,10 @@ fn entry(provider: &str, model: &str, catalog: &Catalog) -> ModelEntry {
     }
 }
 
-/// Model entries from the built-in catalog (no network). Use this to populate
-/// the picker immediately, then follow up with [`discover_models`].
 pub fn catalog_entries() -> Vec<ModelEntry> {
     catalog_entries_for(None)
 }
 
-/// Catalog entries for one provider (or all when `None`), so the picker can be
-/// seeded without showing models from providers the user has not configured.
 pub fn catalog_entries_for(provider: Option<&str>) -> Vec<ModelEntry> {
     let cat = Catalog::builtin();
     cat.models()
@@ -150,13 +127,6 @@ pub fn catalog_entries_for(provider: Option<&str>) -> Vec<ModelEntry> {
         .collect()
 }
 
-/// Providers worth querying for models, with `(id, base_url, key)`. Pure (no
-/// I/O), so the selection rules are unit-testable.
-///
-/// Enumerated: every preset with a *stored* key (`/login` writes these), the
-/// active provider (which may fall back to `ai.api_key_env`), a local Ollama,
-/// and the active custom endpoint. This keeps discovery tied to what the user
-/// actually entered.
 pub fn providers_to_query(
     cfg: &Config,
     creds: &Credentials,
@@ -180,12 +150,9 @@ pub fn providers_to_query(
             .cloned();
         let key = match stored {
             Some(k) => Some(k),
-            // Only the active provider may fall back to its env var.
             None if is_active => creds.resolve(&id, env),
             None => None,
         };
-        // Local Ollama needs no key, but only show it when it is the active
-        // provider so the picker reflects exactly what the user configured.
         let is_local_ollama = id == "ollama" && is_active;
         if key.is_none() && !is_local_ollama {
             continue;
@@ -196,10 +163,6 @@ pub fn providers_to_query(
     out
 }
 
-/// Return the models for one provider: from the cache when the key is
-/// unchanged, otherwise from one live `list_models` call (persisted on
-/// success). A failed re-fetch falls back to the previous cache. Returns
-/// `(models, cache_changed)`.
 async fn models_for(
     id: &str,
     base: &str,
@@ -230,9 +193,6 @@ async fn models_for(
     }
 }
 
-/// Query every provider with a usable key (once, then cached) and merge the
-/// live models with the catalog. Requests are bounded by a per-request timeout
-/// so a slow gateway cannot stall the picker.
 pub async fn discover_models(cfg: &Config) -> Vec<ModelEntry> {
     let catalog = Catalog::builtin();
     let creds = Credentials::load();
@@ -256,9 +216,6 @@ pub async fn discover_models(cfg: &Config) -> Vec<ModelEntry> {
 
     for (id, base, key) in providers_to_query(cfg, &creds) {
         let mut models = models_for(&id, &base, key, &mut cache, &mut dirty).await;
-        // Only if a provider returned nothing do we fall back to the built-in
-        // list — and only that provider's entries, so the picker never shows
-        // models from providers the user has not configured.
         if models.is_empty() {
             models = catalog
                 .models()
@@ -312,8 +269,6 @@ mod tests {
 
     #[test]
     fn only_configured_providers_are_queried() {
-        // Active provider is "custom" with no base_url, so no env fallback can
-        // sneak other providers in: only stored keys qualify.
         let mut cfg = Config::default();
         cfg.ai.provider = "custom".into();
 
@@ -323,7 +278,6 @@ mod tests {
         assert!(!ids.contains(&"ollama"), "unconfigured Ollama is hidden");
         assert!(!ids.contains(&"openai"));
 
-        // Both OpenCode gateways are queried when keys are stored.
         let q = providers_to_query(
             &cfg,
             &creds_with(&[("opencode", "k"), ("opencode-go", "k2")]),
@@ -332,7 +286,6 @@ mod tests {
         assert!(ids.contains(&"opencode"));
         assert!(ids.contains(&"opencode-go"));
 
-        // Ollama shows up only when it is the active provider.
         cfg.ai.provider = "ollama".into();
         let q = providers_to_query(&cfg, &creds_with(&[]));
         let ids: Vec<&str> = q.iter().map(|(id, _, _)| id.as_str()).collect();
@@ -351,7 +304,6 @@ mod tests {
     fn key_fingerprint_tracks_the_key() {
         assert_eq!(key_fingerprint(Some("a")), key_fingerprint(Some("a")));
         assert_ne!(key_fingerprint(Some("a")), key_fingerprint(Some("b")));
-        // No key and the empty key are equivalent.
         assert_eq!(key_fingerprint(None), key_fingerprint(Some("")));
     }
 
@@ -368,7 +320,6 @@ mod tests {
             },
         );
         let mut dirty = false;
-        // A bogus endpoint proves the cache short-circuits `list_models`.
         let models =
             models_for("acme", "http://127.0.0.1:1/v1", key, &mut cache, &mut dirty).await;
         assert_eq!(models, vec!["m1".to_string(), "m2".to_string()]);

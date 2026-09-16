@@ -1,5 +1,3 @@
-//! Minimal Git integration via the `git` CLI (async, cached).
-
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -88,7 +86,6 @@ pub async fn query_status(dir: &Path) -> Result<GitInfo> {
         if let Some(b) = line.strip_prefix("# branch.head ") {
             info.branch = Some(b.trim().to_string());
         } else if line.starts_with("1 ") || line.starts_with("2 ") {
-            // XY fields: index status then worktree status
             let fields: Vec<&str> = line.split_whitespace().collect();
             if fields.len() >= 2 {
                 let xy = fields[1];
@@ -106,7 +103,6 @@ pub async fn query_status(dir: &Path) -> Result<GitInfo> {
                     },
                 }
                 if y == 'M' && x != 'D' {
-                    // counted above
                 }
             }
         } else if line.starts_with("? ") {
@@ -144,7 +140,6 @@ pub async fn workspace_diff(dir: &Path) -> Result<String> {
     Ok(diff)
 }
 
-/// `owner/repo` parsed from the `origin` remote URL, if any.
 pub async fn remote_repo(dir: &Path) -> Option<String> {
     let url = run(dir, &["remote", "get-url", "origin"]).await.ok()?;
     Some(parse_repo(url.trim()))
@@ -165,7 +160,6 @@ fn parse_repo(url: &str) -> String {
     s.to_string()
 }
 
-/// A concise, zero-token commit subject derived from the staged file list.
 fn auto_message(staged: &str) -> String {
     let files: Vec<&str> = staged.lines().filter(|l| !l.trim().is_empty()).collect();
     match files.len() {
@@ -176,17 +170,12 @@ fn auto_message(staged: &str) -> String {
     }
 }
 
-/// Result of a successful `/push`.
 #[derive(Debug, Clone)]
 pub struct PushOutcome {
-    /// `owner/repo` (or the remote string as-is).
     pub repo: String,
-    /// The commit subject that was actually used.
     pub subject: String,
 }
 
-/// Stage everything, commit, and push. When `message` is empty a minimal
-/// subject is derived from the changed files. Returns the repo and subject.
 pub async fn commit_and_push(dir: &Path, message: &str) -> Result<PushOutcome> {
     run(dir, &["add", "-A"]).await?;
     let staged = run(dir, &["diff", "--cached", "--name-only"]).await?;

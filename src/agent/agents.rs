@@ -1,18 +1,10 @@
-//! Named agent presets: tool sets, prompts and permission presets.
-//!
-//! Mirrors Pi's mode split (a full "build" agent vs. a read-only "plan"
-//! agent) and gives the `task` tool named sub-agents to delegate to.
-
 use std::sync::Arc;
 
 use super::tools::Tool;
 
-/// Which built-in tools an agent may use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolSet {
-    /// Every tool (read + mutate).
     All,
-    /// Investigation only: read/grep/glob/webfetch.
     ReadOnly,
 }
 
@@ -20,12 +12,9 @@ pub enum ToolSet {
 pub struct AgentDef {
     pub name: &'static str,
     pub description: &'static str,
-    /// Appended to the base system prompt.
     pub system_prompt: &'static str,
     pub tools: ToolSet,
-    /// Permission preset: `inherit` (use config), `ask`, `allow`, `read-only`.
     pub permission: &'static str,
-    /// Whether this agent may spawn sub-agents via `task`.
     pub can_delegate: bool,
 }
 
@@ -40,7 +29,6 @@ task with the available tools and report back concisely.";
 const EXPLORE_PROMPT: &str = "You are an exploration sub-agent. Search the codebase \
 and return a precise, structured answer. You cannot modify files.";
 
-/// Built-in agents, in picker order.
 pub fn builtin() -> Vec<AgentDef> {
     vec![
         AgentDef {
@@ -83,12 +71,10 @@ pub fn find(name: &str) -> Option<AgentDef> {
     builtin().into_iter().find(|a| a.name == name)
 }
 
-/// Default agent when none is selected.
 pub fn default_name() -> &'static str {
     "build"
 }
 
-/// `(name, description)` pairs for pickers.
 pub fn names() -> Vec<(String, String)> {
     builtin()
         .into_iter()
@@ -96,7 +82,6 @@ pub fn names() -> Vec<(String, String)> {
         .collect()
 }
 
-/// Names offered as `task` sub-agent types (delegating agents excluded).
 pub fn subagent_names() -> Vec<&'static str> {
     builtin()
         .into_iter()
@@ -105,7 +90,6 @@ pub fn subagent_names() -> Vec<&'static str> {
         .collect()
 }
 
-/// The tools a definition is allowed to use, given the full tool list.
 pub fn tools_for(def: &AgentDef, all: Vec<Arc<dyn Tool>>) -> Vec<Arc<dyn Tool>> {
     match def.tools {
         ToolSet::All => all,
@@ -152,7 +136,6 @@ mod tests {
         }));
         assert!(!ro.iter().any(|t| t.spec().name == "bash"));
         assert_eq!(tools_for(&find("build").unwrap(), all.clone()).len(), all.len());
-        // Every subagent type resolves to a real definition.
         for n in subagent_names() {
             assert!(find(n).is_some());
         }

@@ -1,10 +1,3 @@
-//! Provider-neutral LLM layer.
-//!
-//! This is Theta's own `pi-ai` equivalent: one [`Provider`] trait that turns a
-//! [`ChatRequest`] into a stream of [`ProviderEvent`]s, independent of any
-//! vendor wire format. Concrete providers (OpenAI-compatible, Anthropic,
-//! Google) live next to this module and translate to/from it.
-
 pub mod anthropic;
 pub mod catalog;
 pub mod discovery;
@@ -23,42 +16,29 @@ pub enum Role {
     Tool,
 }
 
-/// A tool call requested by the model.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
-    /// Raw JSON string of arguments (as streamed by the provider).
     pub arguments: String,
 }
 
-/// An inline image attached to a message (base64 data, no `data:` prefix).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ImagePart {
     pub mime: String,
     pub data: String,
 }
 
-/// One message in the model conversation. Kept deliberately flat and
-/// serializable so every provider can map it to its own shape.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ChatMessage {
     pub role: Role,
     pub text: String,
-    /// Set on assistant messages that requested tools.
     pub tool_calls: Vec<ToolCall>,
-    /// Set on tool-result messages: which call this answers.
     pub tool_call_id: Option<String>,
-    /// Provider-reported token usage, captured on assistant messages so the
-    /// context estimate can use the real prompt size (Pi's
-    /// `getLastAssistantUsage` + tail estimate).
     #[serde(default)]
     pub tokens: Option<crate::harness::transcript::TokenUsage>,
-    /// Inline images (vision models).
     #[serde(default)]
     pub images: Vec<ImagePart>,
-    /// Estimated USD cost of this message, from the model catalog. `None` when
-    /// the model's pricing is unknown (never a fake `0.0`).
     #[serde(default)]
     pub cost: Option<f64>,
 }
@@ -70,7 +50,6 @@ impl ChatMessage {
     pub fn user(text: impl Into<String>) -> Self {
         Self { role: Role::User, text: text.into(), tool_calls: Vec::new(), tool_call_id: None, tokens: None, images: Vec::new(), cost: None }
     }
-    /// A user message carrying inline images.
     pub fn user_with_images(text: impl Into<String>, images: Vec<ImagePart>) -> Self {
         let mut m = Self::user(text);
         m.images = images;
@@ -92,7 +71,6 @@ impl ChatMessage {
     }
 }
 
-/// Parse a `data:` or `file://` image URL into an inline image part.
 pub fn image_from_url(mime: &str, url: &str) -> Option<ImagePart> {
     if let Some(rest) = url.strip_prefix("data:") {
         let (meta, data) = rest.split_once(',')?;
@@ -116,10 +94,9 @@ pub fn image_from_url(mime: &str, url: &str) -> Option<ImagePart> {
     None
 }
 
-/// Minimal standard base64 encoder (RFC 4648) — no extra dependency.
 pub fn base64_encode(data: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
@@ -131,7 +108,6 @@ pub fn base64_encode(data: &[u8]) -> String {
     out
 }
 
-/// Declaration of a tool the model may call, in JSON Schema.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolSpec {
     pub name: String,
@@ -146,9 +122,6 @@ pub struct ChatRequest {
     pub tools: Vec<ToolSpec>,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
-    /// Reasoning effort for reasoning models (`minimal`/`low`/`medium`/`high`).
-    /// Only adapters that understand it (OpenAI Responses) map it; others
-    /// ignore it so a stray value can never break a request.
     pub reasoning_effort: Option<String>,
 }
 
@@ -160,8 +133,6 @@ pub enum FinishReason {
     Other(String),
 }
 
-/// A normalized streaming event. Providers translate their wire format into
-/// these; the agent loop never sees vendor JSON.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProviderEvent {
     TextDelta(String),
@@ -171,7 +142,6 @@ pub enum ProviderEvent {
     Done(FinishReason),
 }
 
-/// The fully assembled result of one model turn.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AssistantTurn {
     pub text: String,
@@ -179,9 +149,6 @@ pub struct AssistantTurn {
     pub finish: Option<FinishReason>,
 }
 
-/// The core LLM contract. `stream` invokes `on_event` as deltas arrive and
-/// returns the assembled turn (text + tool calls). Boxed future keeps the
-/// trait dyn-compatible, so the harness can hold `Box<dyn Provider>`.
 pub trait Provider: Send + Sync {
     fn id(&self) -> &'static str;
 
@@ -191,8 +158,6 @@ pub trait Provider: Send + Sync {
         on_event: &'a mut (dyn FnMut(ProviderEvent) + Send),
     ) -> Pin<Box<dyn std::future::Future<Output = Result<AssistantTurn, ProviderError>> + Send + 'a>>;
 
-    /// List the model ids this credential can use. The default is empty, so a
-    /// provider without a listing endpoint simply contributes nothing.
     fn list_models<'a>(
         &'a self,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<String>, ProviderError>> + Send + 'a>>
@@ -200,14 +165,9 @@ pub trait Provider: Send + Sync {
         Box::pin(async { Ok(Vec::new()) })
     }
 
-    /// Apply a total per-request timeout (0 = no limit). Providers that do not
-    /// override this ignore the setting.
     fn set_timeout(&mut self, _secs: u64) {}
 }
 
-/// Build the provider for an explicit `provider_id` + `base_url` + key. A
-/// non-empty `base_url` wins (custom/OpenAI-compatible endpoint); otherwise the
-/// provider id selects a native adapter or a built-in OpenAI-compatible preset.
 pub fn provider_for(
     provider_id: &str,
     base_url: &str,
@@ -230,8 +190,6 @@ pub fn provider_for(
     }
 }
 
-/// Some OpenCode Zen/Go models are only served through the OpenAI Responses
-/// API, not `/chat/completions`. Route those by model family.
 pub fn needs_responses_api(provider_id: &str, model: &str) -> bool {
     let id = provider_id.to_ascii_lowercase();
     let zen = matches!(
@@ -245,7 +203,6 @@ pub fn needs_responses_api(provider_id: &str, model: &str) -> bool {
     m.starts_with("muse-spark") || m.starts_with("gpt-5") || m.starts_with("grok-4")
 }
 
-/// Like [`provider_for`], but picks the Responses API for models that need it.
 pub fn provider_for_model(
     provider_id: &str,
     base_url: &str,
@@ -265,7 +222,6 @@ pub fn provider_for_model(
     provider_for(provider_id, base_url, key)
 }
 
-/// Transient failures worth retrying (network, gateway, upstream overload).
 pub fn is_retryable_provider_error(e: &ProviderError) -> bool {
     match e {
         ProviderError::Transport(_) | ProviderError::Unavailable(_) => true,
@@ -279,7 +235,6 @@ pub fn is_retryable_provider_error(e: &ProviderError) -> bool {
     }
 }
 
-/// Stream a request, retrying transient failures with exponential backoff.
 pub async fn stream_with_retry(
     provider: &dyn Provider,
     request: ChatRequest,
@@ -304,8 +259,6 @@ pub async fn stream_with_retry(
     }
 }
 
-/// Split buffered SSE bytes into complete `data:` payloads. Chunks may split a
-/// line anywhere; only complete lines are yielded.
 pub(crate) fn sse_data_lines(buf: &mut Vec<u8>, chunk: &[u8]) -> Vec<String> {
     buf.extend_from_slice(chunk);
     let mut out = Vec::new();
@@ -380,7 +333,6 @@ mod tests {
         .unwrap();
         assert_eq!(img.mime, "image/png");
         assert_eq!(img.data, "iVBORw0KGgo=");
-        // Non-images are ignored.
         assert!(image_from_url("text/plain", "data:text/plain;base64,aGk=").is_none());
     }
 
@@ -403,7 +355,6 @@ mod tests {
         assert!(sse_data_lines(&mut buf, b"data: {\"a\"").is_empty());
         let got = sse_data_lines(&mut buf, b":1}\ndata: [DONE]\n");
         assert_eq!(got, vec!["{\"a\":1}".to_string(), "[DONE]".to_string()]);
-        // Non-data lines (comments/heartbeats) are ignored.
         assert!(sse_data_lines(&mut buf, b"\n: ping\n\n").is_empty());
     }
 }

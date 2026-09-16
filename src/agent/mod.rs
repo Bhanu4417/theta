@@ -1,9 +1,3 @@
-//! The local agent loop: provider → tool calls → tool results → repeat.
-//!
-//! It owns the loop, tools, permission checks and context management, and
-//! emits the *same* provider-neutral [`HarnessEvent`]s the OpenCode adapter
-//! emits — so the UI renders local turns with no changes.
-
 pub mod agents;
 pub mod context;
 pub mod permissions;
@@ -25,7 +19,6 @@ use crate::providers::ProviderError;
 
 use tools::{PermissionDecision, PermissionGate, Tool};
 
-/// A configured local agent: one LLM provider plus tools and policy.
 pub struct AgentLoop {
     provider: Box<dyn Provider>,
     catalog: Catalog,
@@ -33,20 +26,14 @@ pub struct AgentLoop {
     permission: Box<dyn PermissionGate>,
     model: String,
     system_prompt: String,
-    /// Reasoning effort sent to reasoning models (empty = provider default).
     reasoning_effort: Option<String>,
     max_turns: usize,
     compaction: context::CompactionSettings,
     compaction_enabled: bool,
-    /// Optional dedicated provider/model for summarization (fast/cheap), so
-    /// compaction does not depend on the session model.
     compaction_provider: Option<Box<dyn Provider>>,
     compaction_model: Option<String>,
-    /// Answers interactive `Ask` permission decisions (local backend).
     broker: Option<std::sync::Arc<permissions::Broker>>,
-    /// Answers interactive `ask`-tool questions (local backend).
     question_broker: Option<std::sync::Arc<permissions::QuestionBroker>>,
-    /// Retry transport/5xx failures with exponential backoff.
     max_retries: u32,
     retry_base_ms: u64,
 }
@@ -61,7 +48,6 @@ impl AgentLoop {
             model: model.into(),
             system_prompt: default_system_prompt(),
             reasoning_effort: None,
-            // Unlimited by default; the caller configures a cap if desired.
             max_turns: 0,
             compaction: context::CompactionSettings::default(),
             compaction_enabled: true,
@@ -74,15 +60,12 @@ impl AgentLoop {
         }
     }
 
-    /// Configure auto-compaction (Pi-style reserve/keep token budgets).
     pub fn with_compaction(mut self, settings: context::CompactionSettings, enabled: bool) -> Self {
         self.compaction = settings;
         self.compaction_enabled = enabled;
         self
     }
 
-    /// Use a separate provider/model for compaction summaries. Keeps `/compact`
-    /// fast and cheap regardless of the session model.
     pub fn with_compaction_model(
         mut self,
         provider: Box<dyn Provider>,
@@ -103,32 +86,27 @@ impl AgentLoop {
         self
     }
 
-    /// Append one tool (used to add the `task` sub-agent tool).
     pub fn with_extra_tool(mut self, tool: Arc<dyn Tool>) -> Self {
         self.tools.push(tool);
         self
     }
 
-    /// Retry provider transport failures (`max_retries` attempts, base delay in ms).
     pub fn with_retry(mut self, max_retries: u32, base_ms: u64) -> Self {
         self.max_retries = max_retries;
         self.retry_base_ms = base_ms;
         self
     }
 
-    /// Cap the provider round-trips in one user turn (`0` = no limit).
     pub fn with_max_turns(mut self, max_turns: usize) -> Self {
         self.max_turns = max_turns;
         self
     }
 
-    /// Wire the interactive permission broker (local backend).
     pub fn with_broker(mut self, broker: std::sync::Arc<permissions::Broker>) -> Self {
         self.broker = Some(broker);
         self
     }
 
-    /// Wire the interactive question broker (local backend).
     pub fn with_question_broker(
         mut self,
         broker: std::sync::Arc<permissions::QuestionBroker>,
@@ -142,14 +120,12 @@ impl AgentLoop {
         self
     }
 
-    /// Set the reasoning effort for normal turns (e.g. `minimal`/`low`).
     pub fn with_reasoning_effort(mut self, effort: impl Into<String>) -> Self {
         let e = effort.into();
         self.reasoning_effort = (!e.trim().is_empty()).then_some(e);
         self
     }
 
-    /// Append a skills/context block to the system prompt.
     pub fn with_system_appendix(mut self, extra: impl Into<String>) -> Self {
         let extra = extra.into();
         if !extra.trim().is_empty() {
@@ -167,18 +143,12 @@ impl AgentLoop {
         &self.model
     }
 
-    /// USD cost for a turn's usage, or `None` when the catalog has no pricing
-    /// for this model. Never guesses: an unknown model reports no cost rather
-    /// than a misleading `$0.0000`.
     fn cost_for(&self, usage: Option<crate::harness::transcript::TokenUsage>) -> Option<f64> {
         let u = usage?;
         let spec = self.catalog.find(&self.model)?;
         Some(spec.cost(u.input, u.output))
     }
 
-    /// Run one user turn to completion, mutating `history` in place and
-    /// emitting neutral harness events. `history` should contain the system
-    /// message; it is created if missing.
     pub async fn run_turn<F>(
         &self,
         history: &mut Vec<ChatMessage>,
@@ -193,8 +163,6 @@ impl AgentLoop {
         self.run_turn_cancellable(history, user_text, cwd, &never, emit).await
     }
 
-    /// Like [`Self::run_turn`], but observes a cancellation flag (set by the
-    /// provider's `interrupt`) between turns and before each tool call.
     pub async fn run_turn_cancellable<F>(
         &self,
         history: &mut Vec<ChatMessage>,
@@ -211,8 +179,6 @@ impl AgentLoop {
             .await
     }
 
-    /// Run a turn and record every assistant/tool message appended to
-    /// `journal`, so a caller (the session tree) can persist them as nodes.
     pub async fn run_turn_journaled<F>(
         &self,
         history: &mut Vec<ChatMessage>,
@@ -230,8 +196,6 @@ impl AgentLoop {
             .await
     }
 
-    /// Like [`Self::run_turn_journaled`], also returning the pre-images of files
-    /// each mutating tool changed, so a caller can support `/undo` file restore.
     #[allow(clippy::too_many_arguments)]
     pub async fn run_turn_journaled_snapshots<F>(
         &self,
@@ -251,21 +215,11 @@ impl AgentLoop {
             history.push(ChatMessage::system(self.system_prompt.clone()));
         }
         history.push(ChatMessage::user_with_images(user_text, images.to_vec()));
-        // Heal any dangling tool calls from an earlier interrupted turn so the
-        // request is valid for every provider.
         context::repair_tool_calls(history);
         emit(HarnessEvent::SessionWorking);
-        // Unique per turn so transcript parts can never collide with a message
-        // from an earlier turn (or a restored session): `upsert_part` matches by
-        // id, so a reused `local-0` overwrote an old reply instead of appending.
         let run_id = local_run_id();
-        // Same tool + same arguments failing over and over means the model is
-        // stuck in a retry loop (a failing `ask`, a bad path). Count repeats so
-        // the loop can stop with an explanation instead of burning every turn.
         let mut failed: std::collections::HashMap<(String, String), usize> =
             std::collections::HashMap::new();
-        // Last message id seen, so the turn-limit notice can attach to a real
-        // message row instead of inventing one.
         let mut last_msg_id = String::new();
 
         let turn_limit = if self.max_turns == 0 { usize::MAX } else { self.max_turns };
@@ -275,10 +229,6 @@ impl AgentLoop {
                 emit(HarnessEvent::SessionIdle);
                 return Ok(());
             }
-            // Compact the prompt if it is nearing the model's limit, using
-            // Pi's algorithm: prepare a cut, summarize the span (with split
-            // turns handled separately), fold the previous summary forward,
-            // then rebuild the prompt as system + summary + retained messages.
             let limit = self.catalog.context_limit(&self.model);
             let context_tokens = context::estimate_context_tokens(history);
             if self.compaction_enabled && context::should_compact(context_tokens, limit, &self.compaction)
@@ -294,9 +244,6 @@ impl AgentLoop {
                             emit(part_compaction(prep.tokens_before));
                         }
                         None => {
-                            // Pi aborts the run on a failed compaction; we keep
-                            // the full context and surface the error instead of
-                            // losing information.
                             emit(HarnessEvent::SessionError(
                                 "context compaction failed; keeping full history".into(),
                             ));
@@ -338,9 +285,6 @@ impl AgentLoop {
                                 emit(part_text(&msg_id, &acc_text));
                             }
                             ProviderEvent::ReasoningDelta(t) => {
-                                // Accumulate: the part is keyed by id, so
-                                // emitting only the delta makes the UI replace
-                                // the text on every token (flicker).
                                 if reasoning_start.is_none() {
                                     reasoning_start = Some(now_ms());
                                 }
@@ -388,11 +332,6 @@ impl AgentLoop {
                                     turn_usage.map(|u| (u.input, u.output)),
                                 )
                             );
-                            // Some providers assemble the answer without
-                            // emitting deltas (or emit none we can see). The
-                            // text is in `turn.text` either way, so make sure
-                            // the UI gets it — otherwise the reply is invisible
-                            // until the session is reloaded from disk.
                             if acc_text.trim().is_empty() && !turn.text.trim().is_empty() {
                                 acc_text = turn.text.clone();
                                 emit(part_text(&msg_id, &acc_text));
@@ -436,17 +375,12 @@ impl AgentLoop {
                 turn_result.text.clone(),
                 turn_result.tool_calls.clone(),
             );
-            // Record real usage so the next context estimate is accurate, and
-            // the catalog-derived cost so the footer can show it live and the
-            // tree can replay it after a restart.
             assistant_msg.tokens = turn_usage;
             assistant_msg.cost = self.cost_for(turn_usage);
             history.push(assistant_msg.clone());
             journal.push(assistant_msg);
 
             if turn_result.tool_calls.is_empty() {
-                // Never end a turn silently: an empty reply (e.g. a reasoning
-                // model that stopped early) must be visible to the user.
                 if turn_result.text.trim().is_empty() {
                     let why = match turn_result.finish.as_ref() {
                         Some(FinishReason::Length) => {
@@ -472,16 +406,11 @@ impl AgentLoop {
 
             for (i, call) in turn_result.tool_calls.iter().enumerate() {
                 if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                    // Close out every pending call with a synthetic output so
-                    // the history stays valid for the next turn (providers
-                    // reject assistant tool_calls with no tool result).
                     for pending in &turn_result.tool_calls[i..] {
                         let info = ToolInfo {
                             tool: pending.name.clone(),
                             call_id: pending.id.clone(),
                             status: ToolStatus::Error,
-                            // No server title locally: let `display_title`
-                            // derive what the call actually did from the args.
                             title: None,
                             input: serde_json::from_str(&pending.arguments).unwrap_or(json!({})),
                             output: Some("interrupted by user".into()),
@@ -512,8 +441,6 @@ impl AgentLoop {
                 let ok = self
                     .run_tool_call(&msg_id, call, cwd, history, emit, journal, snapshots)
                     .await;
-                // A tool that keeps failing with identical arguments will keep
-                // failing; stop rather than spend the whole turn budget on it.
                 if !ok {
                     let key = (call.name.clone(), call.arguments.clone());
                     let n = failed.entry(key).or_insert(0);
@@ -545,7 +472,6 @@ impl AgentLoop {
             }
         }
 
-        // Safety stop: never loop forever.
         crate::tlog!(
             "STOP hit the {}-turn limit without finishing (model={})",
             self.max_turns,
@@ -572,16 +498,10 @@ impl AgentLoop {
         Ok(())
     }
 
-    /// Produce the final summary for a prepared compaction, mirroring Pi's
-    /// `compact()`: split turns get a history summary and a merged turn-prefix
-    /// summary; file operations are cumulative and appended in Pi's format.
     async fn summarize_prep(&self, prep: &context::Preparation) -> Option<String> {
         let cap = self.compaction.tool_result_cap;
         let mut ops = prep.file_ops.clone();
         let raw = if prep.is_split_turn && !prep.turn_prefix.is_empty() {
-            // The history and turn-prefix summaries are independent, so run them
-            // concurrently: two sequential calls made `/compact` feel hung on
-            // slower reasoning models.
             let history_fut = async {
                 if prep.messages_to_summarize.is_empty() {
                     Some("No prior history.".to_string())
@@ -608,7 +528,6 @@ impl AgentLoop {
             self.summarize_span(&prep.messages_to_summarize, prep.previous_summary.as_deref())
                 .await?
         };
-        // Keep the model's file lists and merge ours, cumulatively.
         ops.merge(&context::FileOps::from_summary(&raw));
         let prose = context::strip_summary_markers(&raw);
         Some(if ops.is_empty() {
@@ -627,10 +546,6 @@ impl AgentLoop {
             .filter(|s| !s.trim().is_empty())
     }
 
-    /// Summarize an abandoned branch for tree navigation (Pi's branch summary).
-    /// Force a compaction pass regardless of the budget (the `/compact`
-    /// command). Returns the summary, the pre-compaction token count, and the
-    /// messages retained after the cut so callers can rebuild a tree.
     pub async fn force_compact(
         &self,
         messages: &mut Vec<ChatMessage>,
@@ -650,7 +565,6 @@ impl AgentLoop {
         self.complete(context::SUMMARIZATION_SYSTEM_PROMPT, &user).await
     }
 
-    /// Present an `ask`-tool question to the UI and wait for an answer.
     async fn run_ask<F>(
         &self,
         msg_id: &str,
@@ -685,8 +599,6 @@ impl AgentLoop {
     }
 
     async fn complete(&self, system: &str, user: &str) -> Result<String, ProviderError> {
-        // Prefer the dedicated compaction model when configured so summaries do
-        // not pay the session model's latency (or reasoning).
         let provider = self.compaction_provider.as_ref().unwrap_or(&self.provider);
         let model = self.compaction_model.clone().unwrap_or_else(|| self.model.clone());
         let request = ChatRequest {
@@ -698,15 +610,10 @@ impl AgentLoop {
             tools: Vec::new(),
             temperature: None,
             max_tokens: Some(context::summary_max_tokens(self.compaction.reserve_tokens) as u32),
-            // Keep reasoning light: models default to `high` and can spend the
-            // whole budget thinking, emitting no summary. `low` is accepted by
-            // muse/gpt-5/grok-4 (unlike `minimal`, which gpt-5 can no-op on).
             reasoning_effort: Some("low".into()),
         };
         let mut acc = String::new();
         let mut finish: Option<FinishReason> = None;
-        // Assigned on the only path that exits the retry loop (the `Ok` arm),
-        // so it needs no initializer.
         let usage: Option<(u64, u64)>;
         let started = std::time::Instant::now();
         crate::tlog!(
@@ -719,7 +626,6 @@ impl AgentLoop {
             let mut attempt = 0u32;
             loop {
                 acc.clear();
-                // Per-attempt, so a failed attempt cannot leak usage into a retry.
                 let mut attempt_usage: Option<(u64, u64)> = None;
                 let result = {
                     let mut on_event = |ev: ProviderEvent| match ev {
@@ -762,8 +668,6 @@ impl AgentLoop {
                 }
             }
         }
-        // Log the response before validating it, so a summary the provider
-        // returned but we reject (empty) is still visible in `/logs`.
         crate::tlog!(
             "{}",
             resp_log(
@@ -775,9 +679,6 @@ impl AgentLoop {
                 usage,
             )
         );
-        // An empty summary must not become a checkpoint (Pi's
-        // getSummarizationFailure). A length-truncated one is still useful, so
-        // keep it (with a warning) rather than leaving the context uncompacted.
         if acc.trim().is_empty() {
             return Err(ProviderError::Protocol("summarization returned no text".into()));
         }
@@ -804,11 +705,8 @@ impl AgentLoop {
     where
         F: FnMut(HarnessEvent),
     {
-        // (permission `Ask` is resolved inside via the broker)
         let input: Value = serde_json::from_str(&call.arguments).unwrap_or(json!({}));
         emit(HarnessEvent::ToolStarted { tool: call.name.clone(), title: call.name.clone() });
-        // Capture pre-images of files this tool may mutate, before it runs, so
-        // `/undo` can restore the working tree.
         for path in tools::snapshot_paths(&call.name, &input, cwd) {
             let before = tokio::fs::read_to_string(&path).await.ok();
             snapshots.push(tools::FileSnapshot {
@@ -856,8 +754,6 @@ impl AgentLoop {
             tool: call.name.clone(),
             call_id: call.id.clone(),
             status,
-            // No server title locally: let `display_title` derive what the
-            // call actually did from the args (file path, pattern, command).
             title: None,
             input: input.clone(),
             output: Some(outcome.output.clone()),
@@ -913,7 +809,6 @@ fn part_reasoning_span(
     }))
 }
 
-/// A process-unique run id (timestamp + counter) used in local message ids.
 fn local_run_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -921,7 +816,6 @@ fn local_run_id() -> String {
     format!("{}-{n}", now_ms())
 }
 
-/// Milliseconds since the Unix epoch (reasoning timers).
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -929,12 +823,8 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// How many times the same tool + arguments may fail before the loop stops.
 const MAX_REPEATED_TOOL_FAILURES: usize = 3;
 
-/// Format a provider-response log line (`RESP`). Pure so it can be tested and
-/// so a normal turn and a compaction summary log identically: `label` is `""`
-/// for a turn and `" (summarize)"` for compaction.
 pub(crate) fn resp_log(
     label: &str,
     model: &str,
@@ -951,7 +841,6 @@ pub(crate) fn resp_log(
     )
 }
 
-/// Transient failures worth retrying.
 fn is_retryable(e: &ProviderError) -> bool {
     crate::ai::is_retryable_provider_error(e)
 }
@@ -960,7 +849,6 @@ fn truncate_detail(args: &str) -> String {
     args.chars().take(200).collect()
 }
 
-/// Parse an `ask`-tool payload into provider-neutral questions.
 fn parse_questions(
     input: &Value,
     msg_id: &str,
@@ -1027,7 +915,6 @@ fn part_meta(msg_id: &str, input: u64, output: u64, cost: Option<f64>) -> Harnes
     }))
 }
 
-/// A transcript marker for a compaction boundary (rendered as a divider).
 pub(crate) fn part_compaction(tokens_before: u64) -> HarnessEvent {
     HarnessEvent::Transcript(TranscriptUpdate::Part(Part {
         id: format!("compaction-{tokens_before}"),
@@ -1043,7 +930,6 @@ pub fn default_system_prompt() -> String {
         .to_string()
 }
 
-/// Helper for tests and callers: the provider-neutral turn shape the loop sees.
 pub fn assistant_turn(text: &str, calls: Vec<ToolCall>) -> AssistantTurn {
     AssistantTurn { text: text.to_string(), tool_calls: calls, finish: None }
 }

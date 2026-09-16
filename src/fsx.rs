@@ -1,5 +1,3 @@
-//! Filesystem helpers: directory listing (gitignore-aware) and local search.
-
 use ignore::WalkBuilder;
 use std::path::Path;
 
@@ -10,7 +8,6 @@ pub struct Entry {
     pub is_dir: bool,
 }
 
-/// List one directory level, dirs first, gitignored entries skipped.
 pub fn list_dir(dir: &Path) -> Vec<Entry> {
     let mut out = Vec::new();
     let walker = WalkBuilder::new(dir)
@@ -41,8 +38,6 @@ pub fn list_dir(dir: &Path) -> Vec<Entry> {
     out
 }
 
-/// Recursively find files whose name contains `query` (gitignore-aware).
-/// Bounded by `limit`; skips heavy directories.
 pub fn find_files(root: &Path, query: &str, limit: usize) -> Vec<String> {
     let mut out = Vec::new();
     let q = query.to_lowercase();
@@ -85,7 +80,6 @@ pub struct LocalMatch {
     pub text: String,
 }
 
-/// Fallback content search when the OpenCode server search is unavailable.
 pub fn search_local(root: &Path, query: &str, limit: usize) -> Vec<LocalMatch> {
     let mut out = Vec::new();
     let q = query.to_lowercase();

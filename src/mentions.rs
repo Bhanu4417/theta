@@ -1,11 +1,5 @@
-//! `@file` mentions: parse attachments out of prompt text, resolve them
-//! against the session directory, and inline them for backends that only take
-//! plain text.
-
 use std::path::{Path, PathBuf};
 
-/// A file/image attached to a prompt: a display label, MIME type and a URL
-/// (`file://…` for `@mentions`, `data:…` for pasted images).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attachment {
     pub label: String,
@@ -15,16 +9,11 @@ pub struct Attachment {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mention {
-    /// The raw token as typed, e.g. `@src/main.rs`.
     pub token: String,
-    /// Absolute path after resolution.
     pub path: PathBuf,
-    /// Display label (relative path when possible).
     pub label: String,
 }
 
-/// If the caret is in a word starting with `@`, return its byte start and the
-/// query typed after the `@`. Used to drive the inline picker.
 pub fn active_query(text: &str) -> Option<(usize, String)> {
     let token_start = text
         .char_indices()
@@ -40,7 +29,6 @@ pub fn active_query(text: &str) -> Option<(usize, String)> {
     Some((token_start, query.to_string()))
 }
 
-/// Replace the active `@query` token with `@label ` and return the new text.
 pub fn complete(text: &str, label: &str) -> String {
     match active_query(text) {
         Some((start, _)) => format!("{}@{} ", &text[..start], label),
@@ -48,15 +36,13 @@ pub fn complete(text: &str, label: &str) -> String {
     }
 }
 
-/// Resolve every `@token` in `text` that points at an existing file under
-/// `dir`. Tokens that don't resolve are left as plain text.
 pub fn extract(text: &str, dir: &Path) -> Vec<Mention> {
     let mut out: Vec<Mention> = Vec::new();
     for token in text.split_whitespace() {
         let Some(raw) = token.strip_prefix('@') else {
             continue;
         };
-        let raw = raw.trim_end_matches(|c| c == ',' || c == '.' || c == ';');
+        let raw = raw.trim_end_matches([',', '.', ';']);
         if raw.is_empty() {
             continue;
         }
@@ -84,7 +70,6 @@ pub fn extract(text: &str, dir: &Path) -> Vec<Mention> {
     out
 }
 
-/// Turn resolved mentions into provider attachments (`file://` URLs).
 pub fn to_attachments(mentions: &[Mention]) -> Vec<Attachment> {
     mentions
         .iter()
@@ -96,8 +81,6 @@ pub fn to_attachments(mentions: &[Mention]) -> Vec<Attachment> {
         .collect()
 }
 
-/// Inline attachments into `text` for text-only backends. `file://` contents
-/// are read (and clipped); data-URL images become a note (local is text-only).
 pub fn inline_attachments(text: &str, attachments: &[Attachment], cap: usize) -> String {
     let mut out = String::new();
     for a in attachments {
@@ -126,7 +109,6 @@ pub fn inline_attachments(text: &str, attachments: &[Attachment], cap: usize) ->
     out
 }
 
-/// Best-effort MIME type from a path's extension.
 pub fn mime_for(path: &Path) -> &'static str {
     match path
         .extension()
@@ -154,7 +136,6 @@ pub fn mime_for(path: &Path) -> &'static str {
     }
 }
 
-/// A `file://` URL for the OpenCode file-part API.
 pub fn file_url(path: &Path) -> String {
     let abs = path
         .canonicalize()
@@ -178,7 +159,6 @@ mod tests {
         assert_eq!(active_query("@src"), Some((0, "src".into())));
         assert_eq!(active_query("look at @main.rs"), Some((8, "main.rs".into())));
         assert_eq!(active_query("no mention"), None);
-        // A completed mention (space after) is no longer active.
         assert_eq!(active_query("@done plus text"), None);
     }
 

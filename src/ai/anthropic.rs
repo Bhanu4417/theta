@@ -1,7 +1,3 @@
-//! Anthropic Messages API provider (`/v1/messages`, SSE streaming).
-//!
-//! Native adapter so Claude works without an OpenAI-compatible gateway.
-
 use futures::StreamExt;
 use serde_json::{json, Value};
 
@@ -13,14 +9,12 @@ use crate::providers::ProviderError;
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const API_VERSION: &str = "2023-06-01";
-/// Anthropic requires an explicit output cap.
 const DEFAULT_MAX_TOKENS: u32 = 8192;
 
 pub struct Anthropic {
     api_key: Option<String>,
     base_url: String,
     client: reqwest::Client,
-    /// Total per-request timeout; `None` means no limit.
     timeout: Option<std::time::Duration>,
 }
 
@@ -42,7 +36,6 @@ impl Anthropic {
         }
     }
 
-    /// List model ids from `{base_url}/v1/models` (Anthropic Models API).
     pub async fn fetch_models(&self) -> Result<Vec<String>, ProviderError> {
         let url = format!("{}/v1/models", self.base_url);
         let mut req = self
@@ -72,7 +65,6 @@ impl Anthropic {
     }
 }
 
-/// Build the Messages request body (pure, testable).
 pub fn build_body(req: &ChatRequest, stream: bool) -> Value {
     let mut system: Vec<String> = Vec::new();
     let mut messages: Vec<Value> = Vec::new();
@@ -147,12 +139,10 @@ pub fn build_body(req: &ChatRequest, stream: bool) -> Value {
     body
 }
 
-/// Accumulates Anthropic SSE events into a final turn.
 #[derive(Default)]
 pub struct StreamState {
     text: String,
     calls: Vec<ToolCall>,
-    /// index -> position in `calls` for the current tool_use block.
     active: Option<(u64, usize)>,
     input_tokens: u64,
     output_tokens: u64,
@@ -160,7 +150,6 @@ pub struct StreamState {
 }
 
 impl StreamState {
-    /// Feed one SSE `data:` payload; returns any neutral events it produced.
     pub fn ingest(&mut self, data: &str, out: &mut Vec<ProviderEvent>) {
         let Ok(v) = serde_json::from_str::<Value>(data) else {
             return;

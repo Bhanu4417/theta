@@ -1,8 +1,3 @@
-//! Conversation rendering: transcript → cached lines with blocks.
-//!
-//! Blocks map transcript entities (messages, tool calls, errors) to line
-//! ranges so scrolling/search can jump precisely.
-
 use crate::harness::transcript::{PartKind, Role, ToolInfo, ToolStatus};
 use crate::session::{SessionState, ToolRef};
 use crate::theme::{pal, self};
@@ -56,7 +51,6 @@ pub struct Cache {
     pub width: u16,
     pub lines: Vec<Line<'static>>,
     pub blocks: Vec<BlockSpan>,
-    /// True when a spinner is visible and the cache must be rebuilt per tick.
     pub animating: bool,
     pub built_at_tick: u64,
 }
@@ -92,9 +86,6 @@ pub fn build_cache(sess: &SessionState, width: u16, tick: u64) -> Cache {
         animating = true;
     }
     let last_user = sess.messages.iter().rposition(|m| m.role == Role::User);
-    // The message currently being generated — the only one allowed to show a
-    // live "thinking" timer. Historical turns replayed without an `end` must
-    // not animate (they used to show an ever-growing bogus timer).
     let live_msg = if busy {
         sess.messages
             .iter()
@@ -114,10 +105,6 @@ pub fn build_cache(sess: &SessionState, width: u16, tick: u64) -> Cache {
         for (pi, part) in msg.parts.iter().enumerate() {
             match &part.kind {
                 PartKind::Text { text, synthetic } if !synthetic && !text.trim().is_empty() => {
-                    // While the agent is working, don't render the assistant's
-                    // streamed text: it re-wraps on every token and flickers
-                    // ("the model talking while it thinks"). It appears as soon
-                    // as the turn finishes, when the pane is stable.
                     if busy
                         && msg.role == Role::Assistant
                         && last_user.map(|u| mi > u).unwrap_or(false)
@@ -130,11 +117,7 @@ pub fn build_cache(sess: &SessionState, width: u16, tick: u64) -> Cache {
                     }
                     match msg.role {
                         Role::User => {
-                            // User prompts: Θ marker on a lifted background,
-                            // with vertical padding so they breathe.
                             lines.push(pad_bg_line(Line::from(""), w, user_bg(), 0));
-                            // While the agent works on this (latest) prompt,
-                            // the marker becomes the animated spinner + time.
                             let in_flight = busy && Some(mi) == last_user;
                             let mut spans = if in_flight {
                                 vec![
@@ -165,7 +148,6 @@ pub fn build_cache(sess: &SessionState, width: u16, tick: u64) -> Cache {
                             lines.push(pad_bg_line(Line::from(""), w, user_bg(), 0));
                         }
                         Role::Assistant => {
-                            // AI replies render plainly on the workspace bg.
                             let base = theme::fg(pal().fg);
                             for l in render_markdown(text, w.saturating_sub(1), base) {
                                 let mut sp = vec![Span::raw(" ")];
@@ -178,9 +160,6 @@ pub fn build_cache(sess: &SessionState, width: u16, tick: u64) -> Cache {
                     block_text.push('\n');
                 }
                 PartKind::Reasoning { text, running, start, end } => {
-                    // Collapsed thinking line: animated only for the message
-                    // currently being generated; historical reasoning replays
-                    // without a live turn so it can't show a bogus timer.
                     if *running && live_msg == Some(mi) {
                         if !rendered_any {
                             start_block(BlockKind::Thinking, String::new(), &mut lines, &mut blocks);
@@ -202,11 +181,6 @@ pub fn build_cache(sess: &SessionState, width: u16, tick: u64) -> Cache {
                                 theme::fg(pal().fg_dim),
                             ),
                         ]));
-                        // Deliberately no preview of the reasoning text: it
-                        // rewraps on every delta, so a fast-thinking model
-                        // makes the transcript flicker and jump. The spinner
-                        // and timer convey that it is working; the text stays
-                        // in `block_text` so `Ctrl+F` can still find it.
                         block_text.push_str(text);
                     } else if let Some(e) = end {
                         let start_ms = start.unwrap_or(*e);
@@ -270,8 +244,6 @@ pub fn build_cache(sess: &SessionState, width: u16, tick: u64) -> Cache {
                     }
                     lines.push(Line::from(spans));
 
-                    // Long-running shell work (clones, installs, builds) gets a
-                    // live "…ing" label and an animated download bar beneath it.
                     if matches!(t.status, ToolStatus::Pending | ToolStatus::Running)
                         && t.tool == "bash"
                     {
@@ -289,8 +261,6 @@ pub fn build_cache(sess: &SessionState, width: u16, tick: u64) -> Cache {
                         lines.push(activity_bar_line(w, pct));
                     }
 
-                    // Edit/write tools show their diff inline (like the
-                    // OpenCode TUI); expanding reveals the full detail.
                     let show_detail = expanded || has_diff;
                     if show_detail {
                         let cap = if expanded { 80 } else { 24 };
@@ -299,7 +269,6 @@ pub fn build_cache(sess: &SessionState, width: u16, tick: u64) -> Cache {
                         }
                     }
                     finish_block(&mut lines, &mut blocks);
-                    // next text part opens a fresh block of the message kind.
                     block_kind = match msg.role {
                         Role::User => BlockKind::User,
                         Role::Assistant => BlockKind::Assistant,
@@ -307,7 +276,6 @@ pub fn build_cache(sess: &SessionState, width: u16, tick: u64) -> Cache {
                     rendered_any = false;
                 }
                 PartKind::Compaction { tokens_before } => {
-                    // A centered rule marking where context was summarized.
                     finish_block(&mut lines, &mut blocks);
                     start_block(
                         BlockKind::Assistant,
@@ -348,7 +316,6 @@ pub fn build_cache(sess: &SessionState, width: u16, tick: u64) -> Cache {
             finish_block(&mut lines, &mut blocks);
         }
 
-        // Blank line between messages.
         lines.push(Line::from(""));
         finish_block(&mut lines, &mut blocks);
     }
@@ -384,7 +351,6 @@ fn tool_detail_lines(t: &ToolInfo, w: usize, cap: usize) -> Vec<Line<'static>> {
 
     if let Some(diff) = t.diff() {
         let file = t.file_path().unwrap_or_default();
-        // OpenCode-style: split when the pane is wide, unified otherwise.
         let mut rows = crate::highlight::diff_view(&diff, &file, w, w >= 110);
         let total = rows.len();
         if total > cap {
@@ -431,8 +397,6 @@ fn tool_detail_lines(t: &ToolInfo, w: usize, cap: usize) -> Vec<Line<'static>> {
     out
 }
 
-/// OpenCode's read tool returns an XML-ish envelope; show just the content.
-/// Human label for a running shell command (best-effort).
 fn activity_label(t: &ToolInfo) -> String {
     let cmd = t.input_str(&["command", "cmd"]).unwrap_or_default();
     let c = cmd.to_lowercase();
@@ -458,8 +422,6 @@ fn activity_label(t: &ToolInfo) -> String {
     }
 }
 
-/// Best-effort current percentage from a streamed command output (git clone
-/// prints lines like `Receiving objects:  45% (123/456)`).
 fn parse_percent(s: &str) -> Option<u8> {
     let mut last = None;
     for tok in s.split(['\r', '\n']) {
@@ -479,8 +441,6 @@ fn parse_percent(s: &str) -> Option<u8> {
     last
 }
 
-/// Fallback when the command gives no live percentage (git suppresses its own
-/// progress off a TTY): estimate from elapsed time, easing toward 95%.
 fn synth_progress(t: &ToolInfo, now_ms: i64) -> Option<u8> {
     if !matches!(t.status, ToolStatus::Pending | ToolStatus::Running) {
         return None;
@@ -491,9 +451,6 @@ fn synth_progress(t: &ToolInfo, now_ms: i64) -> Option<u8> {
     Some(p.round().clamp(0.0, 95.0) as u8)
 }
 
-/// A determinate progress bar: a dim track with the completed portion filled
-/// in the theme accent and the percentage shown at the end. Uses a half-height
-/// block so it stays a thin strip.
 fn activity_bar_line(w: usize, pct: Option<u8>) -> Line<'static> {
     let bar_w = w.saturating_sub(4).clamp(8, 44);
     let filled = pct.map(|p| (p as usize * bar_w + 50) / 100).unwrap_or(0);
@@ -572,7 +529,6 @@ fn render_markdown(text: &str, w: usize, base: Style) -> Vec<Line<'static>> {
             }));
             continue;
         }
-        // numbered list
         if let Some((num, rest)) = split_numbered(t) {
             let mut spans = vec![Span::styled(format!("  {num} "), theme::fg(pal().cyan))];
             spans.extend(inline_md(rest, base));
@@ -681,7 +637,6 @@ fn code_block_lines(code: &str, lang: &str, w: usize) -> Vec<Line<'static>> {
     out
 }
 
-/// Fill a rendered line out to `w` columns on a background, with left padding.
 fn pad_bg_line(line: Line<'static>, w: usize, bg: ratatui::style::Color, pad: usize) -> Line<'static> {
     let bg_style = Style::default().bg(bg);
     let mut spans: Vec<Span<'static>> = vec![Span::styled(" ".repeat(pad), bg_style)];
@@ -721,7 +676,6 @@ pub fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// A centered label between horizontal rules (used for compaction markers).
 fn centered_divider(label: &str, w: usize, style: Style) -> Line<'static> {
     let text = format!(" {label} ");
     let tw = text.chars().count();
@@ -738,7 +692,6 @@ fn centered_divider(label: &str, w: usize, style: Style) -> Line<'static> {
     ])
 }
 
-/// Word-wrap styled spans into rows of spans (char-based widths).
 pub fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
     let width = width.max(4);
     let mut chars: Vec<Ch> = Vec::new();
@@ -819,8 +772,6 @@ fn regroup(chars: &[Ch]) -> Vec<Span<'static>> {
     spans
 }
 
-/// A text selection in cache-line coordinates. `c0` applies to row `r0`,
-/// `c1` to row `r1`; rows in between are fully selected.
 #[derive(Debug, Clone, Copy)]
 pub struct SelRange {
     pub r0: usize,
@@ -829,10 +780,6 @@ pub struct SelRange {
     pub c1: usize,
 }
 
-/// First visible rendered line for a pane: pinned to the bottom while
-/// following, otherwise the stored offset clamped to the content. Shared by
-/// the transcript renderer and the selection mapper so a restored scroll
-/// position means the same thing in both.
 pub fn view_offset(stick_bottom: bool, scroll: usize, total: usize, height: usize) -> usize {
     let max_off = total.saturating_sub(height);
     if stick_bottom {
@@ -842,7 +789,6 @@ pub fn view_offset(stick_bottom: bool, scroll: usize, total: usize, height: usiz
     }
 }
 
-/// Render the transcript into `area`, honoring scroll + stick-to-bottom.
 pub fn render(
     f: &mut ratatui::Frame,
     area: ratatui::layout::Rect,
@@ -855,8 +801,6 @@ pub fn render(
     }
     let h = area.height as usize;
     let total = cache.lines.len();
-    // Like the OpenCode TUI: never scroll past the end — the last line stays
-    // anchored to the bottom of the viewport.
     let offset = view_offset(sess.stick_bottom, sess.scroll, total, h);
     let end = (offset + h).min(total);
     let slice: Vec<Line<'static>> = match sel {
@@ -880,8 +824,6 @@ pub fn render(
     f.render_widget(para, area);
 }
 
-/// Apply a selection background to the `[c0, c1)` char range of a line,
-/// splitting spans as needed.
 fn patch_range(line: &Line<'static>, c0: usize, c1: usize, bg: Color) -> Line<'static> {
     let mut out: Vec<Span<'static>> = Vec::new();
     let mut idx = 0usize;
@@ -964,7 +906,6 @@ mod transcript_boundary_tests {
         let first = text_part("Let me inspect");
         s.upsert_part(&assistant_meta(&first), first);
         assert!(cache_text(&s).contains("Let me inspect"));
-        // The same part id with more text simulates a streaming delta.
         let grown = text_part("Let me inspect the project structure");
         s.upsert_part(&assistant_meta(&grown), grown);
         let rendered = cache_text(&s);
@@ -1061,7 +1002,6 @@ mod tests {
         let cache = build_cache(&s, 60, 0);
         let text = plain(&cache);
         assert!(text.contains("conversation compacted"), "{text}");
-        // Centered: the label sits on a line that starts with a horizontal rule.
         assert!(text
             .lines()
             .any(|l| l.contains("conversation compacted") && l.starts_with('─')), "{text}");
@@ -1085,7 +1025,6 @@ mod tests {
             id: "m1".into(),
             role: TRole::Assistant,
             error: None,
-            // In flight: this is the message allowed to animate.
             completed: None,
             created: None,
             cost: None,
@@ -1096,12 +1035,10 @@ mod tests {
         let cache = build_cache(&s, 60, 0);
         let text = plain(&cache);
         assert!(text.contains("Thinking"), "spinner still shows: {text}");
-        // The preview rewrapped on every delta and made fast models flicker.
         assert!(
             !text.contains("SECRET-REASONING-TEXT"),
             "reasoning text must not be rendered: {text}"
         );
-        // It stays in the block text so `Ctrl+F` can still find it.
         assert!(
             cache.blocks.iter().any(|b| b.text.contains("SECRET-REASONING-TEXT")),
             "reasoning stays searchable"
@@ -1110,12 +1047,8 @@ mod tests {
 
     #[test]
     fn restored_scroll_offset_is_honored_and_clamped() {
-        // A saved offset reopens the pane exactly where the user stopped.
         assert_eq!(view_offset(false, 40, 200, 20), 40);
-        // Following the bottom stays pinned.
         assert_eq!(view_offset(true, 0, 200, 20), 180);
-        // A stale offset (smaller window, shorter transcript) clamps instead
-        // of rendering past the end or panicking.
         assert_eq!(view_offset(false, 999, 200, 20), 180);
         assert_eq!(view_offset(false, 40, 10, 20), 0);
     }

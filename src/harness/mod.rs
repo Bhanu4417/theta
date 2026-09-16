@@ -1,9 +1,3 @@
-//! Theta's harness: provider-independent session/task/event concepts.
-//!
-//! The UI and the manager communicate in terms of these types, never raw
-//! provider protocol. The local harness (`providers::local`) converts its
-//! native events into [`HarnessEvent`]s.
-
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -13,12 +7,6 @@ pub mod transcript;
 
 pub use transcript::TranscriptUpdate;
 
-/// Common, provider-neutral events. Where a provider produces something that
-/// has no common representation, `ProviderSpecific` preserves it untouched.
-// Some variants are reserved: they are part of the provider-neutral protocol
-// that the UI, the manager and future adapters are written against, even when
-// the current local harness does not emit them yet. Deleting one would break
-// that contract, so they are intentionally kept.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub enum HarnessEvent {
@@ -50,36 +38,28 @@ pub enum HarnessEvent {
 
     AssistantFinished,
 
-    /// Context compaction is about to run (provider call in flight).
     CompactionStarted,
-    /// Context compaction finished; the prompt was rebuilt from a summary.
     CompactionFinished { tokens_before: u64 },
 
-    /// A provider-neutral transcript change (streaming text, tool state, …).
     Transcript(TranscriptUpdate),
 
-    /// Files under the working directory changed.
     FilesChanged,
-    /// The git branch changed.
     BranchChanged,
 
     ProviderError(String),
     ProviderDisconnected,
 
-    /// An event with no common mapping; carries the native type name only.
     ProviderSpecific {
         kind: String,
     },
 }
 
-/// A single selectable option in an agent question.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct QuestionChoice {
     pub label: String,
     pub description: String,
 }
 
-/// A single question (provider-neutral form of the `ask` tool payload).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Question {
     pub question: String,
@@ -89,15 +69,12 @@ pub struct Question {
     pub custom: bool,
 }
 
-/// A pending question request from the agent.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct QuestionPrompt {
     pub id: String,
     pub questions: Vec<Question>,
 }
 
-/// Theta-owned session identity. Provider session ids are metadata and never
-/// used as the primary key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SessionId(pub u32);
 
@@ -107,8 +84,6 @@ impl SessionId {
     }
 }
 
-/// A provider-neutral unit of work tracked by the harness. This phase records
-/// lifecycle only; it does not plan or dispatch autonomously.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskStatus {
     Pending,
@@ -150,7 +125,7 @@ impl Task {
         Self {
             id,
             title: title.into(),
-            provider: ProviderKind::OpenCode,
+            provider: ProviderKind::Local,
             workspace,
             session,
             status: TaskStatus::Pending,
@@ -189,8 +164,6 @@ impl Task {
     }
 }
 
-/// Debounces/group-gates notifications so several agents finishing at once do
-/// not spam desktop notifications or sounds.
 pub struct NotificationPolicy {
     window_ms: u128,
     last: Option<Instant>,
@@ -206,7 +179,6 @@ impl NotificationPolicy {
         }
     }
 
-    /// Returns true when a notification should actually be shown.
     pub fn should_notify(&mut self) -> bool {
         let now = Instant::now();
         match self.last {
@@ -222,7 +194,6 @@ impl NotificationPolicy {
         }
     }
 
-    /// Number of notifications suppressed within the current window.
     pub fn suppressed(&self) -> usize {
         self.pending
     }
@@ -268,7 +239,6 @@ mod tests {
 
     #[test]
     fn session_identity_is_owned_by_theta() {
-        // Provider id lives in metadata; Theta identity is independent.
         let s = SessionId(42);
         assert_eq!(s.get(), 42);
     }

@@ -1,10 +1,3 @@
-//! OpenAI **Responses API** provider (`/responses`, SSE streaming).
-//!
-//! Some models (e.g. OpenCode Zen/Go's `muse-spark-*`) are only served through
-//! the Responses format, not `/chat/completions`. This adapter maps Theta's
-//! neutral [`ChatRequest`] to that shape and translates the streamed
-//! `response.*` events back into [`ProviderEvent`]s.
-
 use futures::StreamExt;
 use serde_json::{json, Value};
 
@@ -19,7 +12,6 @@ pub struct Responses {
     api_key: Option<String>,
     client: reqwest::Client,
     headers: Vec<(String, String)>,
-    /// Total per-request timeout; `None` means no limit.
     timeout: Option<std::time::Duration>,
 }
 
@@ -38,7 +30,6 @@ impl Responses {
     }
 }
 
-/// Build the Responses request body (pure, testable).
 pub(crate) fn build_body(req: &ChatRequest, stream: bool) -> Value {
     let mut instructions: Option<String> = None;
     let mut input: Vec<Value> = Vec::new();
@@ -86,10 +77,6 @@ pub(crate) fn build_body(req: &ChatRequest, stream: bool) -> Value {
             }
         }
     }
-    // The Responses API rejects an empty `input` (`input must be non-empty`).
-    // That happens when every message folded into `instructions` (e.g. a
-    // compacted/resumed session whose active path is only system notes). In
-    // that case carry the instructions as the user turn instead.
     if input.is_empty() {
         let text = instructions
             .take()
@@ -121,29 +108,22 @@ pub(crate) fn build_body(req: &ChatRequest, stream: bool) -> Value {
     if let Some(m) = req.max_tokens {
         body["max_output_tokens"] = json!(m);
     }
-    // Reasoning models (muse-spark, gpt-5, grok-4) default to `high`, which can
-    // spend the entire output budget on hidden reasoning and return no text.
-    // Only override when explicitly asked.
     if let Some(e) = &req.reasoning_effort {
         body["reasoning"] = json!({ "effort": e });
     }
     body
 }
 
-/// Folds streamed `response.*` events into a final assistant turn.
 #[derive(Default)]
 pub(crate) struct StreamAccum {
     text: String,
     tool_calls: Vec<ToolCall>,
     usage: Option<(u64, u64)>,
     error: Option<String>,
-    /// Set when the response stopped early (`response.incomplete`), e.g. the
-    /// reasoning model exhausted `max_output_tokens` before emitting text.
     incomplete: Option<String>,
 }
 
 impl StreamAccum {
-    /// Translate one SSE `data:` payload into neutral events.
     pub(crate) fn ingest(&mut self, data: &str, out: &mut Vec<ProviderEvent>) {
         let Ok(v) = serde_json::from_str::<Value>(data) else {
             return;
@@ -165,7 +145,6 @@ impl StreamAccum {
                 }
             }
             "response.output_text.done" => {
-                // Some gateways send the finished text without deltas.
                 if self.text.is_empty() {
                     if let Some(t) = v.get("text").and_then(Value::as_str) {
                         if !t.is_empty() {
@@ -189,7 +168,6 @@ impl StreamAccum {
                 let Some(item) = v.get("item") else { return };
                 match item.get("type").and_then(Value::as_str).unwrap_or("") {
                     "message" => {
-                        // No deltas (or they were missed): take the final text.
                         if self.text.is_empty() {
                             if let Some(t) = message_text(item) {
                                 if !t.is_empty() {
@@ -230,8 +208,6 @@ impl StreamAccum {
                 }
             }
             "response.incomplete" => {
-                // The model ran out of output budget (commonly: reasoning ate
-                // it all). Keep whatever text arrived.
                 let reason = v
                     .get("response")
                     .and_then(|r| r.get("incomplete_details"))
@@ -276,13 +252,11 @@ impl StreamAccum {
     }
 }
 
-/// Text of a `response.*.done` content part, if it carries any.
 fn part_text(part: Option<&Value>) -> Option<String> {
     let p = part?;
     p.get("text").and_then(Value::as_str).map(str::to_string)
 }
 
-/// Concatenated `output_text` of a completed `message` item.
 fn message_text(item: &Value) -> Option<String> {
     let content = item.get("content")?.as_array()?;
     let text: String = content
@@ -353,8 +327,6 @@ impl Provider for Responses {
             }
             let incomplete = acc.incomplete().map(str::to_string);
             let turn = acc.into_turn();
-            // A reasoning model that exhausted its budget yields no text and no
-            // calls; surface it instead of idling with an empty reply.
             if turn.text.trim().is_empty() && turn.tool_calls.is_empty() {
                 if let Some(reason) = incomplete {
                     return Err(ProviderError::Protocol(format!(
@@ -362,7 +334,6 @@ impl Provider for Responses {
                     )));
                 }
             }
-            // Tool calls were already emitted while ingesting the stream.
             if let Some(f) = &turn.finish {
                 on_event(ProviderEvent::Done(f.clone()));
             }
@@ -489,7 +460,6 @@ mod tests {
         };
         let b = build_body(&req, true);
         assert_eq!(b["reasoning"]["effort"], "minimal");
-        // Absent by default so non-reasoning providers are unaffected.
         let plain = ChatRequest {
             model: "x".into(),
             messages: vec![ChatMessage::user("hi")],

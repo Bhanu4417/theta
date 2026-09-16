@@ -1,5 +1,3 @@
-//! Tests for the local agent loop, driven by a scripted provider (no network).
-
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
@@ -8,8 +6,6 @@ use crate::ai::{AssistantTurn, ChatRequest, FinishReason, Provider, ProviderEven
 use crate::harness::HarnessEvent;
 use crate::providers::ProviderError;
 
-/// Returns pre-scripted turns in order. Emits text/tool-call deltas so the
-/// loop's streaming path is exercised, not just the assembled turn.
 struct ScriptedProvider {
     turns: Mutex<VecDeque<AssistantTurn>>,
 }
@@ -88,7 +84,6 @@ async fn ask_gate_waits_for_broker_then_runs() {
         agent.run_turn(&mut history, "go", &run_dir, &mut emit).await
     });
 
-    // The loop must emit PermissionAsked and block until answered.
     let perm_id = loop {
         match erx.recv().await.unwrap() {
             HarnessEvent::PermissionAsked { id, .. } => break id,
@@ -124,12 +119,10 @@ async fn ask_gate_denied_blocks_the_tool() {
     let mut emit = |_e: HarnessEvent| {};
     agent.run_turn(&mut history, "go", &dir, &mut emit).await.unwrap();
     assert!(!dir.join("no.txt").exists(), "denied tool must not write");
-    // The denial is reported back to the model as a tool result.
     assert!(history.iter().any(|m| m.text.contains("denied")), "{history:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Fails the first `fail_times` attempts with a transient error, then replies.
 struct FlakyProvider {
     fail_times: u32,
     attempts: std::sync::Arc<Mutex<u32>>,
@@ -268,7 +261,6 @@ async fn ask_tool_without_a_broker_errors_instead_of_hanging() {
     let agent = AgentLoop::new(provider, "m");
     let mut history = Vec::new();
     let mut emit = |_e: HarnessEvent| {};
-    // No broker: the tool returns an error rather than blocking forever.
     agent.run_turn(&mut history, "go", &dir, &mut emit).await.unwrap();
     assert!(history.iter().any(|m| m.text.contains("no interactive session")));
 }
@@ -306,7 +298,6 @@ async fn loop_runs_a_tool_then_finishes() {
     assert!(events.iter().any(|e| matches!(e, HarnessEvent::AssistantFinished)));
     assert!(events.last().unwrap() == &HarnessEvent::SessionIdle);
 
-    // The tool actually wrote the file, and the result was fed back.
     assert_eq!(std::fs::read_to_string(dir.join("out.txt")).unwrap(), "hi");
     assert!(history.iter().any(|m| {
         m.role == crate::ai::Role::Tool && m.text.contains("wrote") && m.text.contains("out.txt")
@@ -347,9 +338,6 @@ async fn loop_stops_at_max_turns_instead_of_spinning() {
     use crate::harness::TranscriptUpdate;
 
     let dir = std::env::temp_dir();
-    // A provider that never stops requesting a tool.
-    // Distinct arguments each round: with identical ones the repeated-failure
-    // guard would (correctly) stop it first, and this test is about the cap.
     let mut turns = Vec::new();
     for i in 0..40 {
         turns.push(AssistantTurn {
@@ -369,8 +357,6 @@ async fn loop_stops_at_max_turns_instead_of_spinning() {
     agent.run_turn(&mut history, "go", &dir, &mut emit).await.unwrap();
 
     let events = events.lock().unwrap();
-    // Hitting the budget is a *notice*, not a hard error: the work so far is
-    // kept and the session stays usable, so the user can just continue.
     assert!(
         !events.iter().any(|e| matches!(e, HarnessEvent::SessionError(_))),
         "the turn limit must not surface as an error"
@@ -383,7 +369,6 @@ async fn loop_stops_at_max_turns_instead_of_spinning() {
         _ => false,
     });
     assert!(told, "the user must be told why it stopped");
-    // It stopped at the cap instead of spinning (3 rounds, not 40).
     let rounds = events
         .iter()
         .filter(|e| matches!(e, HarnessEvent::ToolStarted { .. }))
@@ -399,7 +384,6 @@ fn helper_turn_shape() {
     assert_eq!(t.tool_calls.len(), 1);
 }
 
-/// Emits a fixed summary when asked to summarize, otherwise pops the script.
 struct CompactProvider {
     turns: Mutex<VecDeque<AssistantTurn>>,
     summarized: Mutex<usize>,
@@ -426,8 +410,6 @@ impl Provider for CompactProvider {
                 *self.summarized.lock().unwrap() += 1;
                 let s = "GOAL: finish. PROGRESS: mostly done.".to_string();
                 on_event(ProviderEvent::TextDelta(s.clone()));
-                // Usage on the summarize path feeds the `RESP (summarize)` log
-                // line; emitting it here keeps that arm covered.
                 on_event(ProviderEvent::Usage { input: 1_200, output: 40 });
                 return Ok(AssistantTurn { text: s, tool_calls: vec![], finish: Some(FinishReason::Stop) });
             }
@@ -455,7 +437,6 @@ async fn compaction_summarizes_with_the_model_and_rebuilds_the_prompt() {
         turns: Mutex::new(VecDeque::new()),
         summarized: Mutex::new(0),
     };
-    // Small fallback context so the trigger fires; tight keep budget so a span exists.
     let catalog = Catalog::builtin().with_fallback(ModelSpec {
         id: "m".into(),
         provider: "test".into(),
@@ -475,7 +456,6 @@ async fn compaction_summarizes_with_the_model_and_rebuilds_the_prompt() {
             true,
         );
 
-    // A long conversation (system + 30 pairs of big messages).
     let mut history = vec![crate::ai::ChatMessage::system("sys")];
     for _ in 0..30 {
         history.push(crate::ai::ChatMessage::user("x".repeat(400)));
@@ -497,15 +477,12 @@ async fn compaction_summarizes_with_the_model_and_rebuilds_the_prompt() {
         e,
         HarnessEvent::Transcript(TranscriptUpdate::Part(p)) if matches!(p.kind, PartKind::Compaction { .. })
     )));
-    // The prompt was rebuilt with a summary and the system prefix preserved.
     assert_eq!(history[0].text, "sys");
     assert!(history
         .iter()
         .any(|m| m.text.contains("conversation-summary") && m.text.contains("GOAL: finish")));
 }
 
-/// Echoes the requested model in the summary so tests can tell which provider
-/// handled the summarization request.
 struct ModelTagProvider;
 
 impl Provider for ModelTagProvider {
@@ -583,7 +560,6 @@ async fn dedicated_compaction_model_writes_the_summary() {
     assert!(!summary.text.contains("session-model"), "did not use the session model");
 }
 
-/// Returns a truncated (length-capped) summarization, which must be rejected.
 struct LengthFailProvider;
 impl Provider for LengthFailProvider {
     fn id(&self) -> &'static str {
@@ -631,7 +607,7 @@ async fn failed_summarization_keeps_full_history() {
         );
     let mut history = vec![crate::ai::ChatMessage::system("sys")];
     for _ in 0..20 {
-        history.push(crate::ai::ChatMessage::user(&"x".repeat(400)));
+        history.push(crate::ai::ChatMessage::user("x".repeat(400)));
     }
     let events = std::sync::Arc::new(Mutex::new(Vec::<HarnessEvent>::new()));
     let sink = events.clone();
@@ -641,10 +617,9 @@ async fn failed_summarization_keeps_full_history() {
     assert!(events
         .iter()
         .any(|e| matches!(e, HarnessEvent::SessionError(m) if m.contains("compaction failed"))));
-    // No summary was written; the original messages are intact.
     assert!(!history
         .iter()
-        .any(|m| crate::agent::context::is_summary(m)));
+        .any(crate::agent::context::is_summary));
     assert!(history.iter().filter(|m| m.role == crate::ai::Role::User).count() >= 20);
 }
 
@@ -675,14 +650,12 @@ async fn compaction_folds_previous_summary_and_file_ops() {
             true,
         );
 
-    // A previous summary already tracking /old.rs, followed by new work that
-    // edits /new.rs. The next compaction must fold both forward.
     let mut history = vec![ChatMessage::system("sys")];
     history.push(ChatMessage::system(format!(
         "{SUMMARY_OPEN}\nOLD GOAL\n<read-files>\n/old.rs\n</read-files>\n<modified-files>\n</modified-files>\n{SUMMARY_CLOSE}"
     )));
     for _ in 0..20 {
-        history.push(ChatMessage::user(&"x".repeat(300)));
+        history.push(ChatMessage::user("x".repeat(300)));
         history.push(ChatMessage::assistant(
             "editing",
             vec![ToolCall { id: "e1".into(), name: "edit".into(), arguments: "{\"path\":\"/new.rs\"}".into() }],
@@ -747,8 +720,6 @@ async fn compaction_disabled_leaves_history_alone() {
 }
 
 
-/// Flips a shared cancel flag while streaming, then returns a tool call — this
-/// reproduces interrupting the run just before tools execute.
 struct CancelMidStream {
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     fired: Mutex<bool>,
@@ -793,8 +764,6 @@ async fn interrupt_closes_pending_tool_calls_in_history() {
         .await
         .unwrap();
 
-    // The assistant asked for c1; the interrupt must leave a matching output so
-    // the next request is valid for every provider.
     let has_call = history
         .iter()
         .any(|m| m.tool_calls.iter().any(|c| c.id == "c1"));
@@ -805,7 +774,6 @@ async fn interrupt_closes_pending_tool_calls_in_history() {
     assert!(has_output, "interrupt must synthesize a tool output: {history:?}");
 }
 
-/// Streams reasoning as multiple deltas, then a text answer.
 struct ReasoningProvider;
 
 impl Provider for ReasoningProvider {
@@ -859,8 +827,6 @@ async fn reasoning_deltas_accumulate_into_one_stable_part() {
             _ => None,
         })
         .collect();
-    // Each delta updates the same part with the accumulated text (not the
-    // chunk alone, which made the UI flicker).
     assert!(reasoning.iter().any(|(t, ..)| t == "thi"), "{reasoning:?}");
     let (text, running, start, end) = reasoning.last().unwrap();
     assert_eq!(text, "thinking");
@@ -911,9 +877,6 @@ async fn tool_rows_show_what_they_did() {
     );
 }
 
-/// Assembles the answer in `turn.text` without emitting any TextDelta — the
-/// loop must still surface it to the transcript (regression: it was invisible
-/// live and only appeared after a restart).
 struct SilentTextProvider;
 
 impl Provider for SilentTextProvider {
@@ -995,13 +958,10 @@ async fn local_message_ids_are_unique_across_turns() {
 
 #[test]
 fn resp_log_formats_turns_and_summaries_alike() {
-    // A normal turn keeps the exact historical shape.
     assert_eq!(
         super::resp_log("", "deepseek-v4.1-flash", 2166, 4, 0, Some((5269, 3))),
         "RESP model=deepseek-v4.1-flash ms=2166 chars=4 tool_calls=0 tokens=5269/3"
     );
-    // A compaction summary is distinguishable but still a `RESP` line, so
-    // `/logs` keeps highlighting it (it styles any line containing "RESP").
     let summary = super::resp_log(" (summarize)", "muse-spark", 4400, 342, 0, Some((1_200, 40)));
     assert!(summary.starts_with("RESP (summarize)"), "{summary}");
     assert!(summary.contains("ms=4400") && summary.contains("tokens=1200/40"), "{summary}");
@@ -1009,12 +969,10 @@ fn resp_log_formats_turns_and_summaries_alike() {
 
 #[test]
 fn resp_log_renders_missing_usage_as_a_dash() {
-    // Providers that never report usage must not fake a token count.
     let line = super::resp_log("", "m", 10, 0, 2, None);
     assert!(line.ends_with("tool_calls=2 tokens=-"), "{line}");
 }
 
-/// Always asks for a tool call, so the loop only ends via a limit/guard.
 struct AlwaysToolProvider;
 
 impl Provider for AlwaysToolProvider {
@@ -1031,7 +989,6 @@ impl Provider for AlwaysToolProvider {
         Box::pin(async move {
             Ok(AssistantTurn {
                 text: String::new(),
-                // A guaranteed failure: no such tool.
                 tool_calls: vec![call("c1", "no_such_tool", r#"{"x":1}"#)],
                 finish: Some(FinishReason::ToolCalls),
             })
@@ -1044,8 +1001,6 @@ async fn repeated_failing_tool_call_stops_the_loop_early() {
     use crate::harness::transcript::PartKind;
     use crate::harness::TranscriptUpdate;
 
-    // The budget is far larger than the guard, so reaching the guard (not the
-    // limit) is what proves the loop-breaker works.
     let agent = AgentLoop::new(Box::new(AlwaysToolProvider), "test").with_max_turns(500);
     let dir = std::env::temp_dir();
     let mut history = Vec::new();
@@ -1064,7 +1019,6 @@ async fn repeated_failing_tool_call_stops_the_loop_early() {
         _ => false,
     });
     assert!(stopped, "a repeated identical failure must stop the loop");
-    // It stopped early, not by exhausting the budget.
     let rounds = evs
         .iter()
         .filter(|e| matches!(e, HarnessEvent::ToolStarted { .. }))
@@ -1077,8 +1031,6 @@ async fn turn_limit_stops_with_a_visible_notice() {
     use crate::harness::transcript::PartKind;
     use crate::harness::TranscriptUpdate;
 
-    // Distinct arguments each round, so the repeated-failure guard never fires
-    // and the turn budget is what stops it.
     struct VaryingProvider {
         n: Mutex<usize>,
     }
@@ -1124,7 +1076,6 @@ async fn turn_limit_stops_with_a_visible_notice() {
         _ => false,
     });
     assert!(noticed, "hitting the turn limit must tell the user, not fail silently");
-    // Never a hard error: the session stays usable.
     assert!(
         !evs.iter().any(|e| matches!(e, HarnessEvent::SessionError(_))),
         "the limit is a notice, not an error"

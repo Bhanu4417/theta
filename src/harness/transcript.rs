@@ -1,9 +1,3 @@
-//! Provider-neutral transcript model.
-//!
-//! These are the normalized shapes the UI renders. They are produced by the
-//! active provider adapter from native
-//! events, so the application never handles provider protocol directly.
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -31,7 +25,6 @@ pub struct ToolInfo {
     pub output: Option<String>,
     pub error: Option<String>,
     pub metadata: Value,
-    /// Epoch millis when the tool started (for elapsed-time progress fallback).
     pub start_ms: Option<i64>,
 }
 
@@ -54,7 +47,6 @@ impl ToolInfo {
         None
     }
 
-    /// Human readable one-liner, preferring the server-provided title.
     pub fn display_title(&self) -> String {
         if let Some(t) = self.title.as_deref() {
             if !t.trim().is_empty() {
@@ -97,13 +89,11 @@ impl ToolInfo {
         }
     }
 
-    /// Unified diff text when the tool reported one (edit tools).
     pub fn diff(&self) -> Option<String> {
         self.meta_str(&["diff", "patch"])
             .filter(|d| !d.trim().is_empty())
     }
 
-    /// File path touched by the tool, when applicable.
     pub fn file_path(&self) -> Option<String> {
         self.meta_str(&["filePath", "file_path", "path"])
             .or_else(|| self.input_str(&["filePath", "file_path", "path"]))
@@ -125,8 +115,6 @@ pub enum PartKind {
     Tool(ToolInfo),
     StepStart,
     StepFinish,
-    /// A context-compaction boundary. Rendered as a centered divider; the
-    /// summary itself is kept in the model prompt, not the transcript.
     Compaction {
         tokens_before: u64,
     },
@@ -150,7 +138,6 @@ pub struct TokenUsage {
 }
 
 impl TokenUsage {
-    /// Approximate prompt-side context size for the next request.
     pub fn context(&self) -> u64 {
         self.input + self.cache_read + self.cache_write + self.reasoning
     }
@@ -168,21 +155,11 @@ pub struct Message {
     pub parts: Vec<Part>,
 }
 
-/// An incremental transcript change produced by a provider adapter and applied
-/// to the Theta session transcript. Streaming is preserved because partial
-/// parts arrive as repeated `Part` updates.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TranscriptUpdate {
-    /// Message metadata (from a `message.updated`-style native event).
     MessageMeta(Message),
-    /// A part was created or updated (text delta, tool state, reasoning).
     Part(Part),
-    /// A part was removed.
     PartRemoved { message_id: String, part_id: String },
-    /// Drop the whole transcript before replaying stored history, so a restore
-    /// never stacks replayed turns on top of the cached ones (duplicates).
     Reset,
-    /// Atomically replace the full transcript with authoritative history.
-    /// Avoids progressive re-rendering frames or flicker when adopting a session.
     ReplaceAll(Vec<Message>),
 }

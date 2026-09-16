@@ -1,5 +1,3 @@
-//! Overlay surfaces: palette, dialogs, searches, viewer, diff.
-
 use crate::app::App;
 use crate::theme::{pal, self, SpanExt, P_SYMBOL};
 use crate::ui::conversation::truncate;
@@ -41,8 +39,6 @@ fn surface(f: &mut ratatui::Frame, area: Rect, title: Line<'static>) -> Rect {
     inner
 }
 
-/// Like [`surface`] but borderless: just a floating background patch. Used
-/// where a box would crowd the content (e.g. API-key entry).
 fn surface_plain(f: &mut ratatui::Frame, area: Rect) -> Rect {
     let block = Block::default()
         .style(Style::default().bg(pal().bg_float))
@@ -53,12 +49,10 @@ fn surface_plain(f: &mut ratatui::Frame, area: Rect) -> Rect {
     inner
 }
 
-/// Stop drawing when the surface is full.
 fn lines_drawable(current: usize, cap: usize) -> bool {
     current + 1 < cap
 }
 
-/// Scroll offset keeping `sel` visible in a window of `visible` rows.
 fn window_offset(sel: usize, len: usize, visible: usize) -> usize {
     if len <= visible || visible == 0 {
         0
@@ -74,7 +68,6 @@ fn title_line(spans: Vec<Span<'static>>) -> Line<'static> {
     Line::from(s)
 }
 
-// ---------------------------------------------------------------------------
 
 pub fn render_palette(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let cmds = filtered(app.palette.input.text());
@@ -140,7 +133,6 @@ pub fn render_palette(f: &mut ratatui::Frame, app: &App, area: Rect) {
     }
     f.render_widget(Paragraph::new(lines), inner);
 
-    // cursor
     let cx = inner.x + 2 + app.palette.input.cursor as u16;
     if cx < inner.x + inner.width {
         f.set_cursor_position((cx, inner.y));
@@ -151,7 +143,6 @@ fn filtered(query: &str) -> Vec<&'static crate::app::Command> {
     crate::app::filtered_commands(query)
 }
 
-// ---------------------------------------------------------------------------
 
 pub fn render_new_session(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let recent_h = app.newdlg.recent.len().min(6) as u16;
@@ -473,7 +464,6 @@ pub fn render_keymap(f: &mut ratatui::Frame, app: &App, area: Rect) {
         lines.push(Line::from(spans));
     }
 
-    // Fixed contextual keys (not rebindable).
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "  fixed: Alt+←↑→↓ focus · Alt+H/J/K/L move · Alt+H/J/K/L resize",
@@ -497,7 +487,7 @@ pub fn render_theme_picker(
     anchor: Option<Rect>,
 ) {
     let names = crate::theme::theme_names();
-    let visible = names.len().min(8).max(1);
+    let visible = names.len().clamp(1, 8);
     let h = (visible + 1) as u16;
     let rect = match anchor {
         Some(r) => Rect {
@@ -513,7 +503,7 @@ pub fn render_theme_picker(
     }
     let bg = Style::default().bg(pal().bg_float);
     let sel = app.theme_ui.selected.min(names.len().saturating_sub(1));
-    let offset = window_offset(sel, names.len(), visible as usize);
+    let offset = window_offset(sel, names.len(), visible);
 
     let q_line = Line::from(vec![
         Span::styled("  ".to_string(), bg),
@@ -525,7 +515,7 @@ pub fn render_theme_picker(
         Rect { x: rect.x, y: rect.y, width: rect.width, height: 1 },
     );
 
-    for (row, i) in (offset..names.len()).take(visible as usize).enumerate() {
+    for (row, i) in (offset..names.len()).take(visible).enumerate() {
         let Some(name) = names.get(i) else { continue };
         let is_sel = i == sel;
         let is_current = *name == crate::theme::current_name();
@@ -571,7 +561,7 @@ pub fn render_model_picker(
         .and_then(|s| s.model.as_ref())
         .map(|m| format!("{}/{}", m.provider_id, m.model_id))
         .unwrap_or_else(|| "default".to_string());
-    let visible = entries.len().min(9).max(1);
+    let visible = entries.len().clamp(1, 9);
     let h = (visible + 1) as u16;
     let rect = match anchor {
         Some(r) => Rect {
@@ -606,8 +596,8 @@ pub fn render_model_picker(
         Rect { x: rect.x, y: rect.y, width: rect.width, height: 1 },
     );
     let sel = app.model_picker.selected.min(entries.len().saturating_sub(1));
-    let offset = window_offset(sel, entries.len(), visible as usize);
-    for (row, i) in (offset..entries.len()).take(visible as usize).enumerate() {
+    let offset = window_offset(sel, entries.len(), visible);
+    for (row, i) in (offset..entries.len()).take(visible).enumerate() {
         let Some((label, _)) = entries.get(i) else { continue };
         let is_sel = i == sel;
         let is_current = *label == current;
@@ -652,7 +642,7 @@ pub fn render_agent_picker(
         .focused()
         .and_then(|s| s.agent.clone())
         .unwrap_or_else(|| "default".to_string());
-    let visible = entries.len().min(8).max(1);
+    let visible = entries.len().clamp(1, 8);
     let h = (visible + 1) as u16;
     let rect = match anchor {
         Some(r) => Rect {
@@ -687,8 +677,8 @@ pub fn render_agent_picker(
         Rect { x: rect.x, y: rect.y, width: rect.width, height: 1 },
     );
     let sel = app.agent_picker.selected.min(entries.len().saturating_sub(1));
-    let offset = window_offset(sel, entries.len(), visible as usize);
-    for (row, i) in (offset..entries.len()).take(visible as usize).enumerate() {
+    let offset = window_offset(sel, entries.len(), visible);
+    for (row, i) in (offset..entries.len()).take(visible).enumerate() {
         let Some((name, desc)) = entries.get(i) else { continue };
         let is_sel = i == sel;
         let is_current = *name == current;
@@ -1222,7 +1212,6 @@ pub fn render_diff(f: &mut ratatui::Frame, area: Rect, d: &crate::app::DiffState
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-/// The `/tree` history navigator: indented branches with the active path marked.
 pub fn render_tree(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let total = app.tree_ui.items.len();
     let visible = total.min(16);
@@ -1281,10 +1270,9 @@ pub fn render_tree(f: &mut ratatui::Frame, app: &App, area: Rect) {
 }
 
 
-/// The agy-style `/undo` rewind picker: user turns with per-turn diff stats.
 pub fn render_rewind(f: &mut ratatui::Frame, app: &App, screen: Rect, anchor: Option<Rect>) {
     let rows = &app.rewind_ui.rows;
-    let visible = rows.len().min(12).max(1);
+    let visible = rows.len().clamp(1, 12);
     let h = (visible + 2) as u16;
     let rect = match anchor {
         Some(r) => Rect {
@@ -1364,13 +1352,12 @@ pub fn render_rewind(f: &mut ratatui::Frame, app: &App, screen: Rect, anchor: Op
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-/// Interactive provider login: pick a provider, then type its API key.
 pub fn render_login(f: &mut ratatui::Frame, app: &App, screen: Rect, anchor: Option<Rect>) {
     use crate::app::LoginStage;
     match app.login_ui.stage {
         LoginStage::Choose => {
             let n = app.login_ui.providers.len();
-            let visible = n.min(10).max(1);
+            let visible = n.clamp(1, 10);
             let h = (visible + 2) as u16;
             let rect = match anchor {
                 Some(r) => Rect {
@@ -1518,10 +1505,9 @@ pub fn render_login(f: &mut ratatui::Frame, app: &App, screen: Rect, anchor: Opt
     }
 }
 
-/// `/logs`: live tail of the debug log (requests → provider/model).
 pub fn render_logs(f: &mut ratatui::Frame, app: &App, screen: Rect) {
-    let w = screen.width.saturating_sub(4).min(120).max(20);
-    let h = screen.height.saturating_sub(4).min(28).max(6);
+    let w = screen.width.saturating_sub(4).clamp(20, 120);
+    let h = screen.height.saturating_sub(4).clamp(6, 28);
     let rect = centered_rect_w(w, h, screen);
     let path = app
         .log_view

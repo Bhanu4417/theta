@@ -1,5 +1,3 @@
-//! Empty state and startup splash — blocky Theta mark, single colour.
-
 use crate::app::App;
 use crate::session::SessStatus;
 use crate::theme::{pal, self};
@@ -69,7 +67,6 @@ pub fn render(f: &mut ratatui::Frame, area: Rect, app: &App) {
     let below = below_lines(kind, app.tick);
     let total_h = icon_h + below.len() as u16;
 
-    // Terminal too small for the full mark: show just the text block.
     if total_h >= area.height {
         let th = below.len() as u16;
         let y = area.y + (area.height - th) / 2;
@@ -82,7 +79,7 @@ pub fn render(f: &mut ratatui::Frame, area: Rect, app: &App) {
         return;
     }
     let y = area.y + (area.height - total_h) / 2;
-    let x = area.x + 4; // left-aligned with a small margin
+    let x = area.x + 4; 
 
     for (i, line) in icon.iter().enumerate() {
         f.render_widget(

@@ -1,13 +1,3 @@
-//! Skills and prompt packs.
-//!
-//! Theta's lightweight take on Pi's extension surface: markdown resources that
-//! shape the agent without recompiling. A registry is discovered from:
-//! - `<root>/skills/<name>/SKILL.md` or `<root>/skills/<name>.md`
-//! - `<root>/prompts/<name>.md`
-//!
-//! Skills are appended to the system prompt as an index (name + description)
-//! so the model knows what is available; prompt packs are addressable by name.
-
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,7 +24,6 @@ impl Registry {
         self.skills.is_empty() && self.prompts.is_empty()
     }
 
-    /// Discover resources under each root (missing roots are ignored).
     pub fn discover(roots: &[PathBuf]) -> Self {
         let mut reg = Registry::default();
         for root in roots {
@@ -48,7 +37,6 @@ impl Registry {
         reg
     }
 
-    /// Default discovery locations for the current user.
     pub fn default_roots(cwd: &Path) -> Vec<PathBuf> {
         let mut roots = Vec::new();
         if let Some(cfg) = dirs::config_dir() {
@@ -112,8 +100,6 @@ impl Registry {
         self.skills.iter().find(|s| s.name == name)
     }
 
-    /// Markdown block appended to the system prompt describing available
-    /// skills. Empty when there are none.
     pub fn system_appendix(&self) -> String {
         if self.skills.is_empty() {
             return String::new();
@@ -130,8 +116,6 @@ impl Registry {
     }
 }
 
-/// Load `AGENTS.md` / `CLAUDE.md` from `cwd` up to the filesystem root
-/// (root-first, capped). Mirrors Pi's context-file loading.
 pub fn load_context_files(cwd: &Path) -> String {
     const CAP: usize = 20_000;
     let mut dirs: Vec<PathBuf> = Vec::new();
@@ -168,8 +152,6 @@ fn make_skill(name: &str, body: &str) -> Skill {
     }
 }
 
-/// Best-effort description: a `description:` frontmatter line, else the first
-/// non-heading, non-empty line.
 fn first_description(body: &str) -> String {
     for line in body.lines() {
         let t = line.trim();
@@ -211,7 +193,7 @@ mod tests {
         std::fs::create_dir_all(root.join("prompts")).unwrap();
         std::fs::write(root.join("prompts/pr.md"), "Open a PR for {{task}}").unwrap();
 
-        let reg = Registry::discover(&[root.clone()]);
+        let reg = Registry::discover(std::slice::from_ref(&root));
         assert_eq!(reg.skills.len(), 2);
         assert_eq!(reg.find_skill("review").unwrap().description, "Review code for bugs");
         assert_eq!(reg.find_skill("hotfix").unwrap().description, "Fast patching");

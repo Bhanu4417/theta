@@ -1,5 +1,3 @@
-//! Global status bar: sessions, activity, cost, git, context.
-
 use crate::app::App;
 use crate::theme::{pal, self};
 use ratatui::style::{Color, Style};
@@ -10,7 +8,6 @@ pub fn render(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
     if area.width < 20 {
         return;
     }
-    // No darker band when the workspace is empty — blend with the splash.
     let barbg = if app.sessions.is_empty() { pal().bg } else { pal().bg_dark };
     let bg = Style::default().bg(barbg);
     let dim = Style::default().bg(barbg).fg(pal().fg_dim);
@@ -22,7 +19,6 @@ pub fn render(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
     let working = app.working_count();
     let compacting = app.compacting_count();
     let active = app.active_count();
-    // A `/push` (or similar) status takes over the activity strip.
     let activity = app.sessions.iter().find_map(|s| s.activity.as_ref());
 
     let mut left: Vec<Span<'static>> = vec![Span::styled(" ".to_string(), bg)];
@@ -64,7 +60,6 @@ pub fn render(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
                     Style::default().bg(barbg).fg(pal().purple),
                 ));
             }
-            // Slider animates as long as anything is going on in any workspace.
             if active > 0 {
                 left.push(Span::styled(" ", bg));
                 left.extend(working_scanner(
@@ -92,8 +87,6 @@ pub fn render(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
         ));
     }
 
-    // Right cluster: git · model · hints. Per-session context size and cost
-    // live in the pane footer next to the folder path, not here.
     let mut right: Vec<Span<'static>> = Vec::new();
     if let Some(git) = &app.git_display {
         if let Some(branch) = &git.branch {
@@ -125,8 +118,6 @@ pub fn render(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
     right.push(Span::styled("  ", bg));
     right.push(hint(crate::keys::Action::Quit));
     right.push(Span::styled("Quit", theme::mute()));
-    // Build stamp: after `/refresh` this time changes, confirming the newest
-    // binary took over.
     let build_hash = option_env!("THETA_BUILD_HASH").unwrap_or("dev");
     let build_time = option_env!("THETA_BUILD_TIME").unwrap_or("--:--:--");
     right.push(Span::styled("  ", bg));
@@ -151,9 +142,6 @@ pub fn render(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
     f.render_widget(Paragraph::new(Line::from(spans)).style(bg), area);
 }
 
-/// Port of OpenCode's Knight-Rider working animation (`ui/spinner.ts`,
-/// `style: "blocks"`): an 8-cell scanner of `■`/`⬝` sweeping back and forth
-/// with a fading trail, advanced one 40ms frame at a time.
 const SCAN_WIDTH: usize = 8;
 const SCAN_HOLD_END: usize = 9;
 const SCAN_HOLD_START: usize = 30;
@@ -291,9 +279,6 @@ fn working_scanner(
     out
 }
 
-/// Mono black-and-white push bar: an 8-cell full-block track that fills
-/// left-to-right, easing toward ~95% like the shell download bar. Full blocks
-/// keep it aligned with the neighbouring text.
 fn push_anim(elapsed_ms: usize, barbg: ratatui::style::Color) -> Vec<Span<'static>> {
     let n = 8usize;
     let pct = (1.0 - (-(elapsed_ms as f32) / 700.0).exp()) * 95.0;

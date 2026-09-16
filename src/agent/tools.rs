@@ -1,9 +1,3 @@
-//! Built-in tools for the local harness.
-//!
-//! Each tool declares a JSON Schema ([`Tool::spec`]) and a handler
-//! ([`Tool::run`]). Handlers run in the session's working directory and always
-//! cap their output so a runaway command cannot flood the context window.
-
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -14,7 +8,6 @@ use serde_json::{json, Value};
 
 use crate::ai::ToolSpec;
 
-/// Max bytes any tool returns to the model.
 pub const MAX_TOOL_BYTES: usize = 100 * 1024;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -32,7 +25,6 @@ impl ToolOutcome {
     }
 }
 
-/// A runnable tool. Boxed future keeps the trait object-safe.
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
     fn run<'a>(
@@ -42,13 +34,10 @@ pub trait Tool: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = ToolOutcome> + Send + 'a>>;
 }
 
-/// Permission policy consulted before a side-effecting tool runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionDecision {
     Allow,
     Deny,
-    /// The caller must ask the user; the harness treats this as "deny until
-    /// an interactive gate is wired in".
     Ask,
 }
 
@@ -56,7 +45,6 @@ pub trait PermissionGate: Send + Sync {
     fn check(&self, tool: &str, input: &Value, cwd: &Path) -> PermissionDecision;
 }
 
-/// Allow everything (the default for the opted-in local backend).
 pub struct AllowAll;
 impl PermissionGate for AllowAll {
     fn check(&self, _tool: &str, _input: &Value, _cwd: &Path) -> PermissionDecision {
@@ -64,9 +52,6 @@ impl PermissionGate for AllowAll {
     }
 }
 
-/// OpenCode-style default: reading the workspace never needs approval — only
-/// tools that mutate files or run commands (and reads *outside* the working
-/// directory) ask.
 pub struct AskGate;
 impl PermissionGate for AskGate {
     fn check(&self, tool: &str, input: &Value, cwd: &Path) -> PermissionDecision {
@@ -78,7 +63,6 @@ impl PermissionGate for AskGate {
     }
 }
 
-/// Deny everything.
 pub struct DenyAll;
 impl PermissionGate for DenyAll {
     fn check(&self, _tool: &str, _input: &Value, _cwd: &Path) -> PermissionDecision {
@@ -86,7 +70,6 @@ impl PermissionGate for DenyAll {
     }
 }
 
-/// Allow read-only tools, deny anything that mutates the workspace.
 pub struct ReadOnly;
 impl PermissionGate for ReadOnly {
     fn check(&self, tool: &str, _input: &Value, _cwd: &Path) -> PermissionDecision {
@@ -97,9 +80,6 @@ impl PermissionGate for ReadOnly {
     }
 }
 
-/// True for pure reads whose target stays inside `cwd` (no approval needed).
-/// Anything that could mutate, or reads an absolute path outside the project,
-/// falls through to the normal permission flow.
 fn read_within(tool: &str, input: &Value, cwd: &Path) -> bool {
     match tool {
         "read" | "grep" | "glob" => {
@@ -111,7 +91,6 @@ fn read_within(tool: &str, input: &Value, cwd: &Path) -> bool {
                 .or_else(|| input.get("dir").and_then(Value::as_str));
             match arg {
                 Some(p) if !p.trim().is_empty() => resolve(cwd, p).starts_with(cwd),
-                // No path means "the working directory", which is in scope.
                 _ => true,
             }
         }
@@ -120,9 +99,6 @@ fn read_within(tool: &str, input: &Value, cwd: &Path) -> bool {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 pub(crate) fn str_arg(input: &Value, keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|k| input.get(*k).and_then(|v| v.as_str()).map(|s| s.to_string()))
@@ -149,17 +125,14 @@ fn cap(mut s: String, limit: usize) -> String {
     s
 }
 
-/// Simple glob matcher: `*` (any run), `?` (one char), `**` (any incl. `/`).
 pub fn glob_match(pattern: &str, text: &str) -> bool {
     fn m(p: &[u8], t: &[u8]) -> bool {
         match p.first() {
             None => t.is_empty(),
             Some(b'*') => {
                 if p.get(1) == Some(&b'*') {
-                    // `**` matches anything, including separators.
                     (0..=t.len()).any(|i| m(&p[2..], &t[i..]))
                 } else {
-                    // `*` matches within a path segment.
                     (0..=t.len()).any(|i| !t[..i].contains(&b'/') && m(&p[1..], &t[i..]))
                 }
             }
@@ -170,9 +143,6 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
     m(pattern.as_bytes(), text.as_bytes())
 }
 
-// ---------------------------------------------------------------------------
-// Tools
-// ---------------------------------------------------------------------------
 
 pub struct ReadTool;
 impl Tool for ReadTool {
@@ -280,7 +250,6 @@ impl Tool for EditTool {
     }
 }
 
-/// Apply several `edit` operations in one call.
 pub struct MultiEditTool;
 impl Tool for MultiEditTool {
     fn spec(&self) -> ToolSpec {
@@ -344,16 +313,12 @@ impl Tool for MultiEditTool {
     }
 }
 
-/// A pre-image of a file a mutating tool is about to change. `before = None`
-/// means the file did not exist (rewind deletes it).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FileSnapshot {
     pub path: String,
     pub before: Option<String>,
 }
 
-/// Paths a tool call is about to mutate, so the loop can snapshot them first.
-/// Unknown tools and `bash` return nothing (their effects are opaque).
 pub fn snapshot_paths(tool_name: &str, input: &Value, cwd: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     match tool_name {
@@ -376,25 +341,16 @@ pub fn snapshot_paths(tool_name: &str, input: &Value, cwd: &Path) -> Vec<PathBuf
     out
 }
 
-/// Delegate a focused sub-task to a nested agent loop and return its report.
-/// The builder is supplied by the provider so the sub-agent shares the same
-/// model/credentials but runs with a fresh, auto-approved context.
+pub type SubAgentBuilder = Arc<
+    dyn Fn(&str) -> Result<crate::agent::AgentLoop, crate::providers::ProviderError> + Send + Sync,
+>;
+
 pub struct TaskTool {
-    build: Arc<
-        dyn Fn(&str) -> Result<crate::agent::AgentLoop, crate::providers::ProviderError>
-            + Send
-            + Sync,
-    >,
+    build: SubAgentBuilder,
 }
 
 impl TaskTool {
-    pub fn new(
-        build: Arc<
-            dyn Fn(&str) -> Result<crate::agent::AgentLoop, crate::providers::ProviderError>
-                + Send
-                + Sync,
-        >,
-    ) -> Self {
+    pub fn new(build: SubAgentBuilder) -> Self {
         Self { build }
     }
 }
@@ -458,9 +414,6 @@ impl Tool for TaskTool {
     }
 }
 
-/// Ask the user one or more multiple-choice questions. Execution is handled by
-/// the agent loop (it needs the event stream + question broker), so `run` is
-/// only a fallback that should never be reached.
 pub struct AskTool;
 impl Tool for AskTool {
     fn spec(&self) -> ToolSpec {
@@ -703,7 +656,6 @@ impl Tool for WebFetchTool {
     }
 }
 
-/// The default tool set.
 pub fn default_tools() -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(ReadTool),
@@ -750,7 +702,6 @@ mod tests {
         assert!(ed.ok, "{ed:?}");
         assert_eq!(g.run(&json!({"path": "nested/x.txt"}), &dir).await.output, "hello there");
 
-        // Missing pattern is a clean error, not a panic.
         assert!(!e.run(&json!({"path": "nested/x.txt", "old": "zzz", "new": "y"}), &dir).await.ok);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -821,7 +772,6 @@ mod tests {
         assert!(out.ok, "{out:?}");
         assert!(out.output.contains("SUBAGENT-REPORT"), "{}", out.output);
 
-        // Empty prompt is a clean error.
         assert!(!TaskTool::new(Arc::new(|_ty: &str| {
             Ok(crate::agent::AgentLoop::new(Box::new(Reply("x".into())), "m"))
         }))
@@ -859,7 +809,6 @@ mod tests {
     #[test]
     fn ask_gate_allows_reads_in_scope_only() {
         let cwd = Path::new("/work/proj");
-        // Workspace reads never prompt.
         assert_eq!(
             AskGate.check("read", &json!({"path": "src/main.rs"}), cwd),
             PermissionDecision::Allow
@@ -867,7 +816,6 @@ mod tests {
         assert_eq!(AskGate.check("grep", &json!({"path": "src"}), cwd), PermissionDecision::Allow);
         assert_eq!(AskGate.check("glob", &json!({}), cwd), PermissionDecision::Allow);
         assert_eq!(AskGate.check("webfetch", &json!({"url": "https://x"}), cwd), PermissionDecision::Allow);
-        // Reads outside the project and anything mutating still ask.
         assert_eq!(
             AskGate.check("read", &json!({"path": "/etc/passwd"}), cwd),
             PermissionDecision::Ask

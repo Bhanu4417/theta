@@ -1,14 +1,3 @@
-//! Tree-shaped session history (Pi's session tree).
-//!
-//! A session is a set of [`Entry`]s linked by `parent`. The active position is
-//! a `leaf`; the root→leaf path is the active branch. Navigation sets a new
-//! leaf and the next append fans out a new branch, while the abandoned branch
-//! stays in the file and can be revisited.
-//!
-//! Compaction and branch-summary entries participate in [`SessionTree::context`]:
-//! a compaction entry replaces its ancestors with a summary, and a branch
-//! summary injects carried-over context at its position.
-
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -23,9 +12,7 @@ pub enum EntryKind {
     Assistant,
     Tool,
     System,
-    /// A compaction boundary: ancestors are replaced by `text` (the summary).
     Compaction,
-    /// Context carried from an abandoned branch.
     BranchSummary,
 }
 
@@ -35,27 +22,19 @@ pub struct Entry {
     pub parent: Option<String>,
     pub timestamp_ms: i64,
     pub kind: EntryKind,
-    /// Message text (or summary text for Compaction/BranchSummary).
     pub text: String,
     #[serde(default)]
     pub tool_calls: Vec<crate::ai::ToolCall>,
     #[serde(default)]
     pub tool_call_id: Option<String>,
-    /// For compaction: first ancestor kept verbatim (context starts here).
     #[serde(default)]
     pub first_kept: Option<String>,
-    /// For compaction: token count before compaction.
     #[serde(default)]
     pub tokens_before: Option<u64>,
-    /// Pre-images of files this entry's turn mutated (for `/undo` restore).
     #[serde(default)]
     pub snapshots: Vec<crate::agent::tools::FileSnapshot>,
-    /// Provider-reported token usage, persisted so the pane footer can still
-    /// show `ctx %` after a restart (replay used to drop it).
     #[serde(default)]
     pub tokens: Option<crate::harness::transcript::TokenUsage>,
-    /// Estimated USD cost for this entry, persisted for the same reason.
-    /// `None` when the model's pricing is unknown.
     #[serde(default)]
     pub cost: Option<f64>,
 }
@@ -88,7 +67,6 @@ impl Entry {
     }
 }
 
-/// A resumable local session discovered from its sidecar.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionSummary {
     pub id: String,
@@ -129,8 +107,6 @@ impl SessionTree {
         self.entries.iter().filter(|e| e.parent.is_none()).collect()
     }
 
-    /// Append a message entry as a child of `parent` (or the current leaf when
-    /// `parent` is `None`), returning the new leaf id.
     pub fn append(&mut self, message: &ChatMessage) -> String {
         let kind = match message.role {
             crate::ai::Role::User => EntryKind::User,
@@ -155,7 +131,6 @@ impl SessionTree {
         })
     }
 
-    /// Append a compaction node and make it the leaf.
     pub fn push_compaction(&mut self, summary: &str, first_kept: Option<String>, tokens_before: u64) -> String {
         let id = self.next_id();
         self.push(Entry {
@@ -174,7 +149,6 @@ impl SessionTree {
         })
     }
 
-    /// Append a branch-summary node and make it the leaf.
     pub fn push_branch_summary(&mut self, summary: &str, from: Option<String>) -> String {
         let _ = from;
         let id = self.next_id();
@@ -206,7 +180,6 @@ impl SessionTree {
         format!("e{}", self.seq)
     }
 
-    /// Root→leaf order for the active branch.
     pub fn active_path(&self) -> Vec<&Entry> {
         let mut out = Vec::new();
         let mut cur = self.leaf.clone();
@@ -219,14 +192,11 @@ impl SessionTree {
         out
     }
 
-    /// Rebuild the model context from the active branch, honoring compaction
-    /// and branch-summary entries.
     pub fn context(&self) -> Vec<ChatMessage> {
         let path = self.active_path();
         if path.is_empty() {
             return Vec::new();
         }
-        // Latest compaction on the path replaces its ancestors.
         let last_cmp = path.iter().rposition(|e| e.kind == EntryKind::Compaction);
         let start = match last_cmp {
             Some(ci) => path[ci]
@@ -237,7 +207,6 @@ impl SessionTree {
             None => 0,
         };
         let mut out = Vec::new();
-        // System prompt(s) before the retained region are preserved.
         for e in &path[..start] {
             if e.kind == EntryKind::System {
                 out.push(e.to_message());
@@ -249,10 +218,6 @@ impl SessionTree {
         out
     }
 
-    /// Convert the active path of this tree into displayable transcript messages.
-    ///
-    /// Tool calls are reconstructed with their outputs, compaction nodes become
-    /// dividers, and token usage / cost are carried through.
     pub fn to_messages(&self, sid: &str) -> Vec<Message> {
         let mut out = Vec::new();
         if self.is_empty() {
@@ -342,8 +307,6 @@ impl SessionTree {
         out
     }
 
-    /// Messages for an abandoned sub-branch (used to summarize before
-    /// navigation). `from` is the branch's old leaf; `to_ancestor` is kept out.
     pub fn branch_messages(&self, from: &str, to_ancestor: Option<&str>) -> Vec<ChatMessage> {
         let mut out = Vec::new();
         let mut cur = Some(from.to_string());
@@ -359,13 +322,11 @@ impl SessionTree {
         out
     }
 
-    /// Serialize the folded branch up to a token budget for summarization.
     pub fn branch_summary_input(&self, from: &str, to_ancestor: Option<&str>, budget: u64, cap: usize) -> Option<String> {
         let msgs = self.branch_messages(from, to_ancestor);
         context::branch_summary_input(&msgs, budget, cap)
     }
 
-    /// True when `ancestor` is on the parent chain of `of` (inclusive).
     pub fn is_ancestor(&self, ancestor: &str, of: &str) -> bool {
         let mut cur = Some(of.to_string());
         while let Some(id) = cur {
@@ -386,8 +347,6 @@ impl SessionTree {
         }
     }
 
-    /// Keep only entries whose id is in `keep`, re-pointing `leaf` at the last
-    /// surviving entry of the previous active path. Used to pin a fork.
     pub fn retain_path(&mut self, keep: &std::collections::HashSet<&str>) {
         let leaf_kept = self
             .leaf
@@ -399,9 +358,6 @@ impl SessionTree {
         }
     }
 
-    /// Restore file pre-images for every entry after `ancestor` (newest first),
-    /// reversing each entry's snapshots then the entry order. Returns how many
-    /// files were touched. Best-effort: write failures are ignored.
     pub fn restore_files_after(&self, ancestor: Option<&str>) -> usize {
         let mut restored = 0;
         for e in self.entries_after(ancestor) {
@@ -423,9 +379,6 @@ impl SessionTree {
         restored
     }
 
-    /// Walk from the current leaf back to (not including) `ancestor`, returning
-    /// the abandoned entries newest-first. `ancestor = None` returns the whole
-    /// active path. Does not mutate.
     pub fn entries_after(&self, ancestor: Option<&str>) -> Vec<Entry> {
         let mut out = Vec::new();
         let mut cur = self.leaf.clone();
@@ -440,8 +393,6 @@ impl SessionTree {
         out
     }
 
-    /// Navigate to `id`, first appending a branch summary carrying the
-    /// abandoned work forward (when one can be produced).
     pub fn navigate_with_summary(&mut self, id: &str, summary: Option<String>) -> bool {
         if self.node(id).is_none() {
             return false;
@@ -456,7 +407,6 @@ impl SessionTree {
         true
     }
 
-    // -- persistence --------------------------------------------------------
 
     pub fn to_jsonl(&self) -> String {
         let mut out = String::new();
@@ -469,7 +419,6 @@ impl SessionTree {
         out
     }
 
-    /// Load entries from JSONL. The leaf is the last entry present.
     pub fn from_jsonl(text: &str) -> Self {
         let mut tree = SessionTree::new();
         for line in text.lines() {
@@ -501,8 +450,6 @@ impl SessionTree {
         (!tree.is_empty()).then_some(tree)
     }
 
-    /// List local sessions saved under the sidecar directory (newest first).
-    /// Missing directories yield an empty list.
     pub fn list_sessions() -> Vec<SessionSummary> {
         let base = match std::env::var_os("THETA_SESSION_DIR") {
             Some(dir) => PathBuf::from(dir),
@@ -575,12 +522,10 @@ impl SessionTree {
                 entries: tree.entries.len(),
             });
         }
-        out.sort_by(|a, b| b.updated_ms.cmp(&a.updated_ms));
+        out.sort_by_key(|s| std::cmp::Reverse(s.updated_ms));
         out
     }
 
-    /// Default on-disk path for a provider session id. Override the directory
-    /// with `THETA_SESSION_DIR`.
     pub fn sidecar_path(session_id: &str) -> Option<PathBuf> {
         let base = match std::env::var_os("THETA_SESSION_DIR") {
             Some(dir) => PathBuf::from(dir),
@@ -611,10 +556,8 @@ mod tests {
         let path = temp_dir.join("ses_sample.jsonl");
 
         let mut tree = SessionTree::new();
-        // Short filler like "so"
         tree.append(&ChatMessage::user("so"));
         tree.append(&ChatMessage::assistant("How can I help?", vec![]));
-        // Substantive prompt
         tree.append(&ChatMessage::user("Refactor the parser module"));
         tree.append(&ChatMessage::assistant("Done", vec![]));
         std::fs::write(&path, tree.to_jsonl()).unwrap();
@@ -656,7 +599,6 @@ mod tests {
         tr.append(&ChatMessage::user("q2"));
         tr.append(&ChatMessage::assistant("a2", vec![]));
 
-        // Go back to just after q1 and take a different path.
         assert!(tr.set_leaf(&after_q1));
         tr.append(&ChatMessage::assistant("a1-alt", vec![]));
         tr.append(&ChatMessage::user("q2-alt"));
@@ -665,7 +607,6 @@ mod tests {
         let texts: Vec<&str> = ctx.iter().map(|m| m.text.as_str()).collect();
         assert!(texts.contains(&"a1-alt") && texts.contains(&"q2-alt"));
         assert!(!texts.contains(&"a1") && !texts.contains(&"q2"));
-        // The abandoned branch is preserved in the file.
         assert!(tr.entries.iter().any(|e| e.text == "a2"));
     }
 
@@ -683,8 +624,6 @@ mod tests {
 
         let ctx = tr.context();
         let texts: Vec<&str> = ctx.iter().map(|m| m.text.as_str()).collect();
-        // old1 is summarized away; the first_kept entry (old2) is retained,
-        // along with the summary, the recent turn and later work.
         assert!(!texts.contains(&"old1"));
         assert!(texts.contains(&"old2"));
         assert!(texts.iter().any(|t| t.contains("THE SUMMARY")));
@@ -728,7 +667,6 @@ mod tests {
         assert_eq!(back.entries.len(), 4);
         assert_eq!(back.leaf, tr.leaf);
         assert_eq!(back.context(), tr.context());
-        // Sequence numbering continues after reload.
         let mut back2 = back;
         back2.append(&ChatMessage::user("more"));
         assert!(!back2.node("e5").is_none() || back2.entries.len() == 5);
@@ -752,7 +690,6 @@ mod tests {
         tr.append(&ChatMessage::assistant("answer after compaction", vec![]));
 
         let msgs = tr.to_messages("sess_test");
-        // User, Assistant (with text + tool output), Compaction divider, Assistant
         assert_eq!(msgs.len(), 4);
         assert_eq!(msgs[0].role, Role::User);
         assert_eq!(msgs[0].id, "sess_test-hist-1");

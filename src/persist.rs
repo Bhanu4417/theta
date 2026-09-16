@@ -1,5 +1,3 @@
-//! Workspace persistence (`~/.local/share/theta/workspace.toml`).
-
 use crate::harness::transcript::Message;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -14,21 +12,14 @@ pub struct SavedSession {
     pub model: Option<(String, String)>,
     #[serde(default)]
     pub agent: Option<String>,
-    /// Provider id (e.g. "opencode"). Absent in older files → default provider.
     #[serde(default)]
     pub provider: Option<String>,
-    /// Transcript scroll offset (rendered lines from the top) so a restored
-    /// pane reopens exactly where the user stopped scrolling.
     #[serde(default)]
     pub scroll: u64,
-    /// Whether the pane was following the transcript bottom. Absent in older
-    /// files → follow (the previous behavior).
     #[serde(default = "follow_bottom_default")]
     pub stick_bottom: bool,
 }
 
-/// Old workspace files have no scroll fields: keep the historical behavior
-/// (pin to the bottom) instead of freezing at offset 0.
 fn follow_bottom_default() -> bool {
     true
 }
@@ -36,7 +27,6 @@ fn follow_bottom_default() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SavedRow {
     pub weight: f32,
-    /// (weight, session index into `sessions`)
     pub cells: Vec<(f32, usize)>,
 }
 
@@ -48,7 +38,6 @@ pub struct Workspace {
     pub maximized: Option<usize>,
     #[serde(default)]
     pub scheme: Option<String>,
-    /// Directories Theta has opened — used to list sessions across projects.
     #[serde(default)]
     pub known_dirs: Vec<String>,
 }
@@ -77,16 +66,7 @@ pub fn load() -> Option<Workspace> {
     toml::from_str(&text).ok()
 }
 
-// ---------------------------------------------------------------------------
-// Transcript cache
-//
-// A display-only cache of the last messages per session so restored panes
-// render instantly while the provider replays authoritative history. It is
-// always replaced by provider history once `HistoryLoaded` arrives; it is
-// never the source of truth and never deletes server history.
-// ---------------------------------------------------------------------------
 
-/// Maximum messages cached per session.
 pub const TRANSCRIPT_CACHE_LIMIT: usize = 500;
 
 pub fn transcript_path() -> Option<PathBuf> {
@@ -174,7 +154,6 @@ mod scroll_tests {
 
     #[test]
     fn older_files_without_scroll_fields_still_follow_the_bottom() {
-        // A workspace written before scroll persistence must not freeze at 0.
         let text = r#"
             focused = 0
             rows = []

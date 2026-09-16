@@ -1,8 +1,3 @@
-//! Small shared data types for sessions, models, and agent questions.
-//!
-//! These were once the OpenCode client's shapes; Theta now owns its harness, so
-//! they live here as provider-neutral value types the UI and events use.
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelRef {
     pub provider_id: String,

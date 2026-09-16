@@ -1,7 +1,3 @@
-//! Theta — a multi-session terminal coding agent (its own harness).
-
-// The ai/agent/extensions layers are a reusable library surface; not every
-// entry point is wired into the TUI yet.
 #[allow(dead_code)]
 mod agent;
 #[allow(dead_code)]
@@ -53,44 +49,59 @@ use std::time::Duration;
 struct Args {
     dir: Option<PathBuf>,
     no_restore: bool,
-    /// `--log`: open/tail the newest log (or record when combined with `--run`).
     log: bool,
-    /// `--run`: start the TUI (with `--log`: record to the log file).
     run: bool,
     help: bool,
     version: bool,
-    /// Headless: run one turn and print the reply, no TUI.
     print: bool,
-    /// Headless: emit neutral harness events as JSON lines.
     json: bool,
-    /// Prompt / positional arguments.
     prompt: Vec<String>,
-    /// Live-verify LLM providers (positional args are provider ids).
     check_ai: bool,
 }
 
 fn usage() -> &'static str {
     "Θ theta — terminal coding agent (local harness, multi-session)
 
+
+
 USAGE:
+
     theta [OPTIONS] [DIR]
 
+
+
 ARGS:
+
     [DIR]              Open with an initial session in DIR
 
+
+
 OPTIONS:
+
     --no-restore       Do not restore the last workspace
+
     --log              Open/tail the newest debug log (request → provider/model)
+
     --run              Start the TUI (with --log: record to the log file)
+
     -p, --print        Run one prompt headlessly and print the reply
+
     --json             With --print, emit events as JSON lines
+
     --check-ai [PROV…] Live-verify provider credentials (default: [ai].provider)
+
     --help             Show this help
+
     --version          Show version
 
+
+
 KEYS:
+
     ^N new session   ^K palette   ^P files   ^⇧F project   ^F conversation
+
     ^B explorer      ^Space maximize   Tab focus   Alt+hjkl resize   F1 help
+
 "
 }
 
@@ -145,8 +156,6 @@ async fn main() -> Result<()> {
     let cfg = config::Config::load()?;
     theme::set_theme(&cfg.theme);
 
-    // `--log` on its own opens/tails the newest log. Combined with a run mode
-    // (`--run`, `--print`, `--json`, `--check-ai`) it records to a fresh file.
     let recording = args.run || args.print || args.json || args.check_ai;
     if args.log && !recording {
         return view_log();
@@ -163,7 +172,6 @@ async fn main() -> Result<()> {
         return run_check_ai(cfg, args.prompt).await;
     }
 
-    // Headless modes do not need a TTY (print / JSON event stream).
     if args.print || args.json {
         let prompt = args.prompt.join(" ");
         if prompt.trim().is_empty() {
@@ -194,12 +202,10 @@ async fn main() -> Result<()> {
 
     let mut app = app::App::new(cfg, manager, initial_dir);
 
-    // Nudge a first-run user whose provider has no credentials yet.
     if !app.provider_configured() {
         app.flash("no API key yet — run /login to add one");
     }
 
-    // Warm the resume cache at boot so the session lists open instantly.
     app.preload_sessions(app.initial_dir.clone());
 
     install_panic_hook();
@@ -207,7 +213,6 @@ async fn main() -> Result<()> {
     let result = run(&mut terminal, &mut app, &mut rx, &args).await;
     restore_terminal();
 
-    // `/refresh`: hand the terminal to the newest binary and re-exec.
     if app.restart {
         exec_self()?;
     }
@@ -223,8 +228,6 @@ async fn main() -> Result<()> {
     }
 }
 
-/// `theta --log`: open/tail the newest log so request → provider/model routing
-/// and token usage are visible without hunting for the file.
 fn view_log() -> Result<()> {
     let dir = logging::logs_dir();
     let Some(path) = logging::newest_log(&dir) else {
@@ -233,7 +236,6 @@ fn view_log() -> Result<()> {
         return Ok(());
     };
     println!("theta: {}  (q to quit)", path.display());
-    // `less +F` follows and supports search; fall back to `tail -f`, then dump.
     if std::process::Command::new("less").arg("+F").arg(&path).status().is_ok() {
         return Ok(());
     }
@@ -249,8 +251,6 @@ fn view_log() -> Result<()> {
     Ok(())
 }
 
-/// Live-verify providers by sending a tiny request to each and reporting the
-/// result. Missing credentials are skipped, not failed.
 async fn run_check_ai(cfg: config::Config, providers: Vec<String>) -> Result<()> {
     let list = if providers.is_empty() {
         vec![cfg.ai.provider.clone()]
@@ -285,8 +285,6 @@ async fn run_check_ai(cfg: config::Config, providers: Vec<String>) -> Result<()>
             messages: vec![ai::ChatMessage::user("Reply with the single word OK.")],
             tools: Vec::new(),
             temperature: None,
-            // Reasoning models can spend >100 tokens thinking before any text;
-            // too small a cap yields no visible output and a false "empty".
             max_tokens: Some(1_024),
             reasoning_effort: Some("low".into()),
         };
@@ -317,9 +315,6 @@ async fn run_check_ai(cfg: config::Config, providers: Vec<String>) -> Result<()>
     Ok(())
 }
 
-/// Run one prompt through the local agent and print the result. `--json`
-/// streams every provider-neutral event as a JSON line; otherwise only the
-/// final assistant text is printed.
 async fn run_headless(cfg: config::Config, prompt: String, json: bool) -> Result<()> {
     let (agent, _broker) = manager::build_agent(&cfg, false)?;
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -354,13 +349,10 @@ async fn run(
     if !args.no_restore && app.cfg.ui.restore {
         app.restore_workspace();
     }
-    // Pull session lists for every folder we know about (through one server).
     app.preload_known_dirs();
     app.dirty = true;
 
     let mut events = EventStream::new().fuse();
-    // 40ms frames keep the status-bar scanner smooth; the
-    // app still only redraws when something changed.
     let mut tick = tokio::time::interval(Duration::from_millis(40));
 
     loop {
@@ -389,7 +381,6 @@ async fn run(
             break;
         }
 
-        // Suspend the TUI to compose a prompt in `$EDITOR` (Ctrl+G / /editor).
         if let Some((sid, initial)) = app.take_pending_editor() {
             restore_terminal();
             let edited = edit_in_external_editor(&initial);
@@ -406,8 +397,6 @@ async fn run(
     Ok(())
 }
 
-/// Run the user's editor on a temp file and return the edited text.
-/// `$VISUAL`, then `$EDITOR`, then a sensible default.
 fn edit_in_external_editor(initial: &str) -> Option<String> {
     let editor = std::env::var("VISUAL")
         .ok()
@@ -442,7 +431,6 @@ fn init_terminal() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
         EnableMouseCapture,
         EnableBracketedPaste
     )?;
-    // Best-effort kitty keyboard protocol (ignored where unsupported).
     let _ = execute!(
         out,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
@@ -463,8 +451,6 @@ fn restore_terminal() {
     let _ = disable_raw_mode();
 }
 
-/// Restore the terminal before the default panic output so a crash never
-/// leaves the user stuck in raw mode / the alternate screen.
 fn install_panic_hook() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -474,9 +460,6 @@ fn install_panic_hook() {
     }));
 }
 
-/// Replace the current process image with the theta binary, preserving CLI
-/// arguments. Tries several candidate paths so a stale `current_exe` (e.g.
-/// after a rebuild replaced the file) still finds a valid binary.
 fn exec_self() -> Result<()> {
     #[cfg(unix)]
     {
@@ -488,7 +471,6 @@ fn exec_self() -> Result<()> {
         if let Ok(p) = std::env::current_exe() {
             candidates.push(p);
         }
-        // The path as invoked (may be relative or a symlink).
         if let Some(arg0) = std::env::args_os().next() {
             let p = PathBuf::from(&arg0);
             if p.components().count() > 1 {
@@ -498,7 +480,6 @@ fn exec_self() -> Result<()> {
         if let Some(home) = dirs::home_dir() {
             candidates.push(home.join(".local/bin/theta"));
         }
-        // Anything named `theta` on PATH.
         if let Some(paths) = std::env::var_os("PATH") {
             for dir in std::env::split_paths(&paths) {
                 candidates.push(dir.join("theta"));
@@ -512,7 +493,6 @@ fn exec_self() -> Result<()> {
                 continue;
             }
             let err = std::process::Command::new(&cand).args(&args).exec();
-            // `exec` only returns on failure; remember and try the next.
             last_err = Some(err);
         }
         match last_err {

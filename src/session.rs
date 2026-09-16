@@ -1,5 +1,3 @@
-//! Per-session state: transcript, input buffer, status, scroll.
-
 use crate::harness::transcript::{Message, Part, PartKind, Role, ToolInfo};
 use crate::harness::{Question, Task};
 use crate::models::ModelRef;
@@ -17,7 +15,6 @@ pub enum SessStatus {
     Error(String),
     Permission,
     Question,
-    /// The harness is summarizing the conversation to free context.
     Compacting,
 }
 
@@ -40,20 +37,14 @@ pub struct PendingPermission {
     pub detail: String,
 }
 
-/// A question the agent is waiting on, plus the UI selection state.
 #[derive(Debug, Clone)]
 pub struct PendingQuestion {
     pub id: String,
     pub questions: Vec<Question>,
-    /// Index of the question currently being answered.
     pub qi: usize,
-    /// Highlighted option per question.
     pub selected: Vec<usize>,
-    /// Toggled options per question (for multi-select).
     pub chosen: Vec<Vec<bool>>,
-    /// Accumulated answers per question (labels).
     pub answers: Vec<Vec<String>>,
-    /// Free-text answer for the current question when `custom` is allowed.
     pub custom: String,
 }
 
@@ -85,8 +76,6 @@ impl PendingQuestion {
         self.qi + 1 >= self.questions.len()
     }
 
-    /// Record the answer for the current question and advance. Returns true
-    /// once every question has been answered.
     pub fn commit_current(&mut self) -> bool {
         let Some(q) = self.questions.get(self.qi) else {
             return true;
@@ -124,11 +113,9 @@ impl PendingQuestion {
 #[derive(Debug, Clone, Default)]
 pub struct InputState {
     pub buf: String,
-    /// Cursor position in *chars* from the start of the buffer.
     pub cursor: usize,
     pub history: Vec<String>,
     pub hist_idx: Option<usize>,
-    /// Draft saved when browsing history.
     draft: Option<String>,
 }
 
@@ -258,8 +245,6 @@ impl InputState {
     }
 }
 
-/// A transient status line shown in the workspace activity strip (e.g. a
-/// `/push`), with the time it started so it can expire and whether it finished.
 #[derive(Debug, Clone)]
 pub struct Activity {
     pub text: String,
@@ -269,75 +254,47 @@ pub struct Activity {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ToolRef {
-    /// Index into `messages`.
     pub msg: usize,
-    /// Index into `messages[msg].parts`.
     pub part: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct SessionState {
     pub id: u32,
-    /// Theta-owned identity wrapper (provider ids are metadata).
     pub session_id: crate::harness::SessionId,
-    /// Which agent runtime backs this session.
     pub provider: ProviderKind,
-    /// The harness task for the current prompt, if any.
     pub task: Option<Task>,
     pub name: String,
     pub dir: PathBuf,
     pub oc_sid: Option<String>,
     pub model: Option<ModelRef>,
-    /// Agent used for subsequent prompts (e.g. "build", "plan").
     pub agent: Option<String>,
-    /// Selected row in the slash-command popup.
     pub slash_selected: usize,
-    /// Last submission (time, text) — guards double-Enter duplicates.
     pub last_send: Option<(std::time::Instant, String)>,
-    /// Prompt typed while the agent was busy — awaiting queue/fork choice.
     pub pending_send: Option<String>,
-    /// Prompts queued while busy; sent in order when the agent idles.
     pub queue: Vec<String>,
-    /// Set when Esc was pressed once while the agent is busy; a second Esc
-    /// within a short window interrupts. Cleared on tick.
     pub interrupt_armed: Option<std::time::Instant>,
-    /// Short status shown in the workspace activity strip (e.g. a `/push`).
     pub activity: Option<Activity>,
-    /// Cumulative assistant cost in USD (recomputed from the transcript).
     pub cost: f64,
-    /// Prompt-side tokens of the latest assistant message (context size).
     pub ctx_tokens: u64,
     pub messages: Vec<Message>,
     pub status: SessStatus,
     pub input: InputState,
-    /// Scroll offset in rendered lines from the top.
     pub scroll: usize,
     pub stick_bottom: bool,
-    /// Tool part ids that are expanded.
     pub expanded: HashSet<String>,
-    /// Selected tool for Enter/expand interactions.
     pub tool_cursor: Option<ToolRef>,
     pub pending_perm: Option<PendingPermission>,
-    /// A question the agent is waiting on.
     pub pending_question: Option<PendingQuestion>,
     pub last_error: Option<String>,
-    /// Counter used to derive unique optimistic message ids.
     optimistic_seq: u64,
-    /// Optimistic user messages not yet adopted by a real server message.
     unadopted_locals: u64,
-    /// Sequence counter for synthetic (agy) message ids.
     synthetic_seq: u64,
-    /// Collapsed pastes (`[Pasted ~N lines]`, `[Image N]`) for this input.
     pub paste_parts: Vec<crate::paste::PastePart>,
-    /// Counter for image/file paste placeholders.
     pub paste_seq: u64,
-    /// Messages removed by the last rewind, for `/redo`.
     pub redo_snapshot: Option<Vec<Message>>,
-    /// `@file` mention suggestions for the current input word.
     pub mention_results: Vec<String>,
-    /// Selected row in the `@` mention popup.
     pub mention_selected: usize,
-    /// Invalidate the rendered-line cache.
     pub dirty: bool,
 }
 
@@ -383,13 +340,9 @@ impl SessionState {
         }
     }
 
-    /// Optimistic local user message shown before the server acknowledges.
     pub fn push_local_user(&mut self, text: &str) -> String {
         self.optimistic_seq += 1;
         self.unadopted_locals += 1;
-        // `local-N` restarts at 1 on every launch, so include the creation time
-        // to keep ids unique against a restored transcript (otherwise a new
-        // optimistic prompt could overwrite an old message by id).
         let created = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
@@ -417,8 +370,6 @@ impl SessionState {
         local_id
     }
 
-    /// Adopt a real server message in place of an optimistic one with
-    /// matching first-text content. Returns true when adopted.
     pub fn adopt_by_text(&mut self, real: &Message, text: &str) -> bool {
         if self.unadopted_locals == 0 {
             return false;
@@ -444,8 +395,6 @@ impl SessionState {
         }
     }
 
-    /// Adopt the oldest optimistic message (FIFO) when no text is available
-    /// to match on (message.updated carries no parts).
     pub fn adopt_oldest(&mut self, real: &Message) -> bool {
         if self.unadopted_locals == 0 {
             return false;
@@ -467,7 +416,6 @@ impl SessionState {
         }
     }
 
-    /// Insert or update a message meta row (from message.updated).
     pub fn upsert_message_meta(&mut self, msg: &Message) {
         if let Some(existing) = self.messages.iter_mut().find(|m| m.id == msg.id) {
             existing.role = msg.role;
@@ -476,9 +424,6 @@ impl SessionState {
             existing.cost = msg.cost;
             existing.tokens = msg.tokens;
         } else {
-            // Create the row so the following `Part` events inherit its role
-            // (otherwise every message without a meta row — e.g. replayed
-            // history — is assumed to be an assistant message).
             let mut meta = msg.clone();
             meta.parts.clear();
             self.messages.push(meta);
@@ -487,16 +432,12 @@ impl SessionState {
         self.dirty = true;
     }
 
-    /// Session cost = sum of assistant message costs; context = the latest
-    /// assistant message's prompt-side tokens.
     pub fn recompute_metrics(&mut self) {
         self.cost = self
             .messages
             .iter()
             .filter_map(|m| if m.role == Role::Assistant { m.cost } else { None })
             .sum();
-        // Most recent assistant usage, skipping any trailing row that has no
-        // recorded tokens (so the context readout doesn't blink to 0).
         self.ctx_tokens = self
             .messages
             .iter()
@@ -507,12 +448,9 @@ impl SessionState {
             .unwrap_or(0);
     }
 
-    /// Insert or replace a part, creating the message row if needed.
     pub fn upsert_part(&mut self, message: &Message, part: Part) {
         let dirty_msg_id = message.id.clone();
         if !self.messages.iter().any(|m| m.id == dirty_msg_id) {
-            // A text part may be the first evidence of a real user message
-            // we predicted optimistically — adopt instead of duplicating.
             if let PartKind::Text { text, .. } = &part.kind {
                 if self.adopt_by_text(message, text) {
                     self.upsert_part_existing(message, part);
@@ -532,9 +470,6 @@ impl SessionState {
             let Some(msg) = self.messages.iter_mut().find(|m| m.id == dirty_msg_id) else {
                 return;
             };
-            // Merge, never blank: a Part arrives with no cost/tokens/completed,
-            // and overwriting the row with `None` wiped the context/cost that a
-            // preceding usage update had just recorded.
             if message.error.is_some() {
                 msg.error = message.error.clone();
             }
@@ -547,8 +482,6 @@ impl SessionState {
             if message.tokens.is_some() {
                 msg.tokens = message.tokens;
             }
-            // An adopted message still carries placeholder local parts; purge
-            // them once the server delivers its own.
             if !part.id.starts_with("local-")
                 && msg.parts.iter().any(|p| p.id.starts_with("local-"))
             {
@@ -584,7 +517,6 @@ impl SessionState {
         self.dirty = true;
     }
 
-    /// Flat list of tool parts in transcript order.
     pub fn tools(&self) -> Vec<ToolRef> {
         let mut out = Vec::new();
         for (mi, m) in self.messages.iter().enumerate() {
@@ -710,8 +642,6 @@ mod tests {
         assert_eq!(s.messages.len(), 1, "meta must create the row");
         assert_eq!(s.messages[0].role, Role::User);
 
-        // The following part fills in the body; the role must not flip to
-        // assistant (replayed user prompts used to lose their Θ marker).
         let part = Part {
             id: "hist-1-p1".into(),
             message_id: "hist-1".into(),
@@ -741,8 +671,6 @@ mod tests {
         s.upsert_message_meta(&usage);
         assert_eq!(s.ctx_tokens, 12_345);
 
-        // The text part for the same message carries no usage metadata; it must
-        // not blank the tokens/cost the usage update just recorded.
         let part = Part {
             id: "m1-text".into(),
             message_id: "m1".into(),

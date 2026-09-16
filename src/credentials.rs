@@ -1,9 +1,3 @@
-//! Provider credentials (`~/.config/theta/keys.toml`).
-//!
-//! Stored separately from `config.toml` with `0600` permissions. Environment
-//! variables remain the fallback, so nothing breaks for users who only export
-//! keys. Override the path with `THETA_KEYS_FILE` (used by tests).
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -12,7 +6,6 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Credentials {
-    /// provider id -> API key.
     #[serde(default)]
     pub api_keys: HashMap<String, String>,
 }
@@ -48,7 +41,6 @@ impl Credentials {
         Ok(())
     }
 
-    /// Stored key for a provider, else the provider's env var.
     pub fn resolve(&self, provider: &str, api_key_env: &str) -> Option<String> {
         if let Some(k) = self.api_keys.get(provider) {
             if !k.trim().is_empty() {
@@ -71,7 +63,6 @@ impl Credentials {
         self.save()
     }
 
-    /// Test-only helper: the stored provider ids, sorted.
     #[cfg(test)]
     pub fn providers(&self) -> Vec<String> {
         let mut v: Vec<String> = self.api_keys.keys().cloned().collect();
@@ -99,7 +90,6 @@ mod tests {
         c.set("anthropic", "sk-ant-test").unwrap();
         let back = Credentials::load();
         assert_eq!(back.resolve("anthropic", "NOPE_ENV"), Some("sk-ant-test".into()));
-        // Falls back to env when not stored.
         std::env::set_var("THETA_TEST_KEY_ENV", "env-key");
         assert_eq!(back.resolve("openai", "THETA_TEST_KEY_ENV"), Some("env-key".into()));
         assert_eq!(back.resolve("openai", ""), None);

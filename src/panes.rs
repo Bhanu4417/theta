@@ -1,9 +1,3 @@
-//! Pane grid: rows of cells with adjustable weights.
-//!
-//! Layouts are tmux-like: adjacent panes share their border line, so the grid
-//! produces single separators between panes. Auto-tiling picks a column count
-//! from the terminal aspect ratio (cells ~2x taller than wide).
-
 use ratatui::layout::Rect;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -18,15 +12,11 @@ pub struct Row {
     pub cells: Vec<Cell>,
 }
 
-/// Tiling scheme the workspace uses (Ctrl+T to switch).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Scheme {
-    /// Adaptive grid (columns from terminal aspect).
     #[default]
     Auto,
-    /// Every pane stacked vertically, full width.
     Rows,
-    /// All panes side by side.
     Columns,
 }
 
@@ -75,13 +65,11 @@ impl PaneGrid {
         self.rows.iter().all(|r| r.cells.is_empty())
     }
 
-    /// Test-only helper: total panes across all rows.
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.rows.iter().map(|r| r.cells.len()).sum()
     }
 
-    /// Test-only helper: is this session currently in the grid?
     #[cfg(test)]
     pub fn contains(&self, session: u32) -> bool {
         self.rows
@@ -89,7 +77,6 @@ impl PaneGrid {
             .any(|r| r.cells.iter().any(|c| c.session == session))
     }
 
-    /// Build an auto-tiled grid from a session order.
     pub fn auto(order: &[u32], area_w: u16, area_h: u16) -> Self {
         let mut grid = PaneGrid::default();
         if order.is_empty() {
@@ -116,20 +103,17 @@ impl PaneGrid {
         grid
     }
 
-    /// Reset weights to the auto-tile shape, preserving session order.
     pub fn retile(&mut self, area_w: u16, area_h: u16) {
         let order = self.order();
         let scheme = self.scheme;
         *self = Self::build(&order, scheme, area_w, area_h);
     }
 
-    /// Apply a new tiling scheme, preserving session order.
     pub fn apply_scheme(&mut self, scheme: Scheme, area_w: u16, area_h: u16) {
         self.scheme = scheme;
         self.retile(area_w, area_h);
     }
 
-    /// Build a grid in the given scheme from a session order.
     pub fn build(order: &[u32], scheme: Scheme, area_w: u16, area_h: u16) -> Self {
         match scheme {
             Scheme::Auto => Self::auto(order, area_w, area_h),
@@ -162,7 +146,6 @@ impl PaneGrid {
         }
     }
 
-    /// Session ids in z-order (row by row).
     pub fn order(&self) -> Vec<u32> {
         self.rows
             .iter()
@@ -204,8 +187,6 @@ impl PaneGrid {
         *self = Self::build(&order, self.scheme, area_w, area_h);
     }
 
-    /// Rects for every session; adjacent panes share separator lines.
-    /// Returns None when the area cannot fit all panes at minimum size.
     pub fn rects(&self, area: Rect) -> Option<Vec<(u32, Rect)>> {
         if self.rows.is_empty() || area.width == 0 || area.height == 0 {
             return Some(Vec::new());
@@ -215,7 +196,6 @@ impl PaneGrid {
         if row_sum <= 0.0 {
             return None;
         }
-        // Total border allowance: rows share horizontal borders.
         let avail_h = area.height.saturating_sub((n_rows - 1) as u16) as f32;
         let avail_w = area.width as f32;
 
@@ -258,14 +238,13 @@ impl PaneGrid {
                         height: h.min(area.bottom().saturating_sub(y)),
                     },
                 ));
-                x += w + 1; // +1: shared vertical separator
+                x += w + 1; 
             }
-            y += h + 1; // +1: shared horizontal separator
+            y += h + 1; 
             used_h += h + 1;
         }
         let _ = used_h;
 
-        // Minimum size check.
         for (_, r) in &out {
             if r.width < MIN_PANE_W || r.height < MIN_PANE_H {
                 return None;
@@ -285,10 +264,6 @@ impl PaneGrid {
         None
     }
 
-    /// Cyclic neighbour used only for keyboard focus. Horizontal moves follow
-    /// row-major session order; vertical moves follow column-major order. In
-    /// a regular grid this preserves the adjacent move, while repeated arrows
-    /// eventually reach every pane.
     pub fn focus_step(&self, session: u32, dir: Dir) -> Option<u32> {
         match dir {
             Dir::Left | Dir::Right => {
@@ -338,8 +313,6 @@ impl PaneGrid {
         }
     }
 
-    /// Neighbouring session in a direction (grid adjacency for
-    /// Left/Right/Up/Down, z-order cycling for Next/Prev).
     pub fn neighbor(&self, session: u32, dir: Dir, rects: &[(u32, Rect)]) -> Option<u32> {
         let _ = rects;
         let (row, col) = self.cell_pos(session)?;
@@ -386,8 +359,6 @@ impl PaneGrid {
         }
     }
 
-    /// Adjust weights: grow the focused pane/row toward `dir`
-    /// (the neighbour in that direction loses space).
     pub fn resize(&mut self, session: u32, dir: Dir, delta: f32) -> bool {
         let Some((row, col)) = self.cell_pos(session) else {
             return false;
@@ -440,7 +411,6 @@ impl PaneGrid {
         }
     }
 
-    /// Swap the focused pane with its neighbour in a direction.
     pub fn swap(&mut self, session: u32, dir: Dir, rects: &[(u32, Rect)]) -> bool {
         let Some(other) = self.neighbor(session, dir, rects) else {
             return false;
@@ -470,8 +440,6 @@ pub enum Dir {
     Prev,
 }
 
-/// Column count from pane count and terminal aspect (cells ≈ 1:2).
-/// Floor keeps the spec layouts: 4 → 2x2, 5 → 3+2, 6 → 3x2.
 pub fn auto_cols(n: usize, w: u16, h: u16) -> usize {
     if n <= 1 {
         return 1;

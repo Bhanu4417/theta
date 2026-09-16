@@ -1,10 +1,3 @@
-//! OpenAI-compatible provider (`/chat/completions`).
-//!
-//! This one implementation covers OpenAI, xAI/Grok, Groq, OpenRouter,
-//! DeepSeek, Together, Fireworks, Cerebras, Ollama, LM Studio, vLLM and any
-//! other gateway that speaks the OpenAI wire format — only `base_url` (and
-//! optionally an API key) differ.
-
 use std::collections::BTreeMap;
 
 use futures::StreamExt;
@@ -17,13 +10,10 @@ use crate::ai::{
 use crate::providers::ProviderError;
 
 pub struct OpenAiCompat {
-    /// e.g. `https://api.openai.com/v1`, `https://api.x.ai/v1`.
     base_url: String,
     api_key: Option<String>,
     client: reqwest::Client,
-    /// Extra request headers (e.g. a gateway session id).
     headers: Vec<(String, String)>,
-    /// Total per-request timeout; `None` means no limit.
     timeout: Option<std::time::Duration>,
 }
 
@@ -34,8 +24,6 @@ impl OpenAiCompat {
             .build()
             .expect("reqwest client");
         let base_url = base_url.into().trim_end_matches('/').to_string();
-        // Some gateways require a per-request session id; add one only when the
-        // host needs it (transport quirk, not a provider identity).
         let mut headers = Vec::new();
         if base_url.contains("opencode.ai/zen") {
             headers.push(("x-opencode-session".to_string(), session_id()));
@@ -43,21 +31,17 @@ impl OpenAiCompat {
         Self { base_url, api_key, client, headers, timeout: None }
     }
 
-    /// Add/replace an extra request header.
     pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.push((name.into(), value.into()));
         self
     }
 
-    /// Standard preset for a well-known provider id, or `None` if unknown.
     pub fn preset(provider: &str, api_key: Option<String>) -> Option<Self> {
         Self::preset_base(provider).map(|base| Self::new(base, api_key))
     }
 
-    /// Base URL for a well-known provider id, or `None` if unknown.
     pub fn preset_base(provider: &str) -> Option<&'static str> {
         Some(match provider {
-            // OpenCode's own gateways.
             "opencode" | "opencode-zen" | "zen" => "https://opencode.ai/zen/v1",
             "opencode-go" | "go" => "https://opencode.ai/zen/go/v1",
             "openai" => "https://api.openai.com/v1",
@@ -75,8 +59,6 @@ impl OpenAiCompat {
         })
     }
 
-    /// List model ids from `{base_url}/models`. OpenAI-compatible gateways all
-    /// expose this, so it covers OpenAI/xAI/Groq/OpenAI Zen and local servers.
     pub async fn fetch_models(&self) -> Result<Vec<String>, ProviderError> {
         let url = format!("{}/models", self.base_url);
         let mut req = self.client.get(&url).timeout(std::time::Duration::from_secs(20));
@@ -107,7 +89,6 @@ impl OpenAiCompat {
     }
 }
 
-/// Build the JSON request body. Pure so it can be unit-tested.
 pub(crate) fn build_body(req: &ChatRequest, stream: bool) -> Value {
     let messages: Vec<Value> = req
         .messages
@@ -178,8 +159,6 @@ pub(crate) fn build_body(req: &ChatRequest, stream: bool) -> Value {
     body
 }
 
-/// Accumulates streamed deltas into a final assistant turn. Tool-call
-/// arguments arrive in fragments keyed by `index`.
 #[derive(Default)]
 pub(crate) struct StreamAccum {
     text: String,
@@ -188,8 +167,6 @@ pub(crate) struct StreamAccum {
 }
 
 impl StreamAccum {
-    /// Translate one SSE `data:` payload into neutral events and fold it into
-    /// the accumulator. Returns the events produced (may be empty).
     pub(crate) fn ingest(&mut self, data: &str, out: &mut Vec<ProviderEvent>) {
         if data == "[DONE]" {
             return;
@@ -333,7 +310,6 @@ impl Provider for OpenAiCompat {
                 }
             }
             let turn = acc.into_turn();
-            // Announce assembled tool calls once, after the stream ends.
             for call in &turn.tool_calls {
                 on_event(ProviderEvent::ToolCall(call.clone()));
             }
@@ -342,7 +318,6 @@ impl Provider for OpenAiCompat {
     }
 }
 
-/// A process-unique session id for gateways that require one.
 pub(crate) fn session_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -486,7 +461,6 @@ mod tests {
         assert_eq!(zen.base_url, "https://opencode.ai/zen/v1");
         let go = OpenAiCompat::preset("opencode-go", None).unwrap();
         assert_eq!(go.base_url, "https://opencode.ai/zen/go/v1");
-        // The zen gateways require a per-request session id.
         assert!(go.headers.iter().any(|(k, _)| k == "x-opencode-session"));
     }
 }

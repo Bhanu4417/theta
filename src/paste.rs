@@ -1,20 +1,10 @@
-//! Paste handling: collapse long pastes into placeholders (like the OpenCode
-//! TUI) and read text or images from the system clipboard.
-//!
-//! Long text and images are stored as [`PastePart`]s on the session; the input
-//! shows a short placeholder (`[Pasted ~42 lines]`, `[Image 1]`) and the real
-//! content is expanded/attached on submit.
-
 use crate::mentions::Attachment;
 
-/// Files above this many characters (or 3 lines) collapse to a placeholder.
 pub const LONG_PASTE_CHARS: usize = 150;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PasteContent {
-    /// Collapsed text, expanded back into the prompt on submit.
     Text(String),
-    /// An image/file attachment (data URL).
     File { mime: String, filename: String, url: String },
 }
 
@@ -24,19 +14,16 @@ pub struct PastePart {
     pub content: PasteContent,
 }
 
-/// True when pasted text is long enough to be collapsed.
 pub fn is_long(text: &str) -> bool {
     let lines = text.lines().count();
     lines >= 3 || text.chars().count() > LONG_PASTE_CHARS
 }
 
-/// `[Pasted ~N lines]`
 pub fn text_placeholder(text: &str) -> String {
     let lines = text.lines().count().max(1);
     format!("[Pasted ~{lines} lines]")
 }
 
-/// `[Image N]` / `[PDF N]`
 pub fn file_placeholder(index: usize, mime: &str) -> String {
     let kind = if mime == "application/pdf" {
         "PDF"
@@ -46,12 +33,10 @@ pub fn file_placeholder(index: usize, mime: &str) -> String {
     format!("[{kind} {index}]")
 }
 
-/// A `data:` URL for clipboard bytes (what OpenCode's file parts expect).
 pub fn data_url(mime: &str, bytes: &[u8]) -> String {
     format!("data:{mime};base64,{}", base64(bytes))
 }
 
-/// Replace every collapsed-text placeholder with its real content.
 pub fn expand(text: &str, parts: &[PastePart]) -> String {
     let mut out = text.to_string();
     for p in parts {
@@ -64,7 +49,6 @@ pub fn expand(text: &str, parts: &[PastePart]) -> String {
     out
 }
 
-/// File attachments whose placeholder appears in `text`.
 pub fn attachments(text: &str, parts: &[PastePart]) -> Vec<Attachment> {
     parts
         .iter()
@@ -96,9 +80,6 @@ fn base64(data: &[u8]) -> String {
     out
 }
 
-// ---------------------------------------------------------------------------
-// System clipboard
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Clipboard {
@@ -106,7 +87,6 @@ pub enum Clipboard {
     Image { mime: String, bytes: Vec<u8> },
 }
 
-/// Pick the first image MIME type offered by the clipboard.
 pub fn pick_image_mime(types: &[String]) -> Option<String> {
     types
         .iter()
@@ -114,8 +94,6 @@ pub fn pick_image_mime(types: &[String]) -> Option<String> {
         .cloned()
 }
 
-/// Read the system clipboard (Wayland `wl-paste`, falling back to `xclip`).
-/// Blocking — call from `spawn_blocking`.
 pub fn read_clipboard() -> Option<Clipboard> {
     if let Some(c) = read_wl_paste() {
         return Some(c);

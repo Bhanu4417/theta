@@ -1,5 +1,3 @@
-//! Root render: header, body (explorer + panes), status bar, overlays.
-
 pub mod conversation;
 pub mod explorer;
 pub mod overlays;
@@ -49,15 +47,12 @@ pub fn render(f: &mut ratatui::Frame, app: &mut App) {
                 }
             }
             _ => {
-                // Terminal too small for the full grid: keep the focused
-                // session usable.
                 app.too_small = true;
                 pane::render(f, app, body, app.focus, true);
             }
         }
     }
 
-    // Full-screen surfaces.
     if let Some(v) = &mut app.viewer {
         overlays::render_viewer(f, area, v);
     }
@@ -67,14 +62,12 @@ pub fn render(f: &mut ratatui::Frame, app: &mut App) {
         }
     }
 
-    // Modal overlays.
     match app.overlay {
         Overlay::Palette => overlays::render_palette(f, app, area),
         Overlay::NewSession => overlays::render_new_session(f, app, area),
         Overlay::Rename => overlays::render_rename(f, app, area),
         Overlay::ConfirmQuit => overlays::render_confirm_quit(f, app, area),
         Overlay::BusyChoice => {
-            // Anchor the mini-dialog just above the focused pane's input box.
             let anchor = app.focused().and_then(|sess| {
                 let rects = app.layout_rects(app.last_body_area)?;
                 let (_, pr) = rects.iter().find(|(sid, _)| *sid == sess.id)?;
@@ -94,8 +87,6 @@ pub fn render(f: &mut ratatui::Frame, app: &mut App) {
             overlays::render_busy_choice(f, app, area, anchor);
         }
         Overlay::Question => {
-            // The question is rendered inline in the session's chatbox
-            // (`ui::pane`); the overlay only routes keys to it.
         }
         Overlay::Keymap => overlays::render_keymap(f, app, area),
         Overlay::FileSearch => overlays::render_file_search(f, app, area),
@@ -122,7 +113,6 @@ pub fn render(f: &mut ratatui::Frame, app: &mut App) {
             overlays::render_theme_picker(f, app, area, anchor);
         }
         Overlay::ModelPicker | Overlay::AgentPicker => {
-            // Anchor the picker to the focused pane's chat box.
             let anchor = app.focused().and_then(|sess| {
                 let rects = app.layout_rects(app.last_body_area)?;
                 let (_, pr) = rects.iter().find(|(sid, _)| *sid == sess.id)?;

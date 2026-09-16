@@ -1,5 +1,3 @@
-//! Global keybindings: actions, key specs, defaults, persistence.
-
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -153,7 +151,6 @@ impl Action {
     }
 }
 
-/// A parsed key binding like `ctrl+shift+f`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeySpec {
     pub ctrl: bool,
@@ -174,7 +171,6 @@ impl KeySpec {
                 "ctrl" | "control" => ctrl = true,
                 "alt" => alt = true,
                 "shift" => shift = true,
-                k if k.is_empty() => return None,
                 k => key = k.to_string(),
             }
         }
@@ -199,7 +195,6 @@ impl KeySpec {
         s
     }
 
-    /// Human display: `^N`, `F1`, `Ctrl+Shift+F`, `Tab`.
     pub fn display(&self) -> String {
         if !self.ctrl && !self.alt && !self.shift {
             return match self.key.as_str() {
@@ -241,7 +236,6 @@ impl KeySpec {
         s
     }
 
-    /// Normalize a KeyEvent into a spec string (None = not bindable).
     pub fn spec_of(key: &KeyEvent) -> Option<String> {
         let (ctrl, alt, shift) = (
             key.modifiers.contains(KeyModifiers::CONTROL),
@@ -320,7 +314,6 @@ pub struct Keymap {
 }
 
 impl Keymap {
-    /// Defaults overridden by user config (`keys.action = "ctrl+x"`).
     pub fn load(overrides: &HashMap<String, String>) -> Self {
         let mut bindings: Vec<(Action, Option<KeySpec>)> = Vec::new();
         for (action, def) in default_bindings() {
@@ -330,7 +323,6 @@ impl Keymap {
         Self { bindings }
     }
 
-    /// The command bound to this key event, if any.
     pub fn action_for(&self, key: &KeyEvent) -> Option<Action> {
         let spec = KeySpec::spec_of(key)?;
         self.bindings
@@ -414,7 +406,6 @@ mod tests {
             )),
             Some(Action::ResizeUp)
         );
-        // Ctrl+O is no longer bound to Switch.
         assert_eq!(
             km.action_for(&ev(KeyCode::Char('o'), KeyModifiers::CONTROL)),
             None
