@@ -27,6 +27,30 @@ struct CachedModels {
 
 static CACHE_LOCK: Mutex<()> = Mutex::new(());
 
+/// How long a provider's model list is trusted before it is fetched again.
+///
+/// `fetched_ms` was recorded but never compared, so the cache was permanent: a
+/// provider that added a model would never have it appear. A day is short
+/// enough that new models show up on their own, long enough that boot does not
+/// wait on a network round-trip for every configured provider. An explicit
+/// refresh bypasses it entirely.
+const CACHE_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// The result of a discovery pass.
+pub struct DiscoveryReport {
+    pub entries: Vec<ModelEntry>,
+    /// Models seen for the first time in this pass, as (provider, model).
+    pub added: Vec<(String, String)>,
+}
+
+/// True when a cached entry is still fresh enough to trust.
+fn is_fresh(c: &CachedModels) -> bool {
+    if c.models.is_empty() || c.fetched_ms <= 0 {
+        return false;
+    }
+    now_ms().saturating_sub(c.fetched_ms) < CACHE_TTL_MS
+}
+
 fn cache_path() -> Option<PathBuf> {
     dirs::cache_dir().map(|d| d.join("theta").join("models.json"))
 }
@@ -169,11 +193,13 @@ async fn models_for(
     key: Option<String>,
     cache: &mut ModelCache,
     dirty: &mut bool,
+    added: &mut Vec<(String, String)>,
+    force: bool,
 ) -> Vec<String> {
     let fp = key_fingerprint(key.as_deref());
     let cached = cache.providers.get(id).cloned();
     if let Some(c) = &cached {
-        if c.key_fp == fp && !c.models.is_empty() {
+        if c.key_fp == fp && is_fresh(c) && !force {
             return c.models.clone();
         }
     }
@@ -182,6 +208,22 @@ async fn models_for(
     };
     match provider.list_models().await {
         Ok(models) if !models.is_empty() => {
+            // Anything not in the previous list is new to this install; the
+            // caller turns that into a notice. A first fetch is not an
+            // addition, or every cold start would announce the whole catalog.
+            if let Some(prev) = &cached {
+                // Only compare against a properly stamped entry. A cache
+                // written before `fetched_ms` was recorded (or by an older
+                // version) has 0, and treating that as a baseline would
+                // announce the entire catalog as newly added on first run.
+                if prev.key_fp == fp && prev.fetched_ms > 0 {
+                    for m in &models {
+                        if !prev.models.contains(m) {
+                            added.push((id.to_string(), m.clone()));
+                        }
+                    }
+                }
+            }
             cache.providers.insert(
                 id.to_string(),
                 CachedModels { fetched_ms: now_ms(), key_fp: fp, models: models.clone() },
@@ -193,11 +235,15 @@ async fn models_for(
     }
 }
 
-pub async fn discover_models(cfg: &Config) -> Vec<ModelEntry> {
+/// Discover every configured provider's models.
+///
+/// `force` ignores the cache age, for an explicit user refresh.
+pub async fn discover_models_report(cfg: &Config, force: bool) -> DiscoveryReport {
     let catalog = Catalog::builtin();
     let creds = Credentials::load();
     let mut cache = load_cache();
     let mut dirty = false;
+    let mut added: Vec<(String, String)> = Vec::new();
 
     let mut entries: Vec<ModelEntry> = Vec::new();
     let mut seen: HashSet<(String, String)> = HashSet::new();
@@ -215,7 +261,8 @@ pub async fn discover_models(cfg: &Config) -> Vec<ModelEntry> {
     };
 
     for (id, base, key) in providers_to_query(cfg, &creds) {
-        let mut models = models_for(&id, &base, key, &mut cache, &mut dirty).await;
+        let mut models =
+            models_for(&id, &base, key, &mut cache, &mut dirty, &mut added, force).await;
         if models.is_empty() {
             models = catalog
                 .models()
@@ -233,7 +280,15 @@ pub async fn discover_models(cfg: &Config) -> Vec<ModelEntry> {
         save_cache(&cache);
     }
 
-    entries
+    // A provider may report the same new model under more than one id.
+    let mut seen_added = HashSet::new();
+    added.retain(|(p, m)| seen_added.insert((p.clone(), m.clone())));
+
+    DiscoveryReport { entries, added }
+}
+
+pub async fn discover_models(cfg: &Config) -> Vec<ModelEntry> {
+    discover_models_report(cfg, false).await.entries
 }
 
 #[cfg(test)]
@@ -314,16 +369,28 @@ mod tests {
         cache.providers.insert(
             "acme".into(),
             CachedModels {
-                fetched_ms: 1,
+                // Fresh, so the TTL does not force a refetch: this test is
+                // about a cache hit, not about expiry.
+                fetched_ms: now_ms(),
                 key_fp: key_fingerprint(key.as_deref()),
                 models: vec!["m1".into(), "m2".into()],
             },
         );
         let mut dirty = false;
-        let models =
-            models_for("acme", "http://127.0.0.1:1/v1", key, &mut cache, &mut dirty).await;
+        let mut added = Vec::new();
+        let models = models_for(
+            "acme",
+            "http://127.0.0.1:1/v1",
+            key,
+            &mut cache,
+            &mut dirty,
+            &mut added,
+            false,
+        )
+        .await;
         assert_eq!(models, vec!["m1".to_string(), "m2".to_string()]);
         assert!(!dirty, "cache hit must not rewrite the cache");
+        assert!(added.is_empty(), "a fresh cache hit reports no additions");
     }
 
     #[test]
@@ -336,4 +403,122 @@ mod tests {
         assert_eq!(custom.1, "https://gateway.test/v1");
         assert_eq!(custom.2.as_deref(), Some("k"));
     }
+
+    #[test]
+    fn a_stale_cache_entry_is_refetched() {
+        // The bug: fetched_ms was written but never read, so a provider that
+        // added a model never had it appear.
+        let now = now_ms();
+        let fresh = CachedModels {
+            fetched_ms: now - 60_000,
+            key_fp: "fp".into(),
+            models: vec!["a".into()],
+        };
+        assert!(is_fresh(&fresh), "a minute old is still good");
+
+        let stale = CachedModels {
+            fetched_ms: now - CACHE_TTL_MS - 1,
+            key_fp: "fp".into(),
+            models: vec!["a".into()],
+        };
+        assert!(!is_fresh(&stale), "past the TTL it must be refetched");
+    }
+
+    #[test]
+    fn an_empty_or_unstamped_entry_is_never_fresh() {
+        // Guards the upgrade path: caches written before fetched_ms existed
+        // deserialize to 0 and must be refetched, not trusted forever.
+        assert!(!is_fresh(&CachedModels {
+            fetched_ms: 0,
+            key_fp: "fp".into(),
+            models: vec!["a".into()],
+        }));
+        assert!(!is_fresh(&CachedModels {
+            fetched_ms: now_ms(),
+            key_fp: "fp".into(),
+            models: Vec::new(),
+        }));
+    }
+
+
+    #[tokio::test]
+    async fn a_stale_entry_is_refetched_even_with_bad_keys() {
+        // The bug this guards: fetched_ms was recorded and never compared, so
+        // the list was frozen forever and a new model could not appear. With a
+        // stale entry the provider is consulted again — here it fails
+        // (nothing listens on that port), and the cached list is the fallback.
+        let key = Some("sk-test".to_string());
+        let mut cache = ModelCache::default();
+        cache.providers.insert(
+            "acme".into(),
+            CachedModels {
+                fetched_ms: now_ms() - CACHE_TTL_MS - 1,
+                key_fp: key_fingerprint(key.as_deref()),
+                models: vec!["m1".into()],
+            },
+        );
+        let mut dirty = false;
+        let mut added = Vec::new();
+        let models = models_for(
+            "acme",
+            "http://127.0.0.1:1/v1",
+            key,
+            &mut cache,
+            &mut dirty,
+            &mut added,
+            false,
+        )
+        .await;
+        assert_eq!(models, vec!["m1".to_string()], "falls back to the cache on failure");
+    }
+
+    #[tokio::test]
+    async fn force_ignores_a_fresh_cache() {
+        // An explicit refresh must actually reach the provider, even when the
+        // cache is still within its TTL.
+        let key = Some("sk-test".to_string());
+        let mut cache = ModelCache::default();
+        cache.providers.insert(
+            "acme".into(),
+            CachedModels {
+                fetched_ms: now_ms(),
+                key_fp: key_fingerprint(key.as_deref()),
+                models: vec!["m1".into()],
+            },
+        );
+        let mut dirty = false;
+        let mut added = Vec::new();
+        let models = models_for(
+            "acme",
+            "http://127.0.0.1:1/v1",
+            key,
+            &mut cache,
+            &mut dirty,
+            &mut added,
+            true,
+        )
+        .await;
+        // The fetch fails, so the fallback is the cached list — but the point
+        // is that it tried rather than short-circuiting on the cache.
+        assert_eq!(models, vec!["m1".to_string()]);
+    }
+
+
+    #[test]
+    fn an_unstamped_cache_does_not_look_like_everything_is_new() {
+        // Upgrade path: a cache from before `fetched_ms` existed has 0. It must
+        // be refetched, but must not be treated as a baseline for comparisons,
+        // or the first run would announce the whole catalog as new.
+        let unstamped = CachedModels {
+            fetched_ms: 0,
+            key_fp: "fp".into(),
+            models: vec!["a".into()],
+        };
+        assert!(!is_fresh(&unstamped), "unstamped must be refetched");
+        assert!(
+            unstamped.fetched_ms == 0,
+            "and is excluded from addition reporting by that same zero"
+        );
+    }
+
 }

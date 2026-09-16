@@ -183,7 +183,14 @@ impl Manager {
                 provider_id: cfg.ai.provider.clone(),
                 model_id: cfg.ai.model.clone(),
             }));
-            m.emit(AppEvent::ProvidersListed { dir: dir_c.clone(), providers, default });
+            m.emit(AppEvent::ProvidersListed {
+                dir: dir_c.clone(),
+                providers,
+                default,
+                // The instant catalog shown before the live fetch; additions are
+                // reported by the discovery pass below.
+                added: Vec::new(),
+            });
             m.emit(AppEvent::AgentsListed {
                 dir: dir_c.clone(),
                 agents: crate::agent::agents::names()
@@ -191,14 +198,15 @@ impl Manager {
                     .map(|(name, description)| crate::models::AgentInfo { name, description })
                     .collect(),
             });
-            let live = crate::ai::discovery::discover_models(&cfg).await;
+            let report = crate::ai::discovery::discover_models_report(&cfg, false).await;
             m.emit(AppEvent::ProvidersListed {
                 dir: dir_c,
-                providers: live,
+                providers: report.entries,
                 default: Some(model.clone().unwrap_or(ModelRef {
                     provider_id: cfg.ai.provider.clone(),
                     model_id: cfg.ai.model.clone(),
                 })),
+                added: report.added,
             });
             let _ = history_limit;
         });
@@ -337,12 +345,17 @@ impl Manager {
         tokio::spawn(async move {
             let dir_c = dir.canonicalize().unwrap_or_else(|_| dir.clone());
             let cfg = m.cfg();
-            let providers = crate::ai::discovery::discover_models(&cfg).await;
+            let report = crate::ai::discovery::discover_models_report(&cfg, true).await;
             let default = Some(ModelRef {
                 provider_id: cfg.ai.provider.clone(),
                 model_id: cfg.ai.model.clone(),
             });
-            m.emit(AppEvent::ProvidersListed { dir: dir_c, providers, default });
+            m.emit(AppEvent::ProvidersListed {
+                dir: dir_c,
+                providers: report.entries,
+                default,
+                added: report.added,
+            });
         });
     }
 

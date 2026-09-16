@@ -79,7 +79,7 @@ pub fn render(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
         ));
     }
 
-    if let Some((msg, _)) = &app.flash {
+    if let Some((msg, _, _)) = &app.flash {
         sep(&mut left);
         left.push(Span::styled(
             msg.clone(),

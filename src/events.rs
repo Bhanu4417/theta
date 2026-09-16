@@ -45,6 +45,11 @@ pub enum AppEvent {
         dir: PathBuf,
         providers: Vec<ModelEntry>,
         default: Option<ModelRef>,
+        /// Models a provider has added since this install last looked, as
+        /// (provider, model). Emitted so the UI can say so rather than
+        /// silently growing the list.
+        #[allow(dead_code)]
+        added: Vec<(String, String)>,
     },
 
     FilesFound {

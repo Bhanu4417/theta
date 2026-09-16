@@ -412,7 +412,7 @@ pub struct App {
     pub next_task: u64,
     pub manager: Manager,
     pub initial_dir: PathBuf,
-    pub flash: Option<(String, Instant)>,
+    pub flash: Option<(String, Instant, Duration)>,
     pub last_newline: Option<Instant>,
     pub notifications: NotificationPolicy,
     pub tick: u64,
@@ -611,8 +611,38 @@ impl App {
             .count()
     }
 
+    /// Notice for models a provider added since this install last looked.
+    /// One is named directly; several are summarized, because a flash is a
+    /// single short line.
+    fn added_models_message(added: &[(String, String)]) -> String {
+        match added {
+            [] => String::new(),
+            [(provider, model)] => {
+                format!("{model} was added by {provider} — /model to use it")
+            }
+            [(provider, model), rest @ ..] => {
+                format!(
+                    "{model} was added by {provider} (+{} more) — /model to see them",
+                    rest.len()
+                )
+            }
+        }
+    }
+
+    /// A short, transient notice.
     pub fn flash(&mut self, msg: impl Into<String>) {
-        self.flash = Some((msg.into(), Instant::now()));
+        self.flash_for(msg, Duration::from_secs(3));
+    }
+
+    /// A notice that stays up longer. Used for things the user did not do
+    /// deliberately and might otherwise miss, such as a provider adding models
+    /// while the app was starting.
+    pub fn flash_long(&mut self, msg: impl Into<String>) {
+        self.flash_for(msg, Duration::from_secs(10));
+    }
+
+    fn flash_for(&mut self, msg: impl Into<String>, for_: Duration) {
+        self.flash = Some((msg.into(), Instant::now(), for_));
         self.dirty = true;
     }
 
@@ -4700,10 +4730,19 @@ impl App {
             }
             AppEvent::Aborted { .. } => {}
             AppEvent::ProvidersListed {
-                providers, default, ..
+                providers,
+                default,
+                added,
+                ..
             } => {
                 self.providers = providers;
                 self.default_model = default;
+                // A provider adding models should be visible, not a list that
+                // quietly grew. Named, so it is obvious where they came from.
+                if !added.is_empty() {
+                    crate::tlog!("MODELS {added:?}");
+                    self.flash_long(Self::added_models_message(&added));
+                }
             }
             AppEvent::FilesFound { req, paths } => {
                 if self.file_search.req == Some(req) {
@@ -5250,8 +5289,8 @@ impl App {
             self.tick = self.tick.wrapping_add(1);
         }
 
-        if let Some((_, at)) = self.flash {
-            if at.elapsed() > Duration::from_secs(3) {
+        if let Some((_, at, for_)) = self.flash {
+            if at.elapsed() > for_ {
                 self.flash = None;
                 self.dirty = true;
             }
@@ -5800,6 +5839,40 @@ mod login_tests {
 
         assert!(app.login_ui.input.text().is_empty());
         assert_eq!(app.session(10).expect("session").input.text(), "");
+    }
+
+    #[test]
+    fn a_new_model_is_announced_with_its_provider() {
+        // A provider adding models should be visible, not a list that quietly
+        // grew.
+        let one = App::added_models_message(&[("opencode-go".into(), "deepseek-v5".into())]);
+        assert!(one.contains("deepseek-v5"), "{one}");
+        assert!(one.contains("opencode-go"), "must name the provider: {one}");
+        assert!(one.contains("/model"), "must say how to use it: {one}");
+
+        // Several are summarized: a flash is one short line.
+        let many = App::added_models_message(&[
+            ("openai".into(), "gpt-5.7".into()),
+            ("openai".into(), "gpt-5.8".into()),
+            ("groq".into(), "llama-4".into()),
+        ]);
+        assert!(many.contains("gpt-5.7") && many.contains("openai"), "{many}");
+        assert!(many.contains("+2 more"), "the rest are counted: {many}");
+
+        assert!(App::added_models_message(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_flash_expires_but_a_long_one_stays_up_longer() {
+        let mut app = test_app();
+        app.flash("copied");
+        let short = app.flash.as_ref().map(|(_, _, d)| *d).unwrap();
+        app.flash_long("models added");
+        let long = app.flash.as_ref().map(|(_, _, d)| *d).unwrap();
+        assert!(
+            long > short,
+            "an announcement nobody asked for must outlast a transient notice"
+        );
     }
 }
 
