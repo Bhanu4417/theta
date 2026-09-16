@@ -179,6 +179,28 @@ first-class nodes that rebuild the model context.
 
 Sessions persist to `~/.local/share/theta/sessions/<id>.jsonl`.
 
+### Keeping long sessions affordable
+
+Every request re-sends the conversation, so anything left in context is paid
+for on **every following turn**. Tool output is the usual culprit — a single
+`cargo build` or `webfetch` can be tens of thousands of tokens.
+
+Theta keeps a **rolling window of recent tool output** (40k tokens by default).
+Older output is replaced by a one-line stand-in before the request goes out, so
+the model is never charged for it again. The current turn and the one before it
+are always left intact, and the message itself stays in place — only its bulk is
+elided — so the conversation remains valid for strict providers.
+
+This costs nothing: there is no model call involved, and it usually means a
+session never needs summarizing at all. When the prompt genuinely outgrows the
+window, Theta summarizes; if a provider still rejects a request as too large,
+Theta compacts and retries rather than failing the turn.
+
+The trade-off is honest: **old tool output is gone from the model's context.**
+If it needed a value from a command it ran twenty turns ago, it will re-run it.
+Your transcript on disk keeps everything. Tune it with
+`[compaction] prune`, `prune_protect_tokens` and `prune_minimum_tokens`.
+
 ## Configuration
 
 `~/.config/theta/config.toml` is written with defaults on first run.
@@ -198,7 +220,10 @@ reasoning_effort = ""           # minimal | low | medium | high
 [compaction]
 enabled = true
 reserve_tokens = 16384          # headroom left for the reply
-keep_recent_tokens = 20000      # kept verbatim; the rest is summarized
+keep_recent_tokens = 0          # 0 = adapt to the model's window
+prune = true                    # roll old tool output out of the prompt
+prune_protect_tokens = 40000    # recent tool output kept verbatim
+prune_minimum_tokens = 20000    # only prune once this much would be freed
 model = ""                      # optional cheap model for summaries
 
 [ui]

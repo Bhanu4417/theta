@@ -29,6 +29,7 @@ pub struct AgentLoop {
     reasoning_effort: Option<String>,
     max_turns: usize,
     compaction: context::CompactionSettings,
+    prune: context::PruneSettings,
     compaction_enabled: bool,
     compaction_provider: Option<Box<dyn Provider>>,
     compaction_model: Option<String>,
@@ -50,6 +51,7 @@ impl AgentLoop {
             reasoning_effort: None,
             max_turns: 0,
             compaction: context::CompactionSettings::default(),
+            prune: context::PruneSettings::default(),
             compaction_enabled: true,
             compaction_provider: None,
             compaction_model: None,
@@ -89,6 +91,22 @@ impl AgentLoop {
     pub fn with_extra_tool(mut self, tool: Arc<dyn Tool>) -> Self {
         self.tools.push(tool);
         self
+    }
+
+    /// Configure the rolling window of recent tool output kept in the prompt.
+    pub fn with_prune(mut self, settings: context::PruneSettings) -> Self {
+        self.prune = settings;
+        self
+    }
+
+    /// Compaction settings for this model, with the recent-token budget
+    /// resolved: an explicit `keep_recent_tokens` wins, otherwise it adapts to
+    /// the model's window.
+    fn compaction_settings(&self) -> context::CompactionSettings {
+        let limit = self.catalog.context_limit(&self.model);
+        let mut s = self.compaction;
+        s.keep_recent_tokens = context::effective_keep_recent(limit, &self.compaction);
+        s
     }
 
     pub fn with_retry(mut self, max_retries: u32, base_ms: u64) -> Self {
@@ -230,10 +248,36 @@ impl AgentLoop {
                 return Ok(());
             }
             let limit = self.catalog.context_limit(&self.model);
-            let context_tokens = context::estimate_context_tokens(history);
-            if self.compaction_enabled && context::should_compact(context_tokens, limit, &self.compaction)
+
+            // Roll old tool output out of the prompt first: it costs no model
+            // call, and it recovers the bulk of the context in a session that
+            // has run a lot of commands. Doing it before compaction also means
+            // many sessions never need summarizing at all.
+            let pruned = context::prune_tool_outputs(history, &self.prune);
+            if pruned.did_something() {
+                crate::tlog!(
+                    "PRUNE dropped {} tokens across {} tool result(s)",
+                    pruned.pruned_tokens,
+                    pruned.messages
+                );
+                emit(HarnessEvent::ContextPruned {
+                    tokens: pruned.pruned_tokens,
+                    messages: pruned.messages,
+                });
+            }
+
+            // The last recorded usage predates this prune, so it would
+            // overstate the prompt about to be sent and could trigger a
+            // needless (and expensive) compaction. Recompute from content.
+            let context_tokens = if pruned.did_something() {
+                context::total_tokens(history)
+            } else {
+                context::estimate_context_tokens(history)
+            };
+            let settings = self.compaction_settings();
+            if self.compaction_enabled && context::should_compact(context_tokens, limit, &settings)
             {
-                if let Some(prep) = context::prepare(history, &self.compaction) {
+                if let Some(prep) = context::prepare(history, &settings) {
                     emit(HarnessEvent::CompactionStarted);
                     match self.summarize_prep(&prep).await {
                         Some(summary) => {
@@ -275,6 +319,9 @@ impl AgentLoop {
                 request.tools.len()
             );
             let started = std::time::Instant::now();
+            // Set when the provider rejects the prompt as too large. The turn
+            // loop then compacts and retries rather than failing the turn.
+            let mut overflowed = false;
             let turn_result = {
                 let mut attempt = 0u32;
                 loop {
@@ -344,7 +391,7 @@ impl AgentLoop {
                                     Some(now_ms()),
                                 ));
                             }
-                            break turn;
+                            break Some(turn);
                         }
                         Err(e) => {
                             if attempt < self.max_retries && is_retryable(&e) {
@@ -365,9 +412,49 @@ impl AgentLoop {
                                 request.model,
                                 request.messages.len()
                             );
+                            // Retrying verbatim cannot help: the prompt is too
+                            // large. The turn loop compacts and tries again.
+                            if self.compaction_enabled && crate::ai::is_context_overflow_error(&e) {
+                                crate::tlog!("OVERFLOW compacting and retrying");
+                                overflowed = true;
+                                break None;
+                            }
                             return Err(e);
                         }
                     }
+                }
+            };
+
+            // Reclaim context and retry the same iteration.
+            if overflowed {
+                emit(HarnessEvent::SessionError(
+                    "prompt hit the model's context limit; compacting and retrying".into(),
+                ));
+                let settings = self.compaction_settings();
+                if let Some(prep) = context::prepare(history, &settings) {
+                    emit(HarnessEvent::CompactionStarted);
+                    if let Some(summary) = self.summarize_prep(&prep).await {
+                        context::apply_summary(history, prep.first_kept, &summary);
+                        emit(HarnessEvent::CompactionFinished {
+                            tokens_before: prep.tokens_before,
+                        });
+                        emit(part_compaction(prep.tokens_before));
+                        continue;
+                    }
+                }
+                // Nothing left to compact: give up rather than loop forever.
+                emit(HarnessEvent::SessionError(
+                    "context overflow, and nothing further to compact".into(),
+                ));
+                emit(HarnessEvent::SessionIdle);
+                return Ok(());
+            }
+
+            let turn_result = match turn_result {
+                Some(t) => t,
+                None => {
+                    emit(HarnessEvent::SessionIdle);
+                    return Ok(());
                 }
             };
 
@@ -550,7 +637,8 @@ impl AgentLoop {
         &self,
         messages: &mut Vec<ChatMessage>,
     ) -> Option<(String, u64, Vec<ChatMessage>)> {
-        let prep = context::prepare(messages, &self.compaction)?;
+        let settings = self.compaction_settings();
+        let prep = context::prepare(messages, &settings)?;
         let tail = messages[prep.first_kept..].to_vec();
         let summary = self.summarize_prep(&prep).await?;
         context::apply_summary(messages, prep.first_kept, &summary);

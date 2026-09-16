@@ -5010,6 +5010,8 @@ impl App {
                 let has_queue = !self.sessions[idx].queue.is_empty();
                 {
                     let s = &mut self.sessions[idx];
+                    // The prune note describes the turn that just finished.
+                    s.last_prune = None;
                     if !matches!(
                         s.status,
                         SessStatus::Error(_) | SessStatus::Permission | SessStatus::Question
@@ -5122,6 +5124,16 @@ impl App {
                         );
                     }
                 }
+            }
+            HarnessEvent::ContextPruned { tokens, messages } => {
+                // Quiet: no status change, so the turn keeps running. The log
+                // line is what makes it visible (and auditable in /logs).
+                crate::tlog!(
+                    "PRUNE session={sid} freed {tokens} tokens from {messages} tool result(s)"
+                );
+                let s = &mut self.sessions[idx];
+                s.last_prune = Some((tokens, messages));
+                s.dirty = true;
             }
             HarnessEvent::CompactionStarted => {
                 let s = &mut self.sessions[idx];

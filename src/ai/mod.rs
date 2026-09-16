@@ -222,6 +222,28 @@ pub fn provider_for_model(
     provider_for(provider_id, base_url, key)
 }
 
+/// True when a failure is the prompt exceeding the model's context window.
+///
+/// Providers report this as a 400 with assorted wording, so match on the
+/// message rather than a status code. Recovering beats surfacing it: the
+/// caller can compact and try again.
+pub fn is_context_overflow_error(e: &ProviderError) -> bool {
+    let text = match e {
+        ProviderError::Protocol(m) | ProviderError::Transport(m) => m.clone(),
+        ProviderError::Auth(m) => m.clone(),
+        ProviderError::Unsupported(m) => m.clone(),
+        _ => return false,
+    };
+    let m = text.to_ascii_lowercase();
+    m.contains("context length")
+        || m.contains("context_length")
+        || m.contains("maximum context")
+        || m.contains("context window")
+        || m.contains("too many tokens")
+        || m.contains("prompt is too long")
+        || m.contains("reduce the length")
+}
+
 pub fn is_retryable_provider_error(e: &ProviderError) -> bool {
     match e {
         ProviderError::Transport(_) | ProviderError::Unavailable(_) => true,

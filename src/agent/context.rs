@@ -10,9 +10,53 @@ pub const SUMMARY_CLOSE: &str = "</conversation-summary>";
 
 pub const TOOL_RESULT_MAX_CHARS: usize = 2000;
 
+/// Prefix of the stand-in left behind where tool output was pruned. Doubles as
+/// the "already pruned" marker, which keeps [`prune_tool_outputs`] idempotent.
+pub const PRUNED_MARKER: &str = "[output pruned:";
+
+/// How much recent tool output is kept verbatim, and how much must be freed
+/// before pruning is worth doing at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PruneSettings {
+    pub enabled: bool,
+    /// Walking back from the newest message, tool output within this budget is
+    /// kept. Everything older is a prune candidate.
+    pub protect_tokens: u64,
+    /// Candidates are only pruned once they would free at least this much —
+    /// rewriting a few hundred tokens is not worth the churn.
+    pub minimum_tokens: u64,
+}
+
+impl Default for PruneSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            protect_tokens: 40_000,
+            minimum_tokens: 20_000,
+        }
+    }
+}
+
+/// What one prune pass removed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PruneReport {
+    /// Tokens freed.
+    pub pruned_tokens: u64,
+    /// Messages rewritten.
+    pub messages: usize,
+}
+
+impl PruneReport {
+    pub fn did_something(&self) -> bool {
+        self.messages > 0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactionSettings {
     pub reserve_tokens: u64,
+    /// Recent tokens kept verbatim across a compaction. `0` means adapt to the
+    /// model's window.
     pub keep_recent_tokens: u64,
     pub tool_result_cap: usize,
 }
@@ -21,10 +65,27 @@ impl Default for CompactionSettings {
     fn default() -> Self {
         Self {
             reserve_tokens: 16_384,
-            keep_recent_tokens: 20_000,
+            keep_recent_tokens: 0,
             tool_result_cap: TOOL_RESULT_MAX_CHARS,
         }
     }
+}
+
+/// Floor and ceiling for the adaptive keep budget, mirroring OpenCode's
+/// `clamp(threshold / 4, 2000, 15000)`.
+pub const KEEP_RECENT_MIN: u64 = 2_000;
+pub const KEEP_RECENT_MAX: u64 = 15_000;
+
+/// Recent tokens to keep verbatim. An explicit `keep_recent_tokens` wins;
+/// otherwise take a quarter of the usable window, clamped. A fixed budget is a
+/// poor fit for every model — 20k is most of a small window and a rounding
+/// error on a huge one.
+pub fn effective_keep_recent(context_window: u64, s: &CompactionSettings) -> u64 {
+    if s.keep_recent_tokens > 0 {
+        return s.keep_recent_tokens;
+    }
+    let usable = context_window.saturating_sub(s.reserve_tokens);
+    (usable / 4).clamp(KEEP_RECENT_MIN, KEEP_RECENT_MAX)
 }
 
 pub type ModelOverrides = HashMap<String, (Option<u64>, Option<u64>)>;
@@ -85,6 +146,79 @@ pub fn should_compact(context_tokens: u64, context_window: u64, s: &CompactionSe
         return false;
     }
     context_tokens > context_window.saturating_sub(s.reserve_tokens)
+}
+
+/// Replace the bulk of old tool output with a short stand-in.
+///
+/// Tool output is what makes a long session expensive: one `cargo build` or
+/// `webfetch` can be tens of thousands of tokens, and every later request
+/// re-sends it. This keeps a rolling window of the most recent output —
+/// `protect_tokens` worth, counting back from the newest message — and elides
+/// everything older.
+///
+/// The current turn is always protected: its output is what the model is
+/// actively reasoning about. Pruning stops at the most recent compaction
+/// boundary, since a summary already stands in for that history.
+///
+/// The message itself is kept and only its `text` is replaced, because a
+/// provider rejects an assistant `tool_calls` entry with no matching tool
+/// result. Pruned output is reported so the caller can log what it freed.
+pub fn prune_tool_outputs(messages: &mut [ChatMessage], s: &PruneSettings) -> PruneReport {
+    if !s.enabled || messages.is_empty() {
+        return PruneReport::default();
+    }
+
+    let mut total = 0u64;
+    let mut prunable = 0u64;
+    let mut candidates: Vec<usize> = Vec::new();
+    let mut user_turns = 0usize;
+
+    for i in (0..messages.len()).rev() {
+        let m = &messages[i];
+        if m.role == Role::User {
+            user_turns += 1;
+        }
+        if user_turns < 2 {
+            continue;
+        }
+        if is_summary(m) {
+            break;
+        }
+        if m.role != Role::Tool {
+            continue;
+        }
+        let text = m.text.trim_start();
+        if text.starts_with(PRUNED_MARKER) {
+            continue;
+        }
+        let t = message_tokens(m);
+        total = total.saturating_add(t);
+        if total <= s.protect_tokens {
+            continue;
+        }
+        prunable = prunable.saturating_add(t);
+        candidates.push(i);
+    }
+
+    if prunable < s.minimum_tokens {
+        return PruneReport::default();
+    }
+
+    let mut freed = 0u64;
+    for &i in &candidates {
+        let t = message_tokens(&messages[i]);
+        messages[i].text = pruned_placeholder(t);
+        freed = freed.saturating_add(t);
+    }
+    PruneReport { pruned_tokens: freed, messages: candidates.len() }
+}
+
+/// Replace the stand-in text left where output was pruned.
+fn pruned_placeholder(tokens: u64) -> String {
+    format!(
+        "{PRUNED_MARKER} {tokens} tokens elided to save context. \
+         Re-run the command if the output is needed again.]"
+    )
 }
 
 
@@ -285,6 +419,7 @@ fn truncate_for_summary(text: &str, max: usize) -> String {
     let head: String = text.chars().take(max).collect();
     format!("{head}\n\n[... {truncated} more characters truncated]")
 }
+
 
 pub fn serialize_conversation(messages: &[ChatMessage], tool_result_cap: usize) -> String {
     let mut parts: Vec<String> = Vec::new();
@@ -738,6 +873,144 @@ mod tests {
         assert!(text.contains("s19"));
         assert!(!text.contains("s0"));
         assert!(branch_summary_input(&[], 500, 2000).is_none());
+    }
+
+
+    fn tool_out(id: &str, size: usize) -> ChatMessage {
+        ChatMessage::tool_result(id, "z".repeat(size))
+    }
+
+    #[test]
+    fn prune_elides_old_tool_output_but_keeps_recent() {
+        let mut msgs = vec![ChatMessage::system("sys")];
+        // Four past turns, each with a big tool result.
+        for i in 0..4 {
+            msgs.push(user(&format!("turn {i}")));
+            msgs.push(tool_out(&format!("t{i}"), 40_000));
+        }
+        // A fifth, in-flight turn: its output must survive.
+        msgs.push(user("current turn"));
+        msgs.push(tool_out("t-live", 40_000));
+
+        let s = PruneSettings { enabled: true, protect_tokens: 20_000, minimum_tokens: 1_000 };
+        let report = prune_tool_outputs(&mut msgs, &s);
+
+        assert!(report.did_something());
+        assert!(report.pruned_tokens > 0);
+        // Oldest output is gone...
+        assert!(msgs.iter().any(|m| m.text.starts_with(PRUNED_MARKER)));
+        assert!(!msgs.iter().any(|m| m.text.contains(&"z".repeat(1000)) && m.text.starts_with(PRUNED_MARKER)));
+        // ...and the current turn's output is untouched.
+        let live = msgs
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("t-live"))
+            .unwrap();
+        assert!(!live.text.starts_with(PRUNED_MARKER), "current turn is protected");
+        assert_eq!(live.text.len(), 40_000);
+    }
+
+    #[test]
+    fn prune_is_a_no_op_below_the_minimum() {
+        let mut msgs = vec![ChatMessage::system("sys")];
+        for i in 0..3 {
+            msgs.push(user(&format!("t{i}")));
+            msgs.push(tool_out(&format!("c{i}"), 400));
+        }
+        msgs.push(user("live"));
+        msgs.push(tool_out("live", 400));
+        let before = msgs.clone();
+        // Tiny outputs: nothing worth rewriting.
+        let s = PruneSettings { enabled: true, protect_tokens: 10, minimum_tokens: 20_000 };
+        let report = prune_tool_outputs(&mut msgs, &s);
+        assert_eq!(report, PruneReport::default());
+        assert_eq!(msgs, before);
+    }
+
+    #[test]
+    fn prune_respects_the_protect_budget() {
+        let mut msgs = vec![ChatMessage::system("sys")];
+        msgs.push(user("old"));
+        msgs.push(tool_out("old", 40_000));
+        msgs.push(user("recent"));
+        msgs.push(tool_out("recent", 4_000));
+        // A generous budget covers everything, so nothing is pruned even
+        // though the minimum is met by the oldest result.
+        let s = PruneSettings { enabled: true, protect_tokens: 1_000_000, minimum_tokens: 1 };
+        assert_eq!(prune_tool_outputs(&mut msgs, &s), PruneReport::default());
+        assert!(!msgs.iter().any(|m| m.text.starts_with(PRUNED_MARKER)));
+    }
+
+    #[test]
+    fn pruning_is_idempotent_and_keeps_tool_ids() {
+        let mut msgs = vec![ChatMessage::system("sys")];
+        for i in 0..4 {
+            msgs.push(user(&format!("t{i}")));
+            msgs.push(tool_out(&format!("c{i}"), 40_000));
+        }
+        msgs.push(user("live"));
+        msgs.push(tool_out("live", 40_000));
+        let s = PruneSettings { enabled: true, protect_tokens: 20_000, minimum_tokens: 1_000 };
+
+        let first = prune_tool_outputs(&mut msgs, &s);
+        assert!(first.did_something());
+        // Every pruned message still answers its call, so the request stays
+        // valid for strict providers.
+        for m in msgs.iter().filter(|m| m.role == Role::Tool) {
+            assert!(m.tool_call_id.is_some(), "a tool result must keep its call id");
+        }
+        // Already-pruned text is not offered as a candidate again.
+        let second = prune_tool_outputs(&mut msgs, &s);
+        assert_eq!(second.pruned_tokens, 0);
+    }
+
+    #[test]
+    fn prune_stops_at_a_compaction_boundary() {
+        let mut msgs = vec![ChatMessage::system("sys")];
+        msgs.push(user("ancient"));
+        msgs.push(tool_out("ancient", 40_000));
+        // A summary stands in for everything above it.
+        msgs.push(ChatMessage::system(format!("{SUMMARY_OPEN}\nSUM\n{SUMMARY_CLOSE}")));
+        for i in 0..4 {
+            msgs.push(user(&format!("t{i}")));
+            msgs.push(tool_out(&format!("c{i}"), 40_000));
+        }
+        msgs.push(user("live"));
+        msgs.push(tool_out("live", 40_000));
+        let s = PruneSettings { enabled: true, protect_tokens: 20_000, minimum_tokens: 1_000 };
+        prune_tool_outputs(&mut msgs, &s);
+        let above = msgs
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("ancient"))
+            .unwrap();
+        assert!(
+            !above.text.starts_with(PRUNED_MARKER),
+            "history above a summary is already accounted for"
+        );
+    }
+
+    #[test]
+    fn prune_can_be_disabled() {
+        let mut msgs = vec![ChatMessage::system("sys"), user("a")];
+        msgs.push(tool_out("big", 40_000));
+        msgs.push(user("b"));
+        msgs.push(tool_out("big2", 40_000));
+        let before = msgs.clone();
+        let s = PruneSettings { enabled: false, protect_tokens: 0, minimum_tokens: 0 };
+        assert_eq!(prune_tool_outputs(&mut msgs, &s), PruneReport::default());
+        assert_eq!(msgs, before);
+    }
+
+    #[test]
+    fn adaptive_keep_recent_scales_with_the_window() {
+        // An explicit budget always wins.
+        let explicit = CompactionSettings { keep_recent_tokens: 7_000, ..Default::default() };
+        assert_eq!(effective_keep_recent(1_000_000, &explicit), 7_000);
+
+        let auto = CompactionSettings { keep_recent_tokens: 0, ..Default::default() };
+        // A quarter of the usable window, clamped at both ends.
+        assert_eq!(effective_keep_recent(80_000, &auto), KEEP_RECENT_MAX);
+        assert_eq!(effective_keep_recent(1_000_000, &auto), KEEP_RECENT_MAX);
+        assert_eq!(effective_keep_recent(4_000, &auto), KEEP_RECENT_MIN);
     }
 
     #[test]

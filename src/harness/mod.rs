@@ -38,6 +38,11 @@ pub enum HarnessEvent {
 
     AssistantFinished,
 
+    ContextPruned {
+        tokens: u64,
+        messages: usize,
+    },
+
     CompactionStarted,
     CompactionFinished { tokens_before: u64 },
 

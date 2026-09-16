@@ -1088,3 +1088,221 @@ fn zero_max_turns_means_no_limit() {
     let agent = AgentLoop::new(Box::new(AlwaysToolProvider), "test").with_max_turns(0);
     assert_eq!(agent.max_turns, 0, "0 is the documented 'no limit' value");
 }
+
+/// Produces large tool output for a while, then answers plainly. Pruning only
+/// touches *completed* turns (the in-flight turn is protected), so a test must
+/// span at least two prompts.
+struct BigOutputProvider {
+    n: Mutex<usize>,
+}
+
+impl Provider for BigOutputProvider {
+    fn id(&self) -> &'static str {
+        "big-output"
+    }
+    fn stream<'a>(
+        &'a self,
+        _request: ChatRequest,
+        _on_event: &'a mut (dyn FnMut(ProviderEvent) + Send),
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<AssistantTurn, ProviderError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let mut n = self.n.lock().unwrap();
+            *n += 1;
+            // Four big tool calls in the first turn, then plain answers.
+            if *n > 4 {
+                return Ok(AssistantTurn {
+                    text: "done".into(),
+                    tool_calls: vec![],
+                    finish: Some(FinishReason::Stop),
+                });
+            }
+            // Distinct arguments each round, so the repeated-failure guard
+            // never trips and the loop reaches the prune path.
+            Ok(AssistantTurn {
+                text: String::new(),
+                tool_calls: vec![call(
+                    &format!("c{n}"),
+                    "bash",
+                    &format!(r#"{{"command":"echo {}"}}"#, "x".repeat(20_000)),
+                )],
+                finish: Some(FinishReason::ToolCalls),
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn old_tool_output_is_pruned_from_the_prompt() {
+    let agent = AgentLoop::new(Box::new(BigOutputProvider { n: Mutex::new(0) }), "test")
+        .with_prune(crate::agent::context::PruneSettings {
+            enabled: true,
+            protect_tokens: 2_000,
+            minimum_tokens: 1_000,
+        });
+    let dir = std::env::temp_dir();
+    let mut history = Vec::new();
+
+    // The in-flight turn and the one before it are always protected, so the
+    // third prompt is the first that can reclaim the first turn's output.
+    let mut prune_event = None;
+    for (i, prompt) in ["first", "second", "third"].iter().enumerate() {
+        let events = std::sync::Arc::new(Mutex::new(Vec::<HarnessEvent>::new()));
+        let sink = events.clone();
+        let mut emit = move |e: HarnessEvent| sink.lock().unwrap().push(e);
+        agent.run_turn(&mut history, prompt, &dir, &mut emit).await.unwrap();
+        let found = events.lock().unwrap().iter().find_map(|e| match e {
+            HarnessEvent::ContextPruned { tokens, messages } => Some((*tokens, *messages)),
+            _ => None,
+        });
+        if i < 2 {
+            assert!(found.is_none(), "turn {i} must not prune (protected recent turns)");
+        }
+        if found.is_some() {
+            prune_event = found;
+        }
+    }
+
+    let (tokens, messages) = prune_event.expect("a later prompt should reclaim the first turn");
+    assert!(tokens > 0 && messages > 0, "{messages} msgs, {tokens} tokens");
+
+    // The prompt actually shrank, which is the whole point.
+    let marker = crate::agent::context::PRUNED_MARKER;
+    assert!(
+        history.iter().filter(|m| m.text.starts_with(marker)).count() > 0,
+        "some tool output should be elided"
+    );
+    // Every tool result still answers its call, so the request stays valid.
+    for m in history.iter().filter(|m| m.role == crate::ai::Role::Tool) {
+        assert!(m.tool_call_id.is_some(), "tool results keep their call id");
+    }
+}
+
+#[tokio::test]
+async fn pruning_can_be_turned_off() {
+    let agent = AgentLoop::new(Box::new(BigOutputProvider { n: Mutex::new(0) }), "test")
+        .with_prune(crate::agent::context::PruneSettings {
+            enabled: false,
+            protect_tokens: 0,
+            minimum_tokens: 0,
+        });
+    let dir = std::env::temp_dir();
+    let mut history = Vec::new();
+    for prompt in ["first", "second", "third"] {
+        let events = std::sync::Arc::new(Mutex::new(Vec::<HarnessEvent>::new()));
+        let sink = events.clone();
+        let mut emit = move |e: HarnessEvent| sink.lock().unwrap().push(e);
+        agent.run_turn(&mut history, prompt, &dir, &mut emit).await.unwrap();
+        assert!(
+            !events.lock().unwrap().iter().any(|e| matches!(e, HarnessEvent::ContextPruned { .. })),
+            "disabled prune must not emit"
+        );
+    }
+    assert!(
+        !history
+            .iter()
+            .any(|m| m.text.starts_with(crate::agent::context::PRUNED_MARKER)),
+        "nothing should be elided when disabled"
+    );
+}
+
+/// Rejects the first prompt as too large, then succeeds once the context has
+/// been compacted — the shape of a real provider's context-limit error.
+struct OverflowThenOk {
+    calls: Mutex<usize>,
+}
+
+impl Provider for OverflowThenOk {
+    fn id(&self) -> &'static str {
+        "overflow-then-ok"
+    }
+    fn stream<'a>(
+        &'a self,
+        _request: ChatRequest,
+        on_event: &'a mut (dyn FnMut(ProviderEvent) + Send),
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<AssistantTurn, ProviderError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let mut n = self.calls.lock().unwrap();
+            *n += 1;
+            if *n == 1 {
+                return Err(ProviderError::Protocol(
+                    "400: this model's maximum context length is 128000 tokens".into(),
+                ));
+            }
+            let text = "recovered".to_string();
+            on_event(ProviderEvent::TextDelta(text.clone()));
+            Ok(AssistantTurn { text, tool_calls: vec![], finish: Some(FinishReason::Stop) })
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_context_overflow_compacts_and_retries_instead_of_failing() {
+    use crate::harness::transcript::PartKind;
+    use crate::harness::TranscriptUpdate;
+
+    let dir = std::env::temp_dir();
+    let agent = AgentLoop::new(Box::new(OverflowThenOk { calls: Mutex::new(0) }), "test")
+        .with_compaction(
+            crate::agent::context::CompactionSettings {
+                reserve_tokens: 0,
+                keep_recent_tokens: 100,
+                tool_result_cap: 2_000,
+            },
+            true,
+        );
+
+    // Enough history that a compaction has something to fold.
+    let mut history = vec![crate::ai::ChatMessage::system("sys")];
+    for i in 0..8 {
+        history.push(crate::ai::ChatMessage::user(&format!("q{i} {}", "x".repeat(400))));
+        history.push(crate::ai::ChatMessage::assistant("ok", vec![]));
+    }
+
+    let events = std::sync::Arc::new(Mutex::new(Vec::<HarnessEvent>::new()));
+    let sink = events.clone();
+    let mut emit = move |e: HarnessEvent| sink.lock().unwrap().push(e);
+    let result = agent.run_turn(&mut history, "go", &dir, &mut emit).await;
+
+    // The turn succeeded rather than surfacing the provider error.
+    assert!(result.is_ok(), "overflow must not fail the turn: {result:?}");
+    let evs = events.lock().unwrap();
+    assert!(
+        evs.iter().any(|e| matches!(e, HarnessEvent::CompactionStarted)),
+        "the overflow should trigger a compaction"
+    );
+    let answered = evs.iter().any(|e| match e {
+        HarnessEvent::Transcript(TranscriptUpdate::Part(p)) => matches!(
+            &p.kind,
+            PartKind::Text { text, .. } if text.contains("recovered")
+        ),
+        _ => false,
+    });
+    assert!(answered, "the retry's answer should reach the transcript");
+}
+
+#[test]
+fn context_overflow_errors_are_recognized() {
+    use crate::providers::ProviderError;
+    for msg in [
+        "400 this model's maximum context length is 128000 tokens",
+        "prompt is too long: 250000 tokens > 200000 maximum",
+        "Please reduce the length of the messages",
+        "context_length_exceeded",
+    ] {
+        assert!(
+            crate::ai::is_context_overflow_error(&ProviderError::Protocol(msg.into())),
+            "should detect: {msg}"
+        );
+    }
+    // Ordinary failures are not mistaken for overflow.
+    for msg in ["429 rate limited", "invalid api key", "500 internal error"] {
+        assert!(
+            !crate::ai::is_context_overflow_error(&ProviderError::Protocol(msg.into())),
+            "must not treat as overflow: {msg}"
+        );
+    }
+}

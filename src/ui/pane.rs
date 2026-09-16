@@ -505,6 +505,16 @@ fn render_input(
     if sess.cost > 0.0 {
         right_parts.push(format!("${:.4}", sess.cost));
     }
+    // Old tool output was rolled out of the prompt this turn. Worth showing:
+    // it explains why an earlier command's output is no longer in context.
+    if let Some((tokens, n)) = sess.last_prune {
+        if tokens > 0 {
+            right_parts.push(format!(
+                "{} pruned ({n})",
+                crate::ui::statusbar::fmt_tokens(tokens)
+            ));
+        }
+    }
     right_parts.push(dir);
     if sess.interrupt_armed.is_some() {
         right_parts.push("press Esc again to interrupt".into());

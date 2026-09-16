@@ -277,6 +277,9 @@ pub struct SessionState {
     pub activity: Option<Activity>,
     pub cost: f64,
     pub ctx_tokens: u64,
+    /// Tokens freed by the most recent prune pass, with the number of tool
+    /// results elided. Cleared when the turn ends.
+    pub last_prune: Option<(u64, usize)>,
     pub messages: Vec<Message>,
     pub status: SessStatus,
     pub input: InputState,
@@ -318,6 +321,7 @@ impl SessionState {
             activity: None,
             cost: 0.0,
             ctx_tokens: 0,
+            last_prune: None,
             messages: Vec::new(),
             status: SessStatus::Connecting,
             input: InputState::default(),

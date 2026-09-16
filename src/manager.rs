@@ -531,6 +531,11 @@ fn build_agent_with(
         .map(|(k, v)| (k.clone(), (v.reserve_tokens, v.keep_recent_tokens)))
         .collect();
     let settings = crate::agent::context::resolve_settings(base, &overrides, &model);
+    let prune = crate::agent::context::PruneSettings {
+        enabled: cfg.compaction.prune,
+        protect_tokens: cfg.compaction.prune_protect_tokens,
+        minimum_tokens: cfg.compaction.prune_minimum_tokens,
+    };
     let compactor = if cfg.compaction.model.trim().is_empty() {
         None
     } else {
@@ -551,6 +556,7 @@ fn build_agent_with(
     let mut agent = crate::agent::AgentLoop::new(provider, model)
         .with_tools(tools)
         .with_compaction(settings, cfg.compaction.enabled)
+        .with_prune(prune)
         .with_retry(cfg.ai.max_retries, cfg.ai.retry_base_ms)
         .with_max_turns(cfg.ai.max_turns)
         .with_reasoning_effort(cfg.ai.reasoning_effort.clone())

@@ -55,7 +55,16 @@ impl Default for McpServerConfig {
 pub struct CompactionConfig {
     pub enabled: bool,
     pub reserve_tokens: u64,
+    /// Recent tokens kept verbatim across a compaction. `0` adapts to the
+    /// model's window (a quarter of the usable context, clamped).
     pub keep_recent_tokens: u64,
+    /// Roll old tool output out of the prompt. Tool output is the main way a
+    /// session's context grows without bound, and this costs no model call.
+    pub prune: bool,
+    /// Recent tool output kept verbatim, counting back from the newest message.
+    pub prune_protect_tokens: u64,
+    /// Only prune once at least this much would be freed.
+    pub prune_minimum_tokens: u64,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub model: String,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
@@ -74,7 +83,11 @@ impl Default for CompactionConfig {
         Self {
             enabled: true,
             reserve_tokens: 16_384,
-            keep_recent_tokens: 20_000,
+            // Adaptive by default: a fixed budget suits no single model well.
+            keep_recent_tokens: 0,
+            prune: true,
+            prune_protect_tokens: 40_000,
+            prune_minimum_tokens: 20_000,
             model: String::new(),
             model_overrides: HashMap::new(),
         }
