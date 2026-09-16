@@ -190,7 +190,9 @@ Latency work is not one thing, so it is attacked at each layer:
   `thinkingBudget` on Gemini (`minimal` disables thinking outright).
 - **Only what changed is re-rendered.** Each message's rendered lines are cached
   and reused, so streaming a reply costs one message of work rather than the
-  whole transcript. On a 509-message session that is ~100x less per token.
+  whole transcript. On a 509-message session that is ~100x less per token. The
+  cache key includes whether the turn is running and which message is live, so a
+  frame rendered mid-turn is never reused once it is stale.
 - **Independent tool calls run concurrently.** A turn that reads three files or
   runs two searches no longer waits on each in series. Mutating tools stay
   sequential so they cannot race.

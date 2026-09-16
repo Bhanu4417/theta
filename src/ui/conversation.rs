@@ -76,8 +76,14 @@ fn mix(h: &mut u64, v: u64) {
 
 /// A signature that changes whenever this message would render differently.
 /// Lengths are used instead of the text itself so the check stays O(parts).
-fn message_rev(sess: &SessionState, mi: usize, msg: &Message) -> u64 {
+fn message_rev(sess: &SessionState, mi: usize, msg: &Message, ctx: u64) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    // How a message renders also depends on session state: whether the turn is
+    // running, whether this is the prompt in flight, and whether this is the
+    // live message. Omitting it meant a render captured mid-turn was reused
+    // afterwards, so a finished reply stayed invisible and the working spinner
+    // never cleared until the session was refreshed.
+    mix(&mut h, ctx);
     mix(&mut h, msg.role as u8 as u64);
     mix(&mut h, msg.completed.is_some() as u64);
     mix(&mut h, msg.parts.len() as u64);
@@ -164,12 +170,6 @@ fn render_message(
     for (pi, part) in msg.parts.iter().enumerate() {
         match &part.kind {
             PartKind::Text { text, synthetic } if !synthetic && !text.trim().is_empty() => {
-                if busy
-                    && msg.role == Role::Assistant
-                    && last_user.map(|u| mi > u).unwrap_or(false)
-                {
-                    continue;
-                }
                 if !rendered_any {
                     start_block(block_kind.clone(), String::new(), &mut lines, &mut blocks);
                     rendered_any = true;
@@ -432,7 +432,10 @@ pub fn rebuild(prev: Option<&Cache>, sess: &SessionState, width: u16, tick: u64)
     let reusable = prev.filter(|c| c.width == width);
 
     for (mi, msg) in sess.messages.iter().enumerate() {
-        let rev = message_rev(sess, mi, msg);
+        let ctx = (busy as u64)
+            | ((last_user == Some(mi)) as u64) << 1
+            | ((live_msg == Some(mi)) as u64) << 2;
+        let rev = message_rev(sess, mi, msg, ctx);
         // Any message that draws a spinner has to be re-rendered each tick,
         // otherwise a reused frame would freeze the animation. That is the
         // in-flight turn, the last prompt while busy, and any running tool —
@@ -1069,6 +1072,98 @@ mod transcript_boundary_tests {
         s.upsert_part(&assistant_meta(&grown), grown);
         let rendered = cache_text(&s);
         assert!(rendered.contains("the project structure"));
+    }
+
+#[test]
+    fn finished_reply_appears_without_refreshing_the_session() {
+        // Reported bug: the reply stayed invisible after the turn finished and
+        // only showed up on a session refresh.
+        let mut s = SessionState::new(1, "s".into(), std::path::PathBuf::from("/tmp"));
+        // A prompt must exist for this to reproduce: the reply only renders
+        // differently while a turn is in flight when there is a user message.
+        let u = Message {
+            id: "mu".into(),
+            role: Role::User,
+            error: None,
+            completed: None,
+            created: None,
+            cost: None,
+            tokens: None,
+            parts: vec![Part {
+                id: "p-u".into(),
+                message_id: "mu".into(),
+                kind: PartKind::Text { text: "my question".into(), synthetic: false },
+            }],
+        };
+        s.upsert_message_meta(&u);
+        s.upsert_part(&u, u.parts[0].clone());
+
+        s.status = crate::session::SessStatus::Working;
+        let p = text_part("the written answer");
+        s.upsert_part(&assistant_meta(&p), p);
+
+        // Mid-turn: build the cache in the state an earlier bug would have
+        // cached, before the reply was finished.
+        let working = build_cache(&s, 60, 0);
+
+        // The turn completes. No refresh, just the next frame.
+        s.status = crate::session::SessStatus::Idle;
+        let after = rebuild(Some(&working), &s, 60, 1);
+        let text = after
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|sp| sp.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("the written answer"),
+            "the reply must appear as soon as the turn ends, with no refresh:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_finished_turn_stops_drawing_the_working_spinner_on_the_prompt() {
+        // The user's own message renders differently while busy; that state must
+        // be invalidated when the turn ends, not cached forever.
+        let mut s = SessionState::new(1, "s".into(), std::path::PathBuf::from("/tmp"));
+        s.status = crate::session::SessStatus::Working;
+        let u = Message {
+            id: "mu".into(),
+            role: Role::User,
+            error: None,
+            completed: None,
+            created: None,
+            cost: None,
+            tokens: None,
+            parts: vec![Part {
+                id: "p-u".into(),
+                message_id: "mu".into(),
+                kind: PartKind::Text { text: "my question".into(), synthetic: false },
+            }],
+        };
+        s.upsert_message_meta(&u);
+        s.upsert_part(&u, u.parts[0].clone());
+        let working = build_cache(&s, 60, 0);
+
+        s.status = crate::session::SessStatus::Idle;
+        let text = {
+            let c = rebuild(Some(&working), &s, 60, 1);
+            c.lines
+                .iter()
+                .map(|l| l.spans.iter().map(|sp| sp.content.as_ref()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(text.contains("my question"));
+        // With the turn over, the prompt glyph is back rather than a spinner.
+        assert!(
+            text.contains("Θ my question") || text.contains("my question"),
+            "prompt should render normally once idle:\n{text}"
+        );
+        assert!(
+            !text.contains('⣾') && !text.contains('⣽') && !text.contains('⣻'),
+            "the working spinner must not persist after the turn ends:\n{text}"
+        );
     }
 
     #[test]
