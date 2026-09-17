@@ -391,6 +391,48 @@ pub async fn stream_with_retry(
     }
 }
 
+/// Identify this client to a provider, the way the OpenCode Go docs ask:
+/// clients should name themselves rather than presenting as a generic HTTP
+/// library, which is what `reqwest`'s default user agent does.
+///
+/// `x-opencode-session` is only routed efficiently when the value is stable, so
+/// this is one identity for the process rather than a fresh value per request.
+pub(crate) fn user_agent() -> String {
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+    let release = kernel_release().unwrap_or_else(|| os.to_string());
+    format!("theta/{} ({release}; {arch})", env!("CARGO_PKG_VERSION"))
+}
+
+/// The kernel release, so the identity carries a version like a real client
+/// would. Linux exposes it as text; other platforms fall back to the OS name.
+fn kernel_release() -> Option<String> {
+    let text = std::fs::read_to_string("/proc/sys/kernel/osrelease").ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// A stable identifier for this client's traffic.
+///
+/// The Go docs require the session header value to be stable; generating a new
+/// one per provider build (and so per model switch) undermines the routing it
+/// exists for. Generated once for the process.
+pub(crate) fn session_identity() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        // A short, opaque token: the value is only an identity, not a secret.
+        format!("theta-{nanos:x}-{:x}", std::process::id())
+    })
+}
+
 /// Build the HTTP client every provider shares.
 ///
 /// `read_timeout` is an **idle** timeout: it fires only when no bytes arrive for
@@ -399,6 +441,8 @@ pub async fn stream_with_retry(
 /// mid-generation, which the user sees as a turn that hangs and then dies.
 pub(crate) fn http_client(read_timeout: Option<std::time::Duration>) -> reqwest::Client {
     let mut b = reqwest::Client::builder()
+        // Present as Theta, not as the HTTP library it happens to use.
+        .user_agent(user_agent())
         // Nagle would coalesce small SSE frames, adding latency per token.
         .tcp_nodelay(true)
         // Reuse connections: otherwise every turn pays a fresh TLS handshake.
@@ -656,6 +700,33 @@ mod tests {
         assert_eq!(httpdate_secs("Thu, 01 Jan 1970 00:00:00"), Some(0));
         // 2015-10-21T07:28:00Z
         assert_eq!(httpdate_secs("Wed, 21 Oct 2015 07:28:00 GMT"), Some(1_445_412_480));
+    }
+
+
+    #[test]
+    fn the_client_identifies_itself_as_theta() {
+        // The OpenCode Go docs ask clients to name themselves rather than
+        // present as a generic HTTP library, which is what reqwest's default
+        // user agent does.
+        let ua = user_agent();
+        assert!(ua.starts_with("theta/"), "{ua}");
+        assert!(ua.contains(env!("CARGO_PKG_VERSION")), "carries the version: {ua}");
+        assert!(ua.contains(std::env::consts::ARCH), "carries the arch: {ua}");
+        assert!(
+            !ua.to_ascii_lowercase().contains("reqwest"),
+            "must not present as the HTTP library: {ua}"
+        );
+    }
+
+    #[test]
+    fn the_session_identity_is_stable_for_the_process() {
+        // It exists so traffic can be routed consistently, so a fresh value per
+        // request (or per model switch) defeats the purpose.
+        let a = session_identity();
+        let b = session_identity();
+        assert_eq!(a, b, "the identity must not change between calls");
+        assert!(a.starts_with("theta-"), "{a}");
+        assert!(a.len() > 12, "distinctive enough to route on: {a}");
     }
 
 }

@@ -422,6 +422,9 @@ pub struct App {
     /// patches over text. main.rs clears the screen and every cached render
     /// before the next frame.
     pub needs_clear: bool,
+    /// Set when a redraw must happen immediately rather than at the next frame
+    /// boundary: input, which is latency-sensitive, and full repaints.
+    pub urgent: bool,
     pub last_newline: Option<Instant>,
     pub notifications: NotificationPolicy,
     pub tick: u64,
@@ -429,6 +432,7 @@ pub struct App {
     pub dirty: bool,
     pub should_quit: bool,
     pub restart: bool,
+    pub is_demo: bool,
     /// When set, quit (and re-exec) after this instant so the `/refresh` flash
     /// is actually drawn before the process replaces itself.
     pub refresh_quit_at: Option<Instant>,
@@ -499,6 +503,7 @@ impl App {
             initial_dir,
             flash: None,
             needs_clear: false,
+            urgent: false,
             last_newline: None,
             notifications: NotificationPolicy::new(8000),
             tick: 0,
@@ -506,6 +511,7 @@ impl App {
             dirty: true,
             should_quit: false,
             restart: false,
+            is_demo: false,
             refresh_quit_at: None,
             git_cache: GitCache::new(),
             git_display: None,
@@ -815,6 +821,15 @@ impl App {
     }
 
     pub fn submit_input(&mut self, id: u32) {
+        if self.is_demo {
+            self.flash("Demo mode — 4 autonomous agents running live demo");
+            if let Some(s) = self.session_mut(id) {
+                s.input.clear();
+                s.dirty = true;
+            }
+            self.dirty = true;
+            return;
+        }
         if let Some(s) = self.session(id) {
             if let Some((send, cmd)) = parse_shell_line(s.input.text()) {
                 let limit = self.cfg.ui.history_limit;

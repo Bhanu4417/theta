@@ -21,7 +21,9 @@ impl Responses {
         let base_url = base_url.into().trim_end_matches('/').to_string();
         let mut headers = Vec::new();
         if base_url.contains("opencode.ai/zen") {
-            headers.push(("x-opencode-session".to_string(), crate::ai::openai::session_id()));
+            let id = crate::ai::session_identity().to_string();
+            headers.push(("x-opencode-session".to_string(), id.clone()));
+            headers.push(("x-session-id".to_string(), id));
         }
         Self { base_url, api_key, client, headers, timeout: None }
     }

@@ -23,7 +23,12 @@ impl OpenAiCompat {
         let base_url = base_url.into().trim_end_matches('/').to_string();
         let mut headers = Vec::new();
         if base_url.contains("opencode.ai/zen") {
-            headers.push(("x-opencode-session".to_string(), session_id()));
+            // The documented header, plus the one other validated clients send.
+            // The value is stable for the process, which is what the docs ask
+            // for: it exists so traffic can be routed consistently.
+            let id = crate::ai::session_identity().to_string();
+            headers.push(("x-opencode-session".to_string(), id.clone()));
+            headers.push(("x-session-id".to_string(), id));
         }
         Self { base_url, api_key, client, headers, timeout: None }
     }
@@ -336,16 +341,6 @@ impl Provider for OpenAiCompat {
     }
 }
 
-pub(crate) fn session_id() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let t = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    format!("theta-{t}-{n}")
-}
 
 fn net(e: reqwest::Error) -> ProviderError {
     ProviderError::Transport(e.to_string())
@@ -504,5 +499,16 @@ mod tests {
         let go = OpenAiCompat::preset("opencode-go", None).unwrap();
         assert_eq!(go.base_url, "https://opencode.ai/zen/go/v1");
         assert!(go.headers.iter().any(|(k, _)| k == "x-opencode-session"));
+        // Both names are recognized by the gateway; sending both costs nothing
+        // and covers clients that look for either.
+        assert!(go.headers.iter().any(|(k, _)| k == "x-session-id"));
+        let ids: Vec<&String> = go
+            .headers
+            .iter()
+            .filter(|(k, _)| k == "x-opencode-session" || k == "x-session-id")
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], ids[1], "both headers must carry the same session");
     }
 }
