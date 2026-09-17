@@ -57,6 +57,7 @@ struct Args {
     json: bool,
     prompt: Vec<String>,
     check_ai: bool,
+    model: Option<String>,
 }
 
 fn usage() -> &'static str {
@@ -69,6 +70,7 @@ ARGS:
     [DIR]              Open with an initial session in DIR
 
 OPTIONS:
+    --model NAME       Use NAME instead of the configured model
     --no-restore       Do not restore the last workspace
     --log              Open/tail the newest debug log (request → provider/model)
     --run              Start the TUI (with --log: record to the log file)
@@ -85,6 +87,10 @@ KEYS:
 }
 
 fn parse_args() -> Args {
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from(argv: impl IntoIterator<Item = String>) -> Args {
     let mut args = Args {
         dir: None,
         no_restore: false,
@@ -96,9 +102,11 @@ fn parse_args() -> Args {
         json: false,
         prompt: Vec::new(),
         check_ai: false,
+        model: None,
     };
     let mut positional: Vec<String> = Vec::new();
-    for a in std::env::args().skip(1) {
+    let mut argv = argv.into_iter();
+    while let Some(a) = argv.next() {
         match a.as_str() {
             "--no-restore" => args.no_restore = true,
             "--log" => args.log = true,
@@ -108,7 +116,12 @@ fn parse_args() -> Args {
             "--print" | "-p" => args.print = true,
             "--json" => args.json = true,
             "--check-ai" => args.check_ai = true,
-            _ => positional.push(a),
+            // Takes the next argument, or the part after `--model=`.
+            "--model" => args.model = argv.next(),
+            _ => match a.strip_prefix("--model=") {
+                Some(m) => args.model = Some(m.to_string()),
+                None => positional.push(a),
+            },
         }
     }
     if args.print || args.json || args.check_ai {
@@ -136,7 +149,10 @@ async fn main() -> Result<()> {
     }
 
     config::Config::save_default_if_missing()?;
-    let cfg = config::Config::load()?;
+    let mut cfg = config::Config::load()?;
+    if let Some(model) = args.model.as_ref().filter(|m| !m.trim().is_empty()) {
+        cfg.ai.model = model.trim().to_string();
+    }
     theme::set_theme(&cfg.theme);
 
     let recording = args.run || args.print || args.json || args.check_ai;
@@ -508,5 +524,38 @@ fn exec_self() -> Result<()> {
             }
         }
         Err(anyhow::anyhow!("refresh failed: could not locate the theta binary"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(a: &[&str]) -> Args {
+        parse_args_from(a.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn model_flag_takes_next_argument() {
+        let a = parse(&["--model", "union-alpha", "hi"]);
+        assert_eq!(a.model.as_deref(), Some("union-alpha"));
+        // The model name is consumed, not mistaken for a directory or prompt.
+        assert_eq!(a.dir, Some(PathBuf::from("hi")));
+        assert!(a.prompt.is_empty());
+    }
+
+    #[test]
+    fn model_flag_accepts_equals_form_with_print() {
+        let a = parse(&["--print", "--model=union-alpha", "hi", "there"]);
+        assert_eq!(a.model.as_deref(), Some("union-alpha"));
+        assert!(a.print);
+        assert_eq!(a.prompt, vec!["hi".to_string(), "there".to_string()]);
+    }
+
+    #[test]
+    fn model_flag_absent_leaves_model_none() {
+        let a = parse(&["--print", "hi"]);
+        assert_eq!(a.model, None);
+        assert_eq!(a.prompt, vec!["hi".to_string()]);
     }
 }

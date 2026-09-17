@@ -12,7 +12,7 @@ no server to start, no daemon to babysit, no wrapper around somebody else's CLI.
 [![CI](https://github.com/Bhanu4417/theta/actions/workflows/ci.yml/badge.svg)](https://github.com/Bhanu4417/theta/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-e0dbce.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-e0dbce.svg)](https://www.rust-lang.org)
-[![Tests](https://img.shields.io/badge/tests-222%20passing-e0dbce.svg)](#testing)
+[![Tests](https://img.shields.io/badge/tests-247%20passing-e0dbce.svg)](#testing)
 
 </div>
 
@@ -191,7 +191,27 @@ Type `/` in any session for the menu (filter by typing, `↑↓` to choose).
 | `/editor` | Compose the prompt in `$EDITOR` |
 | `/push` | Commit and push the session's project |
 | `/refresh` | Re-exec the newest build without leaving |
+| `/reasoning` | How hard the model thinks: `none`…`max`. Lower is faster and
+  avoids an empty reply when reasoning eats the answer budget |
 | `/login` `/help` `/quit` | Providers · keys · exit |
+
+## When a reply comes back empty
+
+A reasoning model can spend its whole output budget thinking and emit no answer.
+Theta retries that once with minimal thinking; if it is still empty you get a
+note telling you what to try, rather than a reply that is simply missing.
+
+`/reasoning` changes how hard the model thinks, for every following turn:
+
+```
+/reasoning minimal      # fastest; least likely to run out of room
+/reasoning low          # a good default for a busy gateway
+/reasoning default      # hand the choice back to the provider
+```
+
+`none` disables thinking entirely on providers that allow it. The setting lives
+in `[ai] reasoning_effort`, and `/reasoning` changes it without editing a file
+or restarting.
 
 ## Agents
 

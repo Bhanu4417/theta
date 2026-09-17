@@ -1725,3 +1725,153 @@ async fn an_empty_answer_is_retried_with_less_thinking() {
     });
     assert!(!complained, "the user must not see the empty-response notice");
 }
+
+/// Returns an empty answer with finish reason `Stop` — the shape a gateway
+/// reports when a reasoning budget is exhausted — then a real answer. The
+/// earlier retry only fired on `Length`, so this case showed the user an error.
+struct EmptyStopThenAnswer {
+    calls: Mutex<usize>,
+}
+
+impl Provider for EmptyStopThenAnswer {
+    fn id(&self) -> &'static str {
+        "empty-stop"
+    }
+    fn stream<'a>(
+        &'a self,
+        _request: ChatRequest,
+        _on_event: &'a mut (dyn FnMut(ProviderEvent) + Send),
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<AssistantTurn, ProviderError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let mut n = self.calls.lock().unwrap();
+            *n += 1;
+            if *n == 1 {
+                return Ok(AssistantTurn {
+                    text: String::new(),
+                    tool_calls: vec![],
+                    // Not `Length`: this is the case that produced the error.
+                    finish: Some(FinishReason::Stop),
+                });
+            }
+            Ok(AssistantTurn {
+                text: "second try worked".into(),
+                tool_calls: vec![],
+                finish: Some(FinishReason::Stop),
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn an_empty_answer_is_retried_even_without_a_length_finish() {
+    use crate::harness::transcript::PartKind;
+    use crate::harness::TranscriptUpdate;
+
+    let agent = AgentLoop::new(Box::new(EmptyStopThenAnswer { calls: Mutex::new(0) }), "test");
+    let dir = std::env::temp_dir();
+    let mut history = Vec::new();
+    let events = std::sync::Arc::new(Mutex::new(Vec::<HarnessEvent>::new()));
+    let sink = events.clone();
+    let mut emit = move |e: HarnessEvent| sink.lock().unwrap().push(e);
+    agent.run_turn(&mut history, "go", &dir, &mut emit).await.unwrap();
+
+    let evs = events.lock().unwrap();
+    let answered = evs.iter().any(|e| match e {
+        HarnessEvent::Transcript(TranscriptUpdate::Part(p)) => matches!(
+            &p.kind,
+            PartKind::Text { text, .. } if text.contains("second try worked")
+        ),
+        _ => false,
+    });
+    assert!(answered, "the retry's answer must reach the transcript");
+    let complained = evs.iter().any(|e| match e {
+        HarnessEvent::Transcript(TranscriptUpdate::Part(p)) => matches!(
+            &p.kind,
+            PartKind::Text { text, .. } if text.contains("no output")
+        ),
+        _ => false,
+    });
+    assert!(!complained, "an empty reply that a retry fixes must not surface as an error");
+}
+
+#[tokio::test]
+async fn an_empty_answer_is_only_retried_once() {
+    use crate::harness::transcript::PartKind;
+    use crate::harness::TranscriptUpdate;
+
+    // A provider that never answers must not spin: one retry, then a clear
+    // message telling the user what to try.
+    struct AlwaysEmpty {
+        calls: Mutex<usize>,
+    }
+    impl Provider for AlwaysEmpty {
+        fn id(&self) -> &'static str {
+            "always-empty"
+        }
+        fn stream<'a>(
+            &'a self,
+            _r: ChatRequest,
+            _e: &'a mut (dyn FnMut(ProviderEvent) + Send),
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<AssistantTurn, ProviderError>> + Send + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                *self.calls.lock().unwrap() += 1;
+                Ok(AssistantTurn {
+                    text: String::new(),
+                    tool_calls: vec![],
+                    finish: Some(FinishReason::Stop),
+                })
+            })
+        }
+    }
+
+    let provider = std::sync::Arc::new(AlwaysEmpty { calls: Mutex::new(0) });
+    struct EmptyShim(std::sync::Arc<AlwaysEmpty>);
+    impl Provider for EmptyShim {
+        fn id(&self) -> &'static str {
+            self.0.id()
+        }
+        fn stream<'a>(
+            &'a self,
+            r: ChatRequest,
+            e: &'a mut (dyn FnMut(ProviderEvent) + Send),
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<AssistantTurn, ProviderError>> + Send + 'a,
+            >,
+        > {
+            self.0.stream(r, e)
+        }
+    }
+
+    let agent = AgentLoop::new(
+        Box::new(EmptyShim(provider.clone() as std::sync::Arc<AlwaysEmpty>)),
+        "test",
+    );
+    let dir = std::env::temp_dir();
+    let mut history = Vec::new();
+    let events = std::sync::Arc::new(Mutex::new(Vec::<HarnessEvent>::new()));
+    let sink = events.clone();
+    let mut emit = move |e: HarnessEvent| sink.lock().unwrap().push(e);
+    agent.run_turn(&mut history, "go", &dir, &mut emit).await.unwrap();
+
+    assert_eq!(
+        *provider.calls.lock().unwrap(),
+        2,
+        "one attempt plus exactly one retry"
+    );
+    let evs = events.lock().unwrap();
+    let told = evs.iter().any(|e| match e {
+        HarnessEvent::Transcript(TranscriptUpdate::Part(p)) => matches!(
+            &p.kind,
+            PartKind::Text { text, .. } if text.contains("/reasoning")
+        ),
+        _ => false,
+    });
+    assert!(told, "the fallback message must say what to try next");
+}

@@ -512,16 +512,19 @@ impl AgentLoop {
                     // budget thinking and emit no answer. Retrying once with
                     // minimal effort is the difference between a usable turn
                     // and an error, so try that before giving up.
-                    // `Length` is the only out-of-room signal the providers
-                    // report; an empty answer with a normal stop is something
-                    // else and is not retried.
-                    let out_of_room = matches!(turn_result.finish, Some(FinishReason::Length));
-                    if out_of_room && !empty_retried {
+                    // An empty answer is retried whatever the finish reason
+                    // says. Requiring `Length` was wrong: gateways report an
+                    // exhausted reasoning budget as `stop`, or omit the reason
+                    // entirely, and then the user got an error for a condition
+                    // a retry fixes. The only cost of retrying is one extra
+                    // request.
+                    if !empty_retried {
                         empty_retried = true;
                         effort_override = Some("minimal".to_string());
                         crate::tlog!(
-                            "RETRY empty answer after {turn} turns: reasoning used the \
-                             whole budget; retrying with minimal effort"
+                            "RETRY empty answer after {turn} turns (finish={:?}); retrying \
+                             with minimal effort",
+                            turn_result.finish
                         );
                         emit(HarnessEvent::SessionRetrying {
                             attempt: 1,
@@ -542,7 +545,8 @@ impl AgentLoop {
                         message_id: msg_id.to_string(),
                         kind: PartKind::Text {
                             text: format!(
-                                "(no output — {why}. Try again, or set `[ai] reasoning_effort = \"low\"`.)"
+                                "(no output — {why}, and the retry with less thinking was \
+                                 also empty. Try `/reasoning minimal`, or another model.)"
                             ),
                             synthetic: false,
                         },

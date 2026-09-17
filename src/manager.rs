@@ -111,6 +111,42 @@ impl Manager {
         self.ref_.local.as_ref().is_some_and(|l| l.redo(&oc_sid))
     }
 
+    /// Change the reasoning effort for subsequent turns.
+    ///
+    /// Stored in the shared config and applied by invalidating the cached
+    /// agents, so the next message rebuilds with the new value. Editing a file
+    /// and restarting was the only way before, which is not a reasonable thing
+    /// to ask when a model is producing empty replies.
+    pub fn set_reasoning_effort(&self, level: String) -> Result<(), String> {
+        let level = level.trim().to_ascii_lowercase();
+        if !matches!(
+            level.as_str(),
+            "" | "default" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+        ) {
+            return Err(format!(
+                "unknown reasoning effort `{level}` — use none, minimal, low, medium, high, \
+                 xhigh, max, or `default` to clear"
+            ));
+        }
+        let level = if level == "default" { String::new() } else { level };
+        {
+            let mut c = self.ref_.cfg.lock().unwrap();
+            c.ai.reasoning_effort = level.clone();
+        }
+        if let Some(local) = self.ref_.local.clone() {
+            local.invalidate_agents();
+        }
+        self.result(
+            true,
+            if level.is_empty() {
+                "reasoning effort: provider default".to_string()
+            } else {
+                format!("reasoning effort: {level}")
+            },
+        );
+        Ok(())
+    }
+
     pub fn local_compact(&self, oc_sid: String) {
         let Some(local) = self.ref_.local.clone() else {
             self.result(false, "compaction requires the local harness");
@@ -805,6 +841,29 @@ mod tests {
         let ok = make_provider(&cfg).is_ok();
         std::env::remove_var("THETA_TEST_PRESENT_KEY");
         assert!(ok);
+    }
+
+
+    #[test]
+    fn reasoning_effort_can_be_changed_and_is_validated() {
+        // There was no way to change this without editing a config file and
+        // restarting, which is not a reasonable ask when a model is returning
+        // empty replies.
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let m = Manager::new(tx, Config::default());
+
+        // The levels the gateway accepts, plus clearing back to the default.
+        for level in ["none", "minimal", "low", "medium", "high", "xhigh", "max"] {
+            assert!(m.set_reasoning_effort(level.into()).is_ok(), "{level} should be accepted");
+            assert_eq!(m.ref_.cfg.lock().unwrap().ai.reasoning_effort, level);
+        }
+        assert!(m.set_reasoning_effort("DEFAULT".into()).is_ok(), "case-insensitive");
+        assert_eq!(m.ref_.cfg.lock().unwrap().ai.reasoning_effort, "");
+
+        // A typo is reported rather than silently stored.
+        let err = m.set_reasoning_effort("very".into()).unwrap_err();
+        assert!(err.contains("very"), "the bad value is named: {err}");
+        assert!(err.contains("minimal"), "and the valid ones are listed: {err}");
     }
 
 }

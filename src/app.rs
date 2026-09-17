@@ -60,6 +60,10 @@ fn builtin_slash_items() -> Vec<SlashItem> {
     vec![
         SlashItem { name: "model".into(), desc: "Change the model for this session".into() },
         SlashItem { name: "agent".into(), desc: "Switch agent (build, plan, …)".into() },
+        SlashItem {
+            name: "reasoning".into(),
+            desc: "How hard the model thinks (none…max); affects speed and empty replies".into(),
+        },
         SlashItem { name: "new".into(), desc: "Create a new session".into() },
         SlashItem { name: "sessions".into(), desc: "Jump to another open session".into() },
         SlashItem { name: "resume".into(), desc: "Resume a previous session".into() },
@@ -2417,6 +2421,35 @@ impl App {
             "delete" | "remove" => {
                 self.close_session(self.focus);
                 self.flash("session deleted from workspace (history kept)");
+            }
+            "reasoning" => {
+                let level = args.trim();
+                if level.is_empty() {
+                    let now = self
+                        .cfg
+                        .ai
+                        .reasoning_effort
+                        .clone();
+                    let now = if now.is_empty() { "provider default".to_string() } else { now };
+                    self.flash(format!(
+                        "reasoning effort: {now} — use /reasoning none|minimal|low|medium|high|xhigh|max"
+                    ));
+                } else {
+                    match self.manager.set_reasoning_effort(level.to_string()) {
+                        Ok(()) => {
+                            // The agents are rebuilt from the shared config, so the
+                            // local copy has to follow or the UI would report the
+                            // old value.
+                            self.cfg.ai.reasoning_effort = if level == "default" {
+                                String::new()
+                            } else {
+                                level.to_ascii_lowercase()
+                            };
+                            self.flash(format!("reasoning effort set to {}", level.to_ascii_lowercase()));
+                        }
+                        Err(e) => self.flash(e),
+                    }
+                }
             }
             "rename" => {
                 if args.is_empty() {
