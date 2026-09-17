@@ -424,8 +424,13 @@ async fn run(
                     None => {}
                 }
             }
-            Some(aev) = rx.recv() => {
-                app.handle_event(aev).await;
+            maybe_aev = rx.recv() => {
+                match maybe_aev {
+                    Some(aev) => app.handle_event(aev).await,
+                    None => {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }
             }
             _ = tick.tick() => {
                 app.on_tick().await;

@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 pub fn setup_demo_app(app: &mut App, theme: Option<&str>) {
-    let t = theme.unwrap_or("ember-gruv");
+    let t = theme.unwrap_or("pine-grove");
     crate::theme::set_theme(t);
     app.is_demo = true;
 

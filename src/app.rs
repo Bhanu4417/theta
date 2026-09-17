@@ -822,7 +822,6 @@ impl App {
 
     pub fn submit_input(&mut self, id: u32) {
         if self.is_demo {
-            self.flash("Demo mode — 4 autonomous agents running live demo");
             if let Some(s) = self.session_mut(id) {
                 s.input.clear();
                 s.dirty = true;
@@ -2193,6 +2192,10 @@ impl App {
         if let Some(name) = names.get(self.theme_ui.selected) {
             crate::theme::set_theme(name);
             self.conv_cache.clear();
+            self.needs_clear = true;
+            use std::io::Write;
+            let _ = write!(std::io::stdout(), "\x1b]999;theme={}\x07", name);
+            let _ = std::io::stdout().flush();
         }
         self.dirty = true;
     }
@@ -2554,12 +2557,18 @@ impl App {
     fn handle_mouse(&mut self, m: MouseEvent) {
         match m.kind {
             MouseEventKind::ScrollUp => {
+                if self.overlay == Overlay::Theme {
+                    let names = crate::theme::theme_names();
+                    if self.theme_ui.selected > 0 {
+                        self.theme_ui.selected -= 1;
+                        self.preview_theme(&names);
+                    }
+                    return;
+                }
                 self.select = None;
-                let (stick, sid) = match self.focused() {
-                    Some(s) => (s.stick_bottom, s.id),
-                    None => (false, 0),
-                };
+                let stick = self.focused().map(|s| s.stick_bottom).unwrap_or(false);
                 let bottom = if stick {
+                    let sid = self.focused().map(|s| s.id).unwrap_or(0);
                     let total = self.conv_cache.get(&sid).map(|c| c.lines.len()).unwrap_or(0);
                     total.saturating_sub(self.pane_view_height())
                 } else {
@@ -2575,6 +2584,14 @@ impl App {
                 self.dirty = true;
             }
             MouseEventKind::ScrollDown => {
+                if self.overlay == Overlay::Theme {
+                    let names = crate::theme::theme_names();
+                    if self.theme_ui.selected + 1 < names.len() {
+                        self.theme_ui.selected += 1;
+                        self.preview_theme(&names);
+                    }
+                    return;
+                }
                 self.select = None;
                 let h = self.pane_view_height();
                 let sid = self.focused().map(|s| s.id).unwrap_or(0);
@@ -4183,7 +4200,11 @@ impl App {
                         crate::theme::set_theme(&original);
                         self.cfg.theme = original.clone();
                         self.conv_cache.clear();
+                        self.needs_clear = true;
                         self.overlay = Overlay::None;
+                        use std::io::Write;
+                        let _ = write!(std::io::stdout(), "\x1b]999;theme={}\x07", original);
+                        let _ = std::io::stdout().flush();
                         self.flash(format!("theme: {}", crate::theme::theme_label(&original)));
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
@@ -4213,7 +4234,11 @@ impl App {
                         self.cfg.theme = name.to_string();
                         let _ = self.cfg.save();
                         self.conv_cache.clear();
+                        self.needs_clear = true;
                         self.overlay = Overlay::None;
+                        use std::io::Write;
+                        let _ = write!(std::io::stdout(), "\x1b]999;theme={}\x07", name);
+                        let _ = std::io::stdout().flush();
                         self.flash(format!(
                             "theme: {} (saved)",
                             crate::theme::theme_label(name)
