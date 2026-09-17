@@ -10,10 +10,8 @@ use crate::session::{SessionState, SessStatus};
 use std::path::PathBuf;
 use std::time::Duration;
 
-pub fn setup_demo_app(app: &mut App, theme: Option<&str>) {
-    let t = theme.unwrap_or("pine-grove");
-    crate::theme::set_theme(t);
-    app.is_demo = true;
+pub fn setup_demo_app(app: &mut App) {
+    crate::theme::set_theme("ember-gruv");
 
     let sessions_meta = [
         (1, "auth", "src/auth.rs", "anthropic", "claude-3-5-sonnet"),
@@ -636,7 +634,7 @@ mod tests {
         let manager = Manager::new(tx, cfg.clone());
         let mut app = App::new(cfg, manager, PathBuf::from("."));
 
-        setup_demo_app(&mut app, None);
+        setup_demo_app(&mut app);
 
         assert_eq!(app.sessions.len(), 4);
         assert_eq!(app.sessions[0].name, "auth");

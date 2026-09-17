@@ -28,10 +28,25 @@ pub type AgentFactory =
     Arc<dyn Fn(&str, &str, &str) -> Result<Arc<AgentLoop>, ProviderError> + Send + Sync>;
 
 struct Inner {
+    /// Unique per process. The session counter restarts at zero on every
+    /// launch, so an id built from the counter alone collides with a session
+    /// restored from a previous run — they would then share an event route, a
+    /// transcript file, and a place in the workspace.
+    instance: String,
     factory: AgentFactory,
     default_agent: Arc<AgentLoop>,
     default_key: (String, String, String),
     sessions: Mutex<HashMap<String, LocalSession>>,
+}
+
+/// A token unique to this process, used to keep session ids distinct across
+/// launches.
+fn instance_token() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{:x}{:x}", nanos, std::process::id())
 }
 
 pub struct LocalProvider {
@@ -60,6 +75,7 @@ impl LocalProvider {
         let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             inner: Arc::new(Inner {
+                instance: instance_token(),
                 factory,
                 default_agent,
                 default_key,
@@ -83,8 +99,22 @@ impl LocalProvider {
     }
 
     pub fn register(&self, dir: &str, title: &str) -> ProviderSession {
-        let n = self.seq.fetch_add(1, Ordering::Relaxed);
-        let id = format!("theta-local-{n}");
+        // The counter restarts at zero each launch, so an id made only from it
+        // repeats an id from a previous run. Two sessions then share one event
+        // route and one transcript file: a turn's output lands in whichever of
+        // them routes first, which splits one reply across several panes. The
+        // instance token makes the id unique across launches; the loop is a
+        // second guard in case a sidecar of that name somehow exists.
+        let id = loop {
+            let n = self.seq.fetch_add(1, Ordering::Relaxed);
+            let candidate = format!("theta-local-{}-{n}", self.inner.instance);
+            let taken = SessionTree::sidecar_path(&candidate)
+                .map(|p| p.exists())
+                .unwrap_or(false);
+            if !taken && !self.inner.sessions.lock().unwrap().contains_key(&candidate) {
+                break candidate;
+            }
+        };
         let dir = if dir.is_empty() { self.default_dir.clone() } else { dir.to_string() };
         let session = ProviderSession {
             provider: ProviderKind::Local,
@@ -1120,4 +1150,31 @@ mod tests {
         assert!(local.capabilities().native_fork);
         assert!(local.capabilities().native_resume);
     }
+
+    #[test]
+    fn session_ids_are_unique_across_launches() {
+        // The bug: the counter restarted at zero every launch, so a session
+        // restored from a previous run (`theta-local-1`) collided with a newly
+        // registered one of the same name. They then shared an event route, a
+        // transcript file and a workspace slot, which split one turn's output
+        // across several panes.
+        // Two launches must not mint the same id for their first session. With
+        // a bare counter both would produce `theta-local-0`; the token makes
+        // them differ.
+        let first_launch = instance_token();
+        let second_launch = instance_token();
+        assert!(!first_launch.is_empty());
+        assert_ne!(
+            first_launch, second_launch,
+            "a token must distinguish separate launches"
+        );
+        assert_ne!(
+            format!("theta-local-{first_launch}-0"),
+            format!("theta-local-{second_launch}-0"),
+            "so the first session of each launch has a distinct id"
+        );
+        // The counter still keeps ids ordered within a launch.
+        assert!(format!("theta-local-{first_launch}-1").ends_with("-1"));
+    }
+
 }

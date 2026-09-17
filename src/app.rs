@@ -422,9 +422,6 @@ pub struct App {
     /// patches over text. main.rs clears the screen and every cached render
     /// before the next frame.
     pub needs_clear: bool,
-    /// Set when a redraw must happen immediately rather than at the next frame
-    /// boundary: input, which is latency-sensitive, and full repaints.
-    pub urgent: bool,
     pub last_newline: Option<Instant>,
     pub notifications: NotificationPolicy,
     pub tick: u64,
@@ -432,7 +429,6 @@ pub struct App {
     pub dirty: bool,
     pub should_quit: bool,
     pub restart: bool,
-    pub is_demo: bool,
     /// When set, quit (and re-exec) after this instant so the `/refresh` flash
     /// is actually drawn before the process replaces itself.
     pub refresh_quit_at: Option<Instant>,
@@ -503,7 +499,6 @@ impl App {
             initial_dir,
             flash: None,
             needs_clear: false,
-            urgent: false,
             last_newline: None,
             notifications: NotificationPolicy::new(8000),
             tick: 0,
@@ -511,7 +506,6 @@ impl App {
             dirty: true,
             should_quit: false,
             restart: false,
-            is_demo: false,
             refresh_quit_at: None,
             git_cache: GitCache::new(),
             git_display: None,
@@ -821,14 +815,6 @@ impl App {
     }
 
     pub fn submit_input(&mut self, id: u32) {
-        if self.is_demo {
-            if let Some(s) = self.session_mut(id) {
-                s.input.clear();
-                s.dirty = true;
-            }
-            self.dirty = true;
-            return;
-        }
         if let Some(s) = self.session(id) {
             if let Some((send, cmd)) = parse_shell_line(s.input.text()) {
                 let limit = self.cfg.ui.history_limit;
@@ -2192,10 +2178,6 @@ impl App {
         if let Some(name) = names.get(self.theme_ui.selected) {
             crate::theme::set_theme(name);
             self.conv_cache.clear();
-            self.needs_clear = true;
-            use std::io::Write;
-            let _ = write!(std::io::stdout(), "\x1b]999;theme={}\x07", name);
-            let _ = std::io::stdout().flush();
         }
         self.dirty = true;
     }
@@ -2557,18 +2539,12 @@ impl App {
     fn handle_mouse(&mut self, m: MouseEvent) {
         match m.kind {
             MouseEventKind::ScrollUp => {
-                if self.overlay == Overlay::Theme {
-                    let names = crate::theme::theme_names();
-                    if self.theme_ui.selected > 0 {
-                        self.theme_ui.selected -= 1;
-                        self.preview_theme(&names);
-                    }
-                    return;
-                }
                 self.select = None;
-                let stick = self.focused().map(|s| s.stick_bottom).unwrap_or(false);
+                let (stick, sid) = match self.focused() {
+                    Some(s) => (s.stick_bottom, s.id),
+                    None => (false, 0),
+                };
                 let bottom = if stick {
-                    let sid = self.focused().map(|s| s.id).unwrap_or(0);
                     let total = self.conv_cache.get(&sid).map(|c| c.lines.len()).unwrap_or(0);
                     total.saturating_sub(self.pane_view_height())
                 } else {
@@ -2584,14 +2560,6 @@ impl App {
                 self.dirty = true;
             }
             MouseEventKind::ScrollDown => {
-                if self.overlay == Overlay::Theme {
-                    let names = crate::theme::theme_names();
-                    if self.theme_ui.selected + 1 < names.len() {
-                        self.theme_ui.selected += 1;
-                        self.preview_theme(&names);
-                    }
-                    return;
-                }
                 self.select = None;
                 let h = self.pane_view_height();
                 let sid = self.focused().map(|s| s.id).unwrap_or(0);
@@ -4200,11 +4168,7 @@ impl App {
                         crate::theme::set_theme(&original);
                         self.cfg.theme = original.clone();
                         self.conv_cache.clear();
-                        self.needs_clear = true;
                         self.overlay = Overlay::None;
-                        use std::io::Write;
-                        let _ = write!(std::io::stdout(), "\x1b]999;theme={}\x07", original);
-                        let _ = std::io::stdout().flush();
                         self.flash(format!("theme: {}", crate::theme::theme_label(&original)));
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
@@ -4234,11 +4198,7 @@ impl App {
                         self.cfg.theme = name.to_string();
                         let _ = self.cfg.save();
                         self.conv_cache.clear();
-                        self.needs_clear = true;
                         self.overlay = Overlay::None;
-                        use std::io::Write;
-                        let _ = write!(std::io::stdout(), "\x1b]999;theme={}\x07", name);
-                        let _ = std::io::stdout().flush();
                         self.flash(format!(
                             "theme: {} (saved)",
                             crate::theme::theme_label(name)

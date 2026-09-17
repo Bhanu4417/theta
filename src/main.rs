@@ -60,7 +60,6 @@ struct Args {
     prompt: Vec<String>,
     check_ai: bool,
     model: Option<String>,
-    theme: Option<String>,
 }
 
 fn usage() -> &'static str {
@@ -108,7 +107,6 @@ fn parse_args_from(argv: impl IntoIterator<Item = String>) -> Args {
         prompt: Vec::new(),
         check_ai: false,
         model: None,
-        theme: None,
     };
     let mut positional: Vec<String> = Vec::new();
     let mut argv = argv.into_iter();
@@ -125,16 +123,10 @@ fn parse_args_from(argv: impl IntoIterator<Item = String>) -> Args {
             "--check-ai" => args.check_ai = true,
             // Takes the next argument, or the part after `--model=`.
             "--model" => args.model = argv.next(),
-            "--theme" => args.theme = argv.next(),
-            _ => {
-                if let Some(m) = a.strip_prefix("--model=") {
-                    args.model = Some(m.to_string());
-                } else if let Some(t) = a.strip_prefix("--theme=") {
-                    args.theme = Some(t.to_string());
-                } else {
-                    positional.push(a);
-                }
-            }
+            _ => match a.strip_prefix("--model=") {
+                Some(m) => args.model = Some(m.to_string()),
+                None => positional.push(a),
+            },
         }
     }
     if args.print || args.json || args.check_ai {
@@ -165,9 +157,6 @@ async fn main() -> Result<()> {
     let mut cfg = config::Config::load()?;
     if let Some(model) = args.model.as_ref().filter(|m| !m.trim().is_empty()) {
         cfg.ai.model = model.trim().to_string();
-    }
-    if let Some(t) = args.theme.as_ref().filter(|t| !t.trim().is_empty()) {
-        cfg.theme = t.trim().to_string();
     }
     theme::set_theme(&cfg.theme);
 
@@ -218,8 +207,7 @@ async fn main() -> Result<()> {
     let mut app = app::App::new(cfg, manager, initial_dir);
 
     if args.demo {
-        app.is_demo = true;
-        demo::setup_demo_app(&mut app, args.theme.as_deref());
+        demo::setup_demo_app(&mut app);
         let demo_tx = tx.clone();
         tokio::spawn(async move {
             demo::run_demo_loop(demo_tx).await;
@@ -378,14 +366,6 @@ async fn run(
     let mut events = EventStream::new().fuse();
     let mut tick = tokio::time::interval(Duration::from_millis(40));
 
-    // At most one frame per interval. A streamed reply marks the app dirty on
-    // every token, which can be hundreds of times a second; drawing each one
-    // re-wraps text faster than it can be read and makes the pane flicker.
-    // Coalescing to a frame rate keeps it smooth, and typing still feels
-    // instant because input preempts the wait.
-    const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(16);
-    let mut last_draw = std::time::Instant::now();
-
     loop {
         if app.needs_clear {
             // A resize can leave cells from the previous, wider layout behind.
@@ -394,54 +374,26 @@ async fn run(
             terminal.clear()?;
             app.needs_clear = false;
             app.dirty = true;
-            app.urgent = true;
         }
-
         if app.dirty {
-            let due = app.urgent || last_draw.elapsed() >= MIN_RENDER_INTERVAL;
-            if due {
-                terminal.draw(|f| ui::render(f, app))?;
-                app.dirty = false;
-                app.urgent = false;
-                last_draw = std::time::Instant::now();
-            }
+            terminal.draw(|f| ui::render(f, app))?;
+            app.dirty = false;
         }
-
-        // When a frame is pending but throttled, wake exactly when it is due
-        // rather than waiting for the next tick.
-        let frame_due = app.dirty.then(|| last_draw + MIN_RENDER_INTERVAL);
 
         tokio::select! {
             maybe_ev = events.next() => {
                 match maybe_ev {
-                    Some(Ok(ev)) => {
-                        // Input is latency-sensitive, so it must not wait behind
-                        // a coalesced frame.
-                        app.urgent = true;
-                        app.handle_term_event(ev).await;
-                    }
+                    Some(Ok(ev)) => app.handle_term_event(ev).await,
                     Some(Err(_)) => {}
                     None => {}
                 }
             }
-            maybe_aev = rx.recv() => {
-                match maybe_aev {
-                    Some(aev) => app.handle_event(aev).await,
-                    None => {
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
-                }
+            Some(aev) = rx.recv() => {
+                app.handle_event(aev).await;
             }
             _ = tick.tick() => {
                 app.on_tick().await;
             }
-            _ = async {
-                match frame_due {
-                    Some(at) => tokio::time::sleep_until(at.into()).await,
-                    // Nothing pending: never resolve, so this branch is inert.
-                    None => std::future::pending::<()>().await,
-                }
-            } => {}
         }
 
         if app.should_quit {
@@ -625,14 +577,5 @@ mod tests {
     fn demo_flag_parsed() {
         let a = parse(&["--demo"]);
         assert!(a.demo);
-    }
-
-    #[test]
-    fn theme_flag_parsed() {
-        let a = parse(&["--theme", "theta-night"]);
-        assert_eq!(a.theme.as_deref(), Some("theta-night"));
-
-        let a2 = parse(&["--theme=rose-fjord"]);
-        assert_eq!(a2.theme.as_deref(), Some("rose-fjord"));
     }
 }
