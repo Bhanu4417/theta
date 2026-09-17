@@ -5,6 +5,7 @@ mod ai;
 mod app;
 mod config;
 mod credentials;
+mod demo;
 mod events;
 #[allow(dead_code)]
 mod export;
@@ -51,6 +52,7 @@ struct Args {
     no_restore: bool,
     log: bool,
     run: bool,
+    demo: bool,
     help: bool,
     version: bool,
     print: bool,
@@ -74,6 +76,7 @@ OPTIONS:
     --no-restore       Do not restore the last workspace
     --log              Open/tail the newest debug log (request → provider/model)
     --run              Start the TUI (with --log: record to the log file)
+    --demo             Run interactive multi-agent demo scenario
     -p, --print        Run one prompt headlessly and print the reply
     --json             With --print, emit events as JSON lines
     --check-ai [PROV…] Live-verify provider credentials (default: [ai].provider)
@@ -96,6 +99,7 @@ fn parse_args_from(argv: impl IntoIterator<Item = String>) -> Args {
         no_restore: false,
         log: false,
         run: false,
+        demo: false,
         help: false,
         version: false,
         print: false,
@@ -111,6 +115,7 @@ fn parse_args_from(argv: impl IntoIterator<Item = String>) -> Args {
             "--no-restore" => args.no_restore = true,
             "--log" => args.log = true,
             "--run" => args.run = true,
+            "--demo" => args.demo = true,
             "--help" | "-h" => args.help = true,
             "--version" | "-V" => args.version = true,
             "--print" | "-p" => args.print = true,
@@ -155,7 +160,7 @@ async fn main() -> Result<()> {
     }
     theme::set_theme(&cfg.theme);
 
-    let recording = args.run || args.print || args.json || args.check_ai;
+    let recording = args.run || args.print || args.json || args.check_ai || args.demo;
     if args.log && !recording {
         return view_log();
     }
@@ -193,7 +198,7 @@ async fn main() -> Result<()> {
     );
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let manager = manager::Manager::new(tx, cfg.clone());
+    let manager = manager::Manager::new(tx.clone(), cfg.clone());
     let initial_dir = args
         .dir
         .clone()
@@ -201,11 +206,18 @@ async fn main() -> Result<()> {
 
     let mut app = app::App::new(cfg, manager, initial_dir);
 
-    if !app.provider_configured() {
-        app.flash("no API key yet — run /login to add one");
+    if args.demo {
+        demo::setup_demo_app(&mut app);
+        let demo_tx = tx.clone();
+        tokio::spawn(async move {
+            demo::run_demo_loop(demo_tx).await;
+        });
+    } else {
+        if !app.provider_configured() {
+            app.flash("no API key yet — run /login to add one");
+        }
+        app.preload_sessions(app.initial_dir.clone());
     }
-
-    app.preload_sessions(app.initial_dir.clone());
 
     install_panic_hook();
     let mut terminal = init_terminal()?;
@@ -345,7 +357,7 @@ async fn run(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<events::AppEvent>,
     args: &Args,
 ) -> Result<()> {
-    if !args.no_restore && app.cfg.ui.restore {
+    if !args.demo && !args.no_restore && app.cfg.ui.restore {
         app.restore_workspace();
     }
     app.preload_known_dirs();
@@ -400,7 +412,9 @@ async fn run(
         }
     }
 
-    app.save_workspace();
+    if !args.demo {
+        app.save_workspace();
+    }
     Ok(())
 }
 
@@ -557,5 +571,11 @@ mod tests {
         let a = parse(&["--print", "hi"]);
         assert_eq!(a.model, None);
         assert_eq!(a.prompt, vec!["hi".to_string()]);
+    }
+
+    #[test]
+    fn demo_flag_parsed() {
+        let a = parse(&["--demo"]);
+        assert!(a.demo);
     }
 }
