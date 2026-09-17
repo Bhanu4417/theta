@@ -12,7 +12,7 @@ no server to start, no daemon to babysit, no wrapper around somebody else's CLI.
 [![CI](https://github.com/Bhanu4417/theta/actions/workflows/ci.yml/badge.svg)](https://github.com/Bhanu4417/theta/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-e0dbce.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-e0dbce.svg)](https://www.rust-lang.org)
-[![Tests](https://img.shields.io/badge/tests-247%20passing-e0dbce.svg)](#testing)
+[![Tests](https://img.shields.io/badge/tests-251%20passing-e0dbce.svg)](#testing)
 
 </div>
 
@@ -258,8 +258,13 @@ time. Theta retries those rather than surfacing an error:
 - **How long:** `Retry-After` is honoured when the server sends one (either
   seconds or an HTTP date, both forms). Otherwise exponential backoff from
   `retry_base_ms`, capped at `retry_max_ms`.
-- **How it looks:** the pane title counts down — `↻ 7s (2/6) · provider error
-  (500)` — so a slow model reads as *waiting*, not frozen.
+- **How many:** unlimited by default (`max_retries = 0`). A busy gateway can be
+  unavailable for minutes, and giving up mid-turn loses the work. Set
+  `max_retries` to a number to bound it.
+- **How it looks:** the pane title counts down and shows the reason —
+  `↻ 7s (attempt 4) · provider error (500)` — so a slow model reads as
+  *waiting*, not frozen. **Ctrl+C stops it at any point**, including during the
+  backoff itself.
 - **What is not retried:** `401`/`403` (a key problem) and `404` (a wrong
   endpoint). Retrying those just wastes time.
 
@@ -318,7 +323,7 @@ provider = "openai"             # a preset id, or set base_url for anything else
 base_url = ""                   # an OpenAI-compatible endpoint overrides the preset
 api_key_env = "OPENAI_API_KEY"
 model = "gpt-4o"
-max_retries = 6                 # attempts for a retryable failure
+max_retries = 0                 # 0 = keep retrying; N = give up after N
 retry_base_ms = 500             # first backoff; doubles each attempt
 retry_max_ms = 30000            # backoff ceiling
 timeout_secs = 300              # idle read timeout; 0 disables

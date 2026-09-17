@@ -26,6 +26,9 @@ pub struct AiConfig {
     pub base_url: String,
     pub api_key_env: String,
     pub model: String,
+    /// Attempts for a retryable failure. `0` keeps retrying — the session can
+    /// always be interrupted, and a busy gateway is often unavailable for
+    /// minutes rather than seconds.
     pub max_retries: u32,
     /// Longest a single retry waits (milliseconds). Exponential backoff is
     /// capped here, so a long outage keeps retrying without parking the session.
@@ -148,10 +151,12 @@ impl Default for AiConfig {
             base_url: String::new(),
             api_key_env: "OPENAI_API_KEY".into(),
             model: "gpt-4o".into(),
-            // A busy model behind a shared gateway returns 500s and 429s for a
-            // while. Three attempts over ~3.5s gave up far too early; these
-            // numbers ride out a short spike.
-            max_retries: 6,
+            // Unlimited by default. A busy model behind a shared gateway can
+            // return 500s and 429s for minutes, and giving up mid-turn loses
+            // the work. The pane counts down and Ctrl+C stops it, so there is
+            // no need for a cap. Raise `retry_max_ms` if the backoff should be
+            // gentler.
+            max_retries: 0,
             retry_base_ms: 500,
             retry_max_ms: 30_000,
             timeout_secs: 300,

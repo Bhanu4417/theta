@@ -368,7 +368,11 @@ fn pane_title(sess: &SessionState, focused: bool, width: u16, tick: u64) -> Line
         } else {
             format!(" {secs}s")
         };
-        let attempts = if r.max_attempts > 1 {
+        // `max_attempts == 0` is "keep trying", so the count has no denominator
+        // and the label says so rather than reading like a limit.
+        let attempts = if r.max_attempts == 0 {
+            format!(" (attempt {})", r.attempt)
+        } else if r.max_attempts > 1 {
             format!(" ({}/{})", r.attempt, r.max_attempts)
         } else {
             String::new()

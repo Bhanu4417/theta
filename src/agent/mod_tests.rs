@@ -1875,3 +1875,135 @@ async fn an_empty_answer_is_only_retried_once() {
     });
     assert!(told, "the fallback message must say what to try next");
 }
+
+/// Fails a fixed number of times, then answers. Used to prove that
+/// `max_retries = 0` keeps going past any finite limit.
+struct FailsThenAnswers {
+    failures_left: Mutex<usize>,
+}
+
+impl Provider for FailsThenAnswers {
+    fn id(&self) -> &'static str {
+        "fails-then-answers"
+    }
+    fn stream<'a>(
+        &'a self,
+        _request: ChatRequest,
+        _on_event: &'a mut (dyn FnMut(ProviderEvent) + Send),
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<AssistantTurn, ProviderError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let mut left = self.failures_left.lock().unwrap();
+            if *left > 0 {
+                *left -= 1;
+                return Err(ProviderError::Status {
+                    code: 503,
+                    message: "Service Unavailable".into(),
+                    retry_after_ms: None,
+                });
+            }
+            Ok(AssistantTurn {
+                text: "up again".into(),
+                tool_calls: vec![],
+                finish: Some(FinishReason::Stop),
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn zero_max_retries_keeps_retrying_past_any_finite_limit() {
+    use crate::harness::transcript::PartKind;
+    use crate::harness::TranscriptUpdate;
+
+    // Ten failures is well past the old default of three or six. With
+    // `max_retries = 0` the turn must still recover.
+    let agent = AgentLoop::new(
+        Box::new(FailsThenAnswers { failures_left: Mutex::new(10) }),
+        "test",
+    )
+    .with_retry(0, 1)
+    .with_retry_cap(5);
+
+    let dir = std::env::temp_dir();
+    let mut history = Vec::new();
+    let events = std::sync::Arc::new(Mutex::new(Vec::<HarnessEvent>::new()));
+    let sink = events.clone();
+    let mut emit = move |e: HarnessEvent| sink.lock().unwrap().push(e);
+    agent.run_turn(&mut history, "go", &dir, &mut emit).await.unwrap();
+
+    let attempts = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| matches!(e, HarnessEvent::SessionRetrying { .. }))
+        .count();
+    assert_eq!(attempts, 10, "every failure should be retried, not just three");
+
+    let answered = events.lock().unwrap().iter().any(|e| match e {
+        HarnessEvent::Transcript(TranscriptUpdate::Part(p)) => matches!(
+            &p.kind,
+            PartKind::Text { text, .. } if text.contains("up again")
+        ),
+        _ => false,
+    });
+    assert!(answered, "the turn recovers once the provider is back");
+}
+
+#[tokio::test]
+async fn unlimited_retries_report_an_attempt_without_a_denominator() {
+    // The label must not read like a limit when there isn't one.
+    let agent = AgentLoop::new(
+        Box::new(FailsThenAnswers { failures_left: Mutex::new(2) }),
+        "test",
+    )
+    .with_retry(0, 1);
+    let dir = std::env::temp_dir();
+    let mut history = Vec::new();
+    let events = std::sync::Arc::new(Mutex::new(Vec::<HarnessEvent>::new()));
+    let sink = events.clone();
+    let mut emit = move |e: HarnessEvent| sink.lock().unwrap().push(e);
+    agent.run_turn(&mut history, "go", &dir, &mut emit).await.unwrap();
+
+    for e in events.lock().unwrap().iter() {
+        if let HarnessEvent::SessionRetrying { max_attempts, .. } = e {
+            assert_eq!(*max_attempts, 0, "0 signals 'keep trying' to the UI");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_cancelled_backoff_stops_waiting_immediately() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    // A long backoff must not ignore an interrupt, or a session with unlimited
+    // retries would have no way out.
+    let cancel = std::sync::Arc::new(AtomicBool::new(false));
+    let flag = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        flag.store(true, Ordering::Relaxed);
+    });
+
+    let started = std::time::Instant::now();
+    let completed =
+        super::sleep_cancellable(std::time::Duration::from_secs(30), &cancel).await;
+    let waited = started.elapsed();
+
+    assert!(!completed, "a cancelled wait reports that it did not finish");
+    assert!(
+        waited < std::time::Duration::from_secs(2),
+        "it must stop promptly, waited {waited:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_uninterrupted_backoff_waits_the_full_time() {
+    use std::sync::atomic::AtomicBool;
+    let cancel = AtomicBool::new(false);
+    let started = std::time::Instant::now();
+    let completed =
+        super::sleep_cancellable(std::time::Duration::from_millis(250), &cancel).await;
+    assert!(completed);
+    assert!(started.elapsed() >= std::time::Duration::from_millis(240));
+}

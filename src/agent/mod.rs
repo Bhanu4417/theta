@@ -416,7 +416,13 @@ impl AgentLoop {
                             break Some(turn);
                         }
                         Err(e) => {
-                            if attempt < self.max_retries && is_retryable(&e) {
+                            // `max_retries == 0` keeps retrying. A busy
+                            // gateway can be unavailable for minutes, and
+                            // giving up mid-turn loses the work; the user can
+                            // always interrupt.
+                            let more_attempts =
+                                self.max_retries == 0 || attempt < self.max_retries;
+                            if more_attempts && is_retryable(&e) {
                                 attempt += 1;
                                 // A busy model behind a shared gateway mostly
                                 // fails with 500 or 429. Wait as long as the
@@ -430,8 +436,13 @@ impl AgentLoop {
                                     self.retry_max_ms,
                                 );
                                 crate::tlog!(
-                                    "RETRY attempt {attempt}/{} in {}ms: {e}",
-                                    self.max_retries,
+                                    "RETRY attempt {}{} in {}ms: {e}",
+                                    attempt,
+                                    if self.max_retries == 0 {
+                                        String::new()
+                                    } else {
+                                        format!("/{}", self.max_retries)
+                                    },
                                     delay.as_millis()
                                 );
                                 emit(HarnessEvent::SessionRetrying {
@@ -442,7 +453,16 @@ impl AgentLoop {
                                 });
                                 acc_text.clear();
                                 turn_usage = None;
-                                tokio::time::sleep(delay).await;
+                                // Waiting must be interruptible. A plain sleep
+                                // ignores Ctrl+C, so a long backoff looked like
+                                // a frozen session — and with unlimited retries
+                                // that would be the only way out.
+                                if !sleep_cancellable(delay, cancel).await {
+                                    crate::tlog!("RETRY cancelled during backoff");
+                                    emit(HarnessEvent::SessionInterrupted);
+                                    emit(HarnessEvent::SessionIdle);
+                                    return Ok(());
+                                }
                                 continue;
                             }
                             crate::tlog!(
@@ -1101,6 +1121,29 @@ pub(crate) fn short_reason(e: &ProviderError) -> String {
             }
         }
         other => other.to_string(),
+    }
+}
+
+/// Sleep, returning `false` if the session was cancelled first.
+///
+/// A plain `tokio::time::sleep` ignores an interrupt, so a 30-second backoff
+/// made the pane look frozen and Ctrl+C did nothing. Checks every 100ms so an
+/// interrupt is felt immediately without busy-waiting.
+async fn sleep_cancellable(
+    total: std::time::Duration,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> bool {
+    let step = std::time::Duration::from_millis(100);
+    let deadline = std::time::Instant::now() + total;
+    loop {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        tokio::time::sleep(step.min(deadline - now)).await;
     }
 }
 
