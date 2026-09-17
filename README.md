@@ -12,7 +12,7 @@ no server to start, no daemon to babysit, no wrapper around somebody else's CLI.
 [![CI](https://github.com/Bhanu4417/theta/actions/workflows/ci.yml/badge.svg)](https://github.com/Bhanu4417/theta/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-e0dbce.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-e0dbce.svg)](https://www.rust-lang.org)
-[![Tests](https://img.shields.io/badge/tests-251%20passing-e0dbce.svg)](#testing)
+[![Tests](https://img.shields.io/badge/tests-254%20passing-e0dbce.svg)](#testing)
 
 </div>
 
@@ -36,7 +36,7 @@ no server to start, no daemon to babysit, no wrapper around somebody else's CLI.
 ├───────────────────────────────┼──────────────────────────────────────────┤
 │ Θ Ask this agent…             │ Θ Ask this agent…                        │
 └───────────────────────────────┴──────────────────────────────────────────┘
- 1 session · 1 working ⣾   main ↑2 · +48 −12      ^K Commands  ^N New  ^Q Quit
+ 1 session · 1 working ⣾   main ↑2 · +125 −8      Ctrl+K Commands  Ctrl+N New  Ctrl+Q Quit
 ```
 
 ## Why Theta

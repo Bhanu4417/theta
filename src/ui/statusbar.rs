@@ -91,6 +91,8 @@ pub fn render(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
     if let Some(git) = &app.git_display {
         if let Some(branch) = &git.branch {
             right.push(Span::styled(branch.clone(), dim));
+            // Added/removed lines and the ahead/behind counts, the way a
+            // reviewer reads a branch: `↑2 ↓1 +48 -12`.
             let summary = git.summary();
             if !summary.is_empty() {
                 right.push(Span::styled(
