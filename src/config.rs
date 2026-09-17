@@ -27,6 +27,9 @@ pub struct AiConfig {
     pub api_key_env: String,
     pub model: String,
     pub max_retries: u32,
+    /// Longest a single retry waits (milliseconds). Exponential backoff is
+    /// capped here, so a long outage keeps retrying without parking the session.
+    pub retry_max_ms: u64,
     pub retry_base_ms: u64,
     pub timeout_secs: u64,
     pub max_turns: usize,
@@ -145,8 +148,12 @@ impl Default for AiConfig {
             base_url: String::new(),
             api_key_env: "OPENAI_API_KEY".into(),
             model: "gpt-4o".into(),
-            max_retries: 3,
+            // A busy model behind a shared gateway returns 500s and 429s for a
+            // while. Three attempts over ~3.5s gave up far too early; these
+            // numbers ride out a short spike.
+            max_retries: 6,
             retry_base_ms: 500,
+            retry_max_ms: 30_000,
             timeout_secs: 300,
             max_turns: 0,
             reasoning_effort: String::new(),

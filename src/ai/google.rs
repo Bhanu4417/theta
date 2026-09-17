@@ -35,9 +35,14 @@ impl Google {
         }
         let resp = req.send().await.map_err(net)?;
         let status = resp.status();
+        let retry_after_ms = crate::ai::retry_after_ms(resp.headers());
         let text = resp.text().await.map_err(net)?;
         if !status.is_success() {
-            return Err(ProviderError::Protocol(format!("HTTP {status}: {}", text.trim())));
+            return Err(ProviderError::Status {
+                code: status.as_u16(),
+                message: text.trim().to_string(),
+                retry_after_ms,
+            });
         }
         let v: Value =
             serde_json::from_str(&text).map_err(|e| ProviderError::Protocol(e.to_string()))?;

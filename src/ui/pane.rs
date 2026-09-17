@@ -355,10 +355,29 @@ fn pane_title(sess: &SessionState, focused: bool, width: u16, tick: u64) -> Line
     let max_name = width.saturating_sub(8) as usize;
     let name = conversation::truncate(&sess.name, max_name);
 
-    let left = vec![
+    let mut left = vec![
         Span::styled(" ".to_string(), Style::default()),
         Span::styled(name, name_style),
     ];
+    // A retry shows its countdown in the title: "↻ 7s (2/5) · rate limited".
+    // Without it a busy model looks like a frozen app.
+    if let SessStatus::Retrying(r) = &sess.status {
+        let secs = r.secs_left();
+        let wait = if r.delay_ms == 0 {
+            String::new()
+        } else {
+            format!(" {secs}s")
+        };
+        let attempts = if r.max_attempts > 1 {
+            format!(" ({}/{})", r.attempt, r.max_attempts)
+        } else {
+            String::new()
+        };
+        left.push(Span::styled(
+            format!("{wait}{attempts} · {}", r.reason),
+            theme::fg(pal().yellow),
+        ));
+    }
     let left_len: usize = left.iter().map(|s| s.content.chars().count()).sum();
     let right_len = 1;
     let pad = (width as usize).saturating_sub(left_len + right_len + 2);

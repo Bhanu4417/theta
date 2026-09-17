@@ -13,7 +13,14 @@ pub enum HarnessEvent {
     SessionIdle,
     SessionWorking,
     SessionThinking,
-    SessionRetrying(String),
+    /// A retry is scheduled. Carries the attempt number and when it will
+    /// happen, so the UI can count down instead of showing a static message.
+    SessionRetrying {
+        attempt: u32,
+        max_attempts: u32,
+        reason: String,
+        delay_ms: u64,
+    },
     SessionError(String),
     SessionInterrupted,
 

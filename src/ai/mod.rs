@@ -262,17 +262,109 @@ pub fn is_context_overflow_error(e: &ProviderError) -> bool {
         || m.contains("reduce the length")
 }
 
+/// Whether an HTTP status is worth retrying.
+///
+/// `408 Request Timeout`, `425 Too Early`, `429 Too Many Requests` and every
+/// `5xx`, which is the rule the reference implementation uses. A busy model
+/// behind a shared gateway mostly returns 500s and 429s, and those are the
+/// failures a retry actually recovers from.
+/// Parse a `Retry-After` header into milliseconds.
+///
+/// The header is either a number of seconds or an HTTP date. Both forms are
+/// handled, because a gateway that sends one form and not the other would
+/// otherwise lose the server's own estimate of when it will be ready.
+pub fn retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?.trim();
+    if let Ok(secs) = raw.parse::<f64>() {
+        if secs.is_finite() && secs >= 0.0 {
+            return Some((secs * 1000.0) as u64);
+        }
+        return None;
+    }
+    // HTTP date form: seconds from now, floored at zero for a past date.
+    let when = httpdate_secs(raw)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    Some(((when - now).max(0) as u64).saturating_mul(1000))
+}
+
+/// Seconds since the epoch for an RFC 7231 date such as
+/// `Wed, 21 Oct 2015 07:28:00 GMT`.
+///
+/// A small parser rather than a date dependency, for a header that is almost
+/// always sent as plain seconds anyway.
+fn httpdate_secs(s: &str) -> Option<i64> {
+    let s = s.trim().trim_end_matches(" GMT").trim();
+    // "Wed, 21 Oct 2015 07:28:00" -> drop the weekday.
+    let s = s.split_once(", ").map(|(_, rest)| rest).unwrap_or(s);
+    let mut parts = s.split_whitespace();
+    let day: i64 = parts.next()?.parse().ok()?;
+    let month = month_number(parts.next()?)?;
+    let year: i64 = parts.next()?.parse().ok()?;
+    let (hh, mm, ss) = {
+        let mut t = parts.next()?.split(':');
+        (
+            t.next()?.parse::<i64>().ok()?,
+            t.next()?.parse::<i64>().ok()?,
+            t.next().unwrap_or("0").parse::<i64>().ok()?,
+        )
+    };
+
+    // Days since the epoch (civil-from-days).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    Some(days * 86400 + hh * 3600 + mm * 60 + ss)
+}
+
+fn month_number(name: &str) -> Option<i64> {
+    Some(match name {
+        "Jan" => 1, "Feb" => 2, "Mar" => 3, "Apr" => 4, "May" => 5, "Jun" => 6,
+        "Jul" => 7, "Aug" => 8, "Sep" => 9, "Oct" => 10, "Nov" => 11, "Dec" => 12,
+        _ => return None,
+    })
+}
+
+pub fn is_retryable_status(code: u16) -> bool {
+    matches!(code, 408 | 425 | 429) || (500..=599).contains(&code)
+}
+
 pub fn is_retryable_provider_error(e: &ProviderError) -> bool {
     match e {
+        // A dropped connection or a resolution failure: the same request will
+        // usually succeed on a second attempt.
         ProviderError::Transport(_) | ProviderError::Unavailable(_) => true,
+        ProviderError::Status { code, .. } => is_retryable_status(*code),
         ProviderError::Protocol(m) => {
             let m = m.to_ascii_lowercase();
-            m.contains("429") || m.contains("500") || m.contains("502")
-                || m.contains("503") || m.contains("504") || m.contains("overloaded")
-                || m.contains("timeout")
+            m.contains("overloaded") || m.contains("timeout") || m.contains("timed out")
         }
         _ => false,
     }
+}
+
+/// How long to wait before the next attempt.
+///
+/// A server-supplied `Retry-After` wins: it knows when it will be ready, and
+/// guessing shorter just burns an attempt. Otherwise exponential backoff,
+/// capped so a long outage does not park the session for minutes.
+pub fn retry_delay(
+    e: &ProviderError,
+    attempt: u32,
+    base_ms: u64,
+    max_ms: u64,
+) -> std::time::Duration {
+    if let ProviderError::Status { retry_after_ms: Some(ms), .. } = e {
+        return std::time::Duration::from_millis((*ms).min(max_ms));
+    }
+    let exp = base_ms.saturating_mul(1u64 << (attempt.saturating_sub(1)).min(10));
+    std::time::Duration::from_millis(exp.min(max_ms))
 }
 
 pub async fn stream_with_retry(
@@ -383,7 +475,14 @@ mod tests {
         use crate::providers::ProviderError;
         assert!(is_retryable_provider_error(&ProviderError::Transport("x".into())));
         assert!(is_retryable_provider_error(&ProviderError::Unavailable("x".into())));
-        assert!(is_retryable_provider_error(&ProviderError::Protocol("HTTP 503".into())));
+        // Status codes now arrive as a Status, not buried in a Protocol string,
+        // so the classification sees the code rather than guessing at text.
+        assert!(is_retryable_provider_error(&ProviderError::Status {
+            code: 503,
+            message: "Service Unavailable".into(),
+            retry_after_ms: None,
+        }));
+        assert!(!is_retryable_provider_error(&ProviderError::Protocol("bad json".into())));
         assert!(!is_retryable_provider_error(&ProviderError::Auth("x".into())));
         assert!(!is_retryable_provider_error(&ProviderError::Unsupported("x".into())));
     }
@@ -456,4 +555,107 @@ mod tests {
     fn a_supplied_key_is_accepted() {
         assert!(provider_for_model("openai", "", Some("sk-test".into()), "gpt-4o").is_ok());
     }
+
+    #[test]
+    fn every_5xx_and_the_usual_4xx_are_retryable() {
+        // The rule the reference implementation uses. Substring-matching the
+        // message before this recognized only 500/502/503/504 and missed the
+        // rest, so a 501 or 507 gave up immediately.
+        for code in [408, 425, 429] {
+            assert!(is_retryable_status(code), "{code} should retry");
+        }
+        for code in 500..=599 {
+            assert!(is_retryable_status(code), "{code} should retry");
+        }
+        for code in [400, 401, 403, 404, 422, 451] {
+            assert!(!is_retryable_status(code), "{code} must not retry");
+        }
+    }
+
+    use crate::agent::short_reason;
+
+    #[test]
+    fn a_status_error_is_classified_by_its_code() {
+        let e = ProviderError::Status {
+            code: 500,
+            message: "Internal server error".into(),
+            retry_after_ms: None,
+        };
+        assert!(is_retryable_provider_error(&e));
+        assert_eq!(short_reason(&e), "provider error (500)");
+
+        let e = ProviderError::Status { code: 429, message: String::new(), retry_after_ms: None };
+        assert_eq!(short_reason(&e), "rate limited (429)");
+
+        let e = ProviderError::Status { code: 401, message: String::new(), retry_after_ms: None };
+        assert!(!is_retryable_provider_error(&e), "auth is not a retryable failure");
+    }
+
+    #[test]
+    fn a_failed_connection_is_retryable_and_named_clearly() {
+        // "fail to connect" is what the user actually sees, so the label says so.
+        for (msg, want) in [
+            ("error sending request: connection refused", "could not connect"),
+            ("operation timed out", "network timeout"),
+            ("something else entirely", "network error"),
+        ] {
+            let e = ProviderError::Transport(msg.into());
+            assert!(is_retryable_provider_error(&e), "{msg} must retry");
+            assert_eq!(short_reason(&e), want, "for {msg}");
+        }
+    }
+
+    #[test]
+    fn retry_delay_prefers_retry_after_then_backs_off_with_a_cap() {
+        // A server that says when to come back is believed.
+        let e = ProviderError::Status {
+            code: 429,
+            message: String::new(),
+            retry_after_ms: Some(7_000),
+        };
+        assert_eq!(retry_delay(&e, 1, 500, 30_000).as_millis(), 7_000);
+        // But never beyond the cap.
+        let e = ProviderError::Status {
+            code: 429,
+            message: String::new(),
+            retry_after_ms: Some(999_000),
+        };
+        assert_eq!(retry_delay(&e, 1, 500, 30_000).as_millis(), 30_000);
+
+        // Without one, exponential: 500, 1000, 2000, ...
+        let e = ProviderError::Transport("boom".into());
+        assert_eq!(retry_delay(&e, 1, 500, 30_000).as_millis(), 500);
+        assert_eq!(retry_delay(&e, 2, 500, 30_000).as_millis(), 1_000);
+        assert_eq!(retry_delay(&e, 3, 500, 30_000).as_millis(), 2_000);
+        // And capped rather than growing without bound.
+        assert_eq!(retry_delay(&e, 20, 500, 30_000).as_millis(), 30_000);
+    }
+
+    #[test]
+    fn retry_after_parses_seconds_and_http_dates() {
+        use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+        let mut h = HeaderMap::new();
+        h.insert(RETRY_AFTER, HeaderValue::from_static("12"));
+        assert_eq!(retry_after_ms(&h), Some(12_000));
+
+        // A past date is treated as "now", never a negative wait.
+        h.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
+        assert_eq!(retry_after_ms(&h), Some(0));
+
+        h.remove(RETRY_AFTER);
+        assert_eq!(retry_after_ms(&h), None);
+    }
+
+    #[test]
+    fn http_date_parsing_matches_known_instants() {
+        // 1970-01-01 00:00:00 and a known modern date.
+        assert_eq!(httpdate_secs("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
+        assert_eq!(httpdate_secs("Thu, 01 Jan 1970 00:00:00"), Some(0));
+        // 2015-10-21T07:28:00Z
+        assert_eq!(httpdate_secs("Wed, 21 Oct 2015 07:28:00 GMT"), Some(1_445_412_480));
+    }
+
 }

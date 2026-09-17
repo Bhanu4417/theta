@@ -588,6 +588,7 @@ fn build_agent_with(
         .with_compaction(settings, cfg.compaction.enabled)
         .with_prune(prune)
         .with_retry(cfg.ai.max_retries, cfg.ai.retry_base_ms)
+        .with_retry_cap(cfg.ai.retry_max_ms)
         .with_max_turns(cfg.ai.max_turns)
         .with_reasoning_effort(cfg.ai.reasoning_effort.clone())
         .with_system_appendix(appendix);

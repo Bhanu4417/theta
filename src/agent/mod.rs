@@ -28,6 +28,7 @@ pub struct AgentLoop {
     system_prompt: String,
     reasoning_effort: Option<String>,
     max_turns: usize,
+    retry_max_ms: u64,
     compaction: context::CompactionSettings,
     prune: context::PruneSettings,
     compaction_enabled: bool,
@@ -50,6 +51,7 @@ impl AgentLoop {
             system_prompt: default_system_prompt(),
             reasoning_effort: None,
             max_turns: 0,
+            retry_max_ms: 30_000,
             compaction: context::CompactionSettings::default(),
             prune: context::PruneSettings::default(),
             compaction_enabled: true,
@@ -90,6 +92,13 @@ impl AgentLoop {
 
     pub fn with_extra_tool(mut self, tool: Arc<dyn Tool>) -> Self {
         self.tools.push(tool);
+        self
+    }
+
+    /// Cap the backoff between retries. A long outage still retries, but never
+    /// waits longer than this.
+    pub fn with_retry_cap(mut self, max_ms: u64) -> Self {
+        self.retry_max_ms = max_ms;
         self
     }
 
@@ -409,14 +418,31 @@ impl AgentLoop {
                         Err(e) => {
                             if attempt < self.max_retries && is_retryable(&e) {
                                 attempt += 1;
-                                let delay = self.retry_base_ms.saturating_mul(1u64 << (attempt - 1).min(6));
-                                emit(HarnessEvent::SessionRetrying(format!(
-                                    "retrying {attempt}/{} after {e}",
-                                    self.max_retries
-                                )));
+                                // A busy model behind a shared gateway mostly
+                                // fails with 500 or 429. Wait as long as the
+                                // server asked (Retry-After) or back off
+                                // exponentially, capped so a long outage does
+                                // not park the session for minutes.
+                                let delay = crate::ai::retry_delay(
+                                    &e,
+                                    attempt,
+                                    self.retry_base_ms,
+                                    self.retry_max_ms,
+                                );
+                                crate::tlog!(
+                                    "RETRY attempt {attempt}/{} in {}ms: {e}",
+                                    self.max_retries,
+                                    delay.as_millis()
+                                );
+                                emit(HarnessEvent::SessionRetrying {
+                                    attempt,
+                                    max_attempts: self.max_retries,
+                                    reason: short_reason(&e),
+                                    delay_ms: delay.as_millis() as u64,
+                                });
                                 acc_text.clear();
                                 turn_usage = None;
-                                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                                tokio::time::sleep(delay).await;
                                 continue;
                             }
                             crate::tlog!(
@@ -497,9 +523,12 @@ impl AgentLoop {
                             "RETRY empty answer after {turn} turns: reasoning used the \
                              whole budget; retrying with minimal effort"
                         );
-                        emit(HarnessEvent::SessionRetrying(
-                            "no answer within the output limit — retrying with less thinking".into(),
-                        ));
+                        emit(HarnessEvent::SessionRetrying {
+                            attempt: 1,
+                            max_attempts: 1,
+                            reason: "no answer within the output limit".into(),
+                            delay_ms: 0,
+                        });
                         continue;
                     }
                     let why = match turn_result.finish.as_ref() {
@@ -1044,6 +1073,31 @@ fn now_ms() -> i64 {
 /// tends to request in one batch (read three files, grep two patterns).
 fn is_parallel_safe(tool: &str) -> bool {
     matches!(tool, "read" | "grep" | "glob" | "webfetch")
+}
+
+/// A short, human-readable reason for a retry, for the status line. The full
+/// provider body is often a page of JSON and does not belong there.
+pub(crate) fn short_reason(e: &ProviderError) -> String {
+    match e {
+        ProviderError::Status { code, .. } => match code {
+            429 => "rate limited (429)".to_string(),
+            408 => "request timed out (408)".to_string(),
+            425 => "too early (425)".to_string(),
+            c if (500..=599).contains(c) => format!("provider error ({c})"),
+            c => format!("HTTP {c}"),
+        },
+        ProviderError::Transport(m) => {
+            let m = m.to_ascii_lowercase();
+            if m.contains("connect") || m.contains("connection") {
+                "could not connect".to_string()
+            } else if m.contains("timeout") || m.contains("timed out") {
+                "network timeout".to_string()
+            } else {
+                "network error".to_string()
+            }
+        }
+        other => other.to_string(),
+    }
 }
 
 const MAX_REPEATED_TOOL_FAILURES: usize = 3;

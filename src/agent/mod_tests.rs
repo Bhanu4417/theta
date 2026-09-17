@@ -177,7 +177,7 @@ async fn retries_transient_provider_errors() {
     assert_eq!(*attempts.lock().unwrap(), 3, "two failures then success");
     assert!(events
         .iter()
-        .any(|e| matches!(e, HarnessEvent::SessionRetrying(_))));
+        .any(|e| matches!(e, HarnessEvent::SessionRetrying { .. })));
     assert!(history.iter().any(|m| m.text == "recovered" && m.role == crate::ai::Role::Assistant));
 }
 

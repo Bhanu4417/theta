@@ -66,6 +66,19 @@ pub enum ProviderError {
     SessionNotFound(String),
     Transport(String),
     Protocol(String),
+    /// A non-2xx HTTP response, with the status preserved.
+    ///
+    /// The status is carried as a number rather than only appearing inside the
+    /// message text, so retry decisions can match on it. Substring-matching the
+    /// message (the previous approach) recognized 500, 502, 503 and 504 but
+    /// missed every other 5xx, and could be fooled by a body that happened to
+    /// contain those digits.
+    Status {
+        code: u16,
+        message: String,
+        /// `Retry-After`, in milliseconds, when the server sent one.
+        retry_after_ms: Option<u64>,
+    },
     Auth(String),
     Unsupported(String),
 }
@@ -77,6 +90,9 @@ impl fmt::Display for ProviderError {
             ProviderError::SessionNotFound(m) => write!(f, "session not found: {m}"),
             ProviderError::Transport(m) => write!(f, "transport error: {m}"),
             ProviderError::Protocol(m) => write!(f, "protocol error: {m}"),
+            ProviderError::Status { code, message, .. } => {
+                write!(f, "{code}: {message}")
+            }
             ProviderError::Auth(m) => write!(f, "authentication error: {m}"),
             ProviderError::Unsupported(m) => write!(f, "unsupported operation: {m}"),
         }

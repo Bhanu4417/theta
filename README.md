@@ -228,6 +228,21 @@ first-class nodes that rebuild the model context.
 
 Sessions persist to `~/.local/share/theta/sessions/<id>.jsonl`.
 
+### When the provider is having a bad day
+
+A busy model behind a shared gateway returns `500`s and `429`s for minutes at a
+time. Theta retries those rather than surfacing an error:
+
+- **What is retried:** `408`, `425`, `429`, and every `5xx` — plus dropped
+  connections and timeouts.
+- **How long:** `Retry-After` is honoured when the server sends one (either
+  seconds or an HTTP date, both forms). Otherwise exponential backoff from
+  `retry_base_ms`, capped at `retry_max_ms`.
+- **How it looks:** the pane title counts down — `↻ 7s (2/6) · provider error
+  (500)` — so a slow model reads as *waiting*, not frozen.
+- **What is not retried:** `401`/`403` (a key problem) and `404` (a wrong
+  endpoint). Retrying those just wastes time.
+
 ### Why it stays responsive
 
 Latency work is not one thing, so it is attacked at each layer:
@@ -283,8 +298,9 @@ provider = "openai"             # a preset id, or set base_url for anything else
 base_url = ""                   # an OpenAI-compatible endpoint overrides the preset
 api_key_env = "OPENAI_API_KEY"
 model = "gpt-4o"
-max_retries = 3                 # transient failures, exponential backoff
-retry_base_ms = 500
+max_retries = 6                 # attempts for a retryable failure
+retry_base_ms = 500             # first backoff; doubles each attempt
+retry_max_ms = 30000            # backoff ceiling
 timeout_secs = 300              # idle read timeout; 0 disables
 max_turns = 0                   # tool rounds per turn; 0 = no limit
 reasoning_effort = ""           # none | minimal | low | medium | high | xhigh | max

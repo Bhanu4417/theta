@@ -5158,9 +5158,23 @@ impl App {
                 }
                 s.dirty = true;
             }
-            HarnessEvent::SessionRetrying(msg) => {
-                self.sessions[idx].status = SessStatus::Retrying(msg);
-                self.sessions[idx].dirty = true;
+            HarnessEvent::SessionRetrying {
+                attempt,
+                max_attempts,
+                reason,
+                delay_ms,
+            } => {
+                // The pane counts down from `until`, so the wait is visible
+                // rather than the app looking hung on a busy model.
+                let s = &mut self.sessions[idx];
+                s.status = SessStatus::Retrying(crate::session::Retrying {
+                    attempt,
+                    max_attempts,
+                    reason,
+                    delay_ms,
+                    until: Instant::now() + Duration::from_millis(delay_ms),
+                });
+                s.dirty = true;
             }
             HarnessEvent::SessionError(msg) => {
                 let s = &mut self.sessions[idx];

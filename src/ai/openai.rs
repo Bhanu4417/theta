@@ -67,9 +67,16 @@ impl OpenAiCompat {
         }
         let resp = req.send().await.map_err(net)?;
         let status = resp.status();
+        let retry_after_ms = crate::ai::retry_after_ms(resp.headers());
         let text = resp.text().await.map_err(net)?;
         if !status.is_success() {
-            return Err(ProviderError::Protocol(format!("HTTP {status}: {}", text.trim())));
+            // A status, not an opaque protocol string, so retry decisions see
+            // the code rather than having to find it in the text.
+            return Err(ProviderError::Status {
+                code: status.as_u16(),
+                message: text.trim().to_string(),
+                retry_after_ms,
+            });
         }
         let v: Value =
             serde_json::from_str(&text).map_err(|e| ProviderError::Protocol(e.to_string()))?;
@@ -294,11 +301,17 @@ impl Provider for OpenAiCompat {
             let resp = rb.send().await.map_err(net)?;
             let status = resp.status();
             if !status.is_success() {
+                // Read Retry-After before consuming the body.
+                let retry_after_ms = crate::ai::retry_after_ms(resp.headers());
                 let text = resp.text().await.unwrap_or_default();
                 return Err(match status.as_u16() {
                     401 | 403 => ProviderError::Auth(text),
                     404 => ProviderError::Unsupported(text),
-                    _ => ProviderError::Transport(format!("{status}: {text}")),
+                    code => ProviderError::Status {
+                        code,
+                        message: text,
+                        retry_after_ms,
+                    },
                 });
             }
             let mut stream = resp.bytes_stream();

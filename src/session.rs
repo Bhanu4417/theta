@@ -5,13 +5,35 @@ use crate::providers::ProviderKind;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
+/// A retry in progress, so the UI can show a live countdown rather than a
+/// static line. `until` is when the next attempt starts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Retrying {
+    pub attempt: u32,
+    pub max_attempts: u32,
+    pub reason: String,
+    /// Scheduled wait, kept so the title can omit a countdown for a retry that
+    /// happens immediately (the empty-answer retry).
+    pub delay_ms: u64,
+    pub until: std::time::Instant,
+}
+
+impl Retrying {
+    /// Seconds left before the next attempt, rounded up so the countdown never
+    /// shows 0 while still waiting.
+    pub fn secs_left(&self) -> u64 {
+        let left = self.until.saturating_duration_since(std::time::Instant::now());
+        (left.as_millis() as u64).div_ceil(1000)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessStatus {
     Connecting,
     Idle,
     Working,
     Thinking,
-    Retrying(String),
+    Retrying(Retrying),
     Error(String),
     Permission,
     Question,
