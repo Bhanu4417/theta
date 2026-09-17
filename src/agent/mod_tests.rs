@@ -1617,3 +1617,111 @@ async fn repeated_succeeding_tool_call_is_stopped_as_a_loop() {
     assert!(rounds <= 6, "should stop quickly, got {rounds} rounds");
     assert!(evs.iter().any(|e| matches!(e, HarnessEvent::SessionIdle)));
 }
+
+/// Forwards to another provider, so a test can hold an `Arc` to inspect it
+/// after the turn.
+struct ProviderShim(std::sync::Arc<dyn Provider + Send + Sync>);
+
+impl Provider for ProviderShim {
+    fn id(&self) -> &'static str {
+        self.0.id()
+    }
+    fn stream<'a>(
+        &'a self,
+        request: ChatRequest,
+        on_event: &'a mut (dyn FnMut(ProviderEvent) + Send),
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<AssistantTurn, ProviderError>> + Send + 'a>,
+    > {
+        self.0.stream(request, on_event)
+    }
+}
+
+/// Returns an empty answer with `finish_reason: length` on the first call —
+/// the "reasoning ate the whole budget" failure — then a real answer. It also
+/// records the reasoning effort each request carried.
+struct EmptyThenAnswer {
+    calls: Mutex<usize>,
+    efforts: Mutex<Vec<Option<String>>>,
+}
+
+impl Provider for EmptyThenAnswer {
+    fn id(&self) -> &'static str {
+        "empty-then-answer"
+    }
+    fn stream<'a>(
+        &'a self,
+        request: ChatRequest,
+        _on_event: &'a mut (dyn FnMut(ProviderEvent) + Send),
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<AssistantTurn, ProviderError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            self.efforts.lock().unwrap().push(request.reasoning_effort.clone());
+            let mut n = self.calls.lock().unwrap();
+            *n += 1;
+            if *n == 1 {
+                return Ok(AssistantTurn {
+                    text: String::new(),
+                    tool_calls: vec![],
+                    finish: Some(FinishReason::Length),
+                });
+            }
+            Ok(AssistantTurn {
+                text: "here is the answer".into(),
+                tool_calls: vec![],
+                finish: Some(FinishReason::Stop),
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn an_empty_answer_is_retried_with_less_thinking() {
+    use crate::harness::transcript::PartKind;
+    use crate::harness::TranscriptUpdate;
+
+    let provider = std::sync::Arc::new(EmptyThenAnswer {
+        calls: Mutex::new(0),
+        efforts: Mutex::new(Vec::new()),
+    });
+    let agent = AgentLoop::new(
+        Box::new(ProviderShim(provider.clone() as std::sync::Arc<dyn Provider + Send + Sync>)),
+        "test",
+    )
+    .with_reasoning_effort("high");
+    let dir = std::env::temp_dir();
+    let mut history = Vec::new();
+    let events = std::sync::Arc::new(Mutex::new(Vec::<HarnessEvent>::new()));
+    let sink = events.clone();
+    let mut emit = move |e: HarnessEvent| sink.lock().unwrap().push(e);
+    agent.run_turn(&mut history, "go", &dir, &mut emit).await.unwrap();
+
+    let efforts = provider.efforts.lock().unwrap().clone();
+    assert_eq!(efforts.len(), 2, "the turn should be retried once");
+    assert_eq!(efforts[0].as_deref(), Some("high"), "the first try keeps the setting");
+    assert_eq!(
+        efforts[1].as_deref(),
+        Some("minimal"),
+        "the retry must think less, or it will run out of room again"
+    );
+
+    // The user gets the answer, not an error about an empty response.
+    let evs = events.lock().unwrap();
+    let answered = evs.iter().any(|e| match e {
+        HarnessEvent::Transcript(TranscriptUpdate::Part(p)) => matches!(
+            &p.kind,
+            PartKind::Text { text, .. } if text.contains("here is the answer")
+        ),
+        _ => false,
+    });
+    assert!(answered, "the retry's answer reaches the transcript");
+    let complained = evs.iter().any(|e| match e {
+        HarnessEvent::Transcript(TranscriptUpdate::Part(p)) => matches!(
+            &p.kind,
+            PartKind::Text { text, .. } if text.contains("no output")
+        ),
+        _ => false,
+    });
+    assert!(!complained, "the user must not see the empty-response notice");
+}

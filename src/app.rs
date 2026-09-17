@@ -413,6 +413,11 @@ pub struct App {
     pub manager: Manager,
     pub initial_dir: PathBuf,
     pub flash: Option<(String, Instant, Duration)>,
+    /// Set when the terminal was resized. Drawing the diff is not enough on a
+    /// shrink: cells left over from the wider layout can survive as blank
+    /// patches over text. main.rs clears the screen and every cached render
+    /// before the next frame.
+    pub needs_clear: bool,
     pub last_newline: Option<Instant>,
     pub notifications: NotificationPolicy,
     pub tick: u64,
@@ -489,6 +494,7 @@ impl App {
             manager,
             initial_dir,
             flash: None,
+            needs_clear: false,
             last_newline: None,
             notifications: NotificationPolicy::new(8000),
             tick: 0,
@@ -722,8 +728,16 @@ impl App {
     }
 
     pub fn rename_session(&mut self, id: u32, name: &str) {
-        if let Some(s) = self.session_mut(id) {
+        let named = {
+            let Some(s) = self.session_mut(id) else { return };
             s.name = name.trim().to_string();
+            s.oc_sid.clone().map(|oc| (oc, s.name.clone()))
+        };
+        // Record it against the session id. The workspace copy is not enough:
+        // resuming this session passes a derived title, which used to land in
+        // the workspace and silently undo the rename.
+        if let Some((oc, name)) = named {
+            crate::tree::set_given_name(&oc, &name);
         }
         self.dirty = true;
         self.save_workspace();
@@ -2464,7 +2478,13 @@ impl App {
         match ev {
             TermEvent::Key(k) => self.handle_key(k).await,
             TermEvent::Mouse(m) => self.handle_mouse(m),
-            TermEvent::Resize(_, _) => self.dirty = true,
+            TermEvent::Resize(_, _) => {
+                // Wrapping is width-dependent, so every cached render is stale
+                // too. The pane rebuilds them when it sees the new width.
+                self.conv_cache.clear();
+                self.needs_clear = true;
+                self.dirty = true;
+            }
             TermEvent::Paste(raw) => {
                 if self.viewer.is_some() || self.diff.is_some() {
                     self.dirty = true;
@@ -3577,7 +3597,10 @@ impl App {
         let dir = dir.canonicalize().unwrap_or(dir);
         self.remember_dir(&dir);
         self.preload_sessions(dir.clone());
-        let mut sess = SessionState::new(id, name.to_string(), dir.clone());
+        // `name` is a derived title. If the user ever renamed this session,
+        // their name is the right one and the title is only a fallback.
+        let name = crate::tree::given_name(&oc_sid).unwrap_or_else(|| name.to_string());
+        let mut sess = SessionState::new(id, name.clone(), dir.clone());
         sess.oc_sid = Some(oc_sid.clone());
         sess.status = SessStatus::Connecting;
         if let Some(msgs) = crate::tree::SessionTree::sidecar_path(&oc_sid)
@@ -3598,7 +3621,7 @@ impl App {
         self.manager.connect_session(
             req,
             dir,
-            name.to_string(),
+            name,
             Some(oc_sid),
             None,
             self.cfg.behavior.history_limit,

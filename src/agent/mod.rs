@@ -243,6 +243,11 @@ impl AgentLoop {
         let mut last_call_sig: Option<String> = None;
         let mut same_call_repeats: usize = 0;
         let mut last_msg_id = String::new();
+        // Set after an empty answer, so the retry of that turn thinks less.
+        let mut effort_override: Option<String> = None;
+        // Only one automatic retry per turn, so a provider that always returns
+        // nothing cannot spin.
+        let mut empty_retried = false;
 
         let turn_limit = if self.max_turns == 0 { usize::MAX } else { self.max_turns };
         for turn in 0..turn_limit {
@@ -306,7 +311,11 @@ impl AgentLoop {
                 tools: self.tools.iter().map(|t| t.spec()).collect(),
                 temperature: None,
                 max_tokens: None,
-                reasoning_effort: self.reasoning_effort.clone(),
+                // Lowered for one retry when the previous attempt reasoned its
+                // way through the whole budget and produced no answer.
+                reasoning_effort: effort_override
+                    .clone()
+                    .or_else(|| self.reasoning_effort.clone()),
             };
 
             let msg_id = format!("local-{run_id}-{turn}");
@@ -473,6 +482,26 @@ impl AgentLoop {
 
             if turn_result.tool_calls.is_empty() {
                 if turn_result.text.trim().is_empty() {
+                    // A reasoning model will happily spend the entire output
+                    // budget thinking and emit no answer. Retrying once with
+                    // minimal effort is the difference between a usable turn
+                    // and an error, so try that before giving up.
+                    // `Length` is the only out-of-room signal the providers
+                    // report; an empty answer with a normal stop is something
+                    // else and is not retried.
+                    let out_of_room = matches!(turn_result.finish, Some(FinishReason::Length));
+                    if out_of_room && !empty_retried {
+                        empty_retried = true;
+                        effort_override = Some("minimal".to_string());
+                        crate::tlog!(
+                            "RETRY empty answer after {turn} turns: reasoning used the \
+                             whole budget; retrying with minimal effort"
+                        );
+                        emit(HarnessEvent::SessionRetrying(
+                            "no answer within the output limit — retrying with less thinking".into(),
+                        ));
+                        continue;
+                    }
                     let why = match turn_result.finish.as_ref() {
                         Some(FinishReason::Length) => {
                             "the model hit its output limit before replying"

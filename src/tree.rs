@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -100,6 +101,59 @@ pub struct SessionTree {
     pub entries: Vec<Entry>,
     pub leaf: Option<String>,
     seq: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Session names
+//
+// A session's name is the user's choice, so it must survive being resumed. It
+// used to live only in `workspace.toml`, and resuming a session (from /resume
+// or the new-session dialog) passed the *derived* title — the first line of the
+// first message — which then overwrote the rename and was saved. Storing names
+// against the session id, separately from the workspace, is what makes a rename
+// stick.
+// ---------------------------------------------------------------------------
+
+fn names_path() -> Option<PathBuf> {
+    let base = match std::env::var_os("THETA_SESSION_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => match std::env::var_os("THETA_DATA_DIR") {
+            Some(dir) => PathBuf::from(dir).join("sessions"),
+            None => dirs::data_dir()?.join("theta").join("sessions"),
+        },
+    };
+    Some(base.join("names.json"))
+}
+
+fn load_names() -> HashMap<String, String> {
+    names_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// The name a user gave a session, if any.
+pub fn given_name(session_id: &str) -> Option<String> {
+    load_names().remove(session_id).filter(|n| !n.trim().is_empty())
+}
+
+/// Record a user-chosen name for a session. An empty name clears it, so the
+/// derived title takes over again.
+pub fn set_given_name(session_id: &str, name: &str) {
+    let Some(path) = names_path() else { return };
+    let mut names = load_names();
+    let name = name.trim();
+    if name.is_empty() {
+        names.remove(session_id);
+    } else {
+        names.insert(session_id.to_string(), name.to_string());
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(text) = serde_json::to_string_pretty(&names) {
+        let _ = std::fs::write(&path, text);
+    }
 }
 
 impl SessionTree {
@@ -469,6 +523,7 @@ impl SessionTree {
         (!tree.is_empty()).then_some(tree)
     }
 
+
     pub fn list_sessions() -> Vec<SessionSummary> {
         let base = match std::env::var_os("THETA_SESSION_DIR") {
             Some(dir) => PathBuf::from(dir),
@@ -493,7 +548,11 @@ impl SessionTree {
                 continue;
             };
             let Some(tree) = SessionTree::load(&path) else { continue };
-            let title = tree
+            // A name the user gave this session wins over the derived title;
+            // otherwise the picker would show the first message again and a
+            // rename would look like it never happened.
+            let given = given_name(&id).filter(|n| !n.trim().is_empty());
+            let derived = tree
                 .entries
                 .iter()
                 .filter(|e| e.kind == EntryKind::User)
@@ -507,8 +566,9 @@ impl SessionTree {
                         .map(|e| e.text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim())
                         .find(|l| !l.is_empty())
                 })
-                .map(|l| l.chars().take(60).collect())
+                .map(|l| l.chars().take(60).collect::<String>())
                 .unwrap_or_else(|| "(empty session)".to_string());
+            let title = given.unwrap_or(derived);
 
             let directory = tree
                 .entries
@@ -739,4 +799,48 @@ mod tests {
         assert_eq!(msgs[3].role, Role::Assistant);
         assert_eq!(msgs[3].id, "sess_test-hist-4");
     }
+
+    #[test]
+    fn a_given_name_survives_and_beats_the_derived_title() {
+        // The bug: resuming a session passed the derived title (the first line
+        // of the first message), which then overwrote a rename. A name stored
+        // against the session id is what makes the rename stick.
+        let dir = std::env::temp_dir().join(format!("theta-names-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _env = testenv::lock();
+        std::env::set_var("THETA_SESSION_DIR", &dir);
+
+        assert_eq!(given_name("ses_x"), None, "no name until one is set");
+        set_given_name("ses_x", "  authentication  ");
+        assert_eq!(
+            given_name("ses_x").as_deref(),
+            Some("authentication"),
+            "the name is trimmed and returned"
+        );
+
+        // An empty name clears it, so the derived title takes over again.
+        set_given_name("ses_x", "");
+        assert_eq!(given_name("ses_x"), None);
+
+        std::env::remove_var("THETA_SESSION_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn names_are_stored_per_session() {
+        let dir = std::env::temp_dir().join(format!("theta-names2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _env = testenv::lock();
+        std::env::set_var("THETA_SESSION_DIR", &dir);
+
+        set_given_name("ses_a", "alpha");
+        set_given_name("ses_b", "beta");
+        assert_eq!(given_name("ses_a").as_deref(), Some("alpha"));
+        assert_eq!(given_name("ses_b").as_deref(), Some("beta"));
+        assert_eq!(given_name("ses_c"), None);
+
+        std::env::remove_var("THETA_SESSION_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }

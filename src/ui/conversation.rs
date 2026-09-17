@@ -208,10 +208,36 @@ fn render_message(
                     }
                     Role::Assistant => {
                         let base = theme::fg(pal().fg);
-                        for l in render_markdown(text, w.saturating_sub(1), base) {
+                        // While a reply streams, render only the lines that are
+                        // finished. A half-written line is re-parsed on every
+                        // token, which both flickers and breaks syntax
+                        // highlighting inside a code fence; the trailing
+                        // partial line is shown as plain text until its newline
+                        // arrives. Once the message completes, it is rendered
+                        // whole.
+                        let (complete, partial): (&str, Option<&str>) =
+                            if msg.completed.is_none() {
+                                match text.rfind('\n') {
+                                    Some(i) => (&text[..=i], Some(&text[i + 1..])),
+                                    None => ("", Some(text.as_str())),
+                                }
+                            } else {
+                                (text.as_str(), None)
+                            };
+                        for l in render_markdown(complete, w.saturating_sub(1), base) {
                             let mut sp = vec![Span::raw(" ")];
                             sp.extend(l.spans);
                             lines.push(Line::from(sp));
+                        }
+                        if let Some(p) = partial.filter(|p| !p.trim().is_empty()) {
+                            // Unhighlighted on purpose: there is no complete
+                            // line to parse yet.
+                            let spans = [Span::styled(p.to_string(), base)];
+                            for chunk in wrap_spans(&spans, w.saturating_sub(1)) {
+                                let mut sp = vec![Span::raw(" ")];
+                                sp.extend(chunk);
+                                lines.push(Line::from(sp));
+                            }
                         }
                     }
                 }
@@ -1204,6 +1230,57 @@ mod transcript_boundary_tests {
                 "absurd elapsed rendered: {text}"
             );
         }
+    }
+
+#[test]
+    fn a_streaming_reply_renders_only_complete_lines() {
+        // Reported: token chunks flickered and broke syntax highlighting. A
+        // half-written line was re-parsed on every token. While a message is in
+        // flight only its finished lines are rendered; the trailing partial
+        // line waits for its newline.
+        let mut s = SessionState::new(1, "s".into(), std::path::PathBuf::from("/tmp"));
+        let part = Part {
+            id: "p1".into(),
+            message_id: "m1".into(),
+            kind: PartKind::Text {
+                // A finished line, then a partial one holding markdown that
+                // would be transformed if it were parsed.
+                text: "done\n**bold**".to_string(),
+                synthetic: false,
+            },
+        };
+        let meta = Message {
+            id: "m1".into(),
+            role: Role::Assistant,
+            error: None,
+            // In flight.
+            completed: None,
+            created: None,
+            cost: None,
+            tokens: None,
+            parts: vec![part.clone()],
+        };
+        s.upsert_part(&meta, part);
+        let text = cache_text(&s);
+        assert!(text.contains("done"), "the finished line renders: {text}");
+        assert!(
+            text.contains("**bold**"),
+            "the partial line is shown verbatim, not markdown-parsed, so a \
+             half-written token cannot break highlighting: {text}"
+        );
+
+        // Once the message completes it is rendered whole, so the markdown in
+        // that same text is now interpreted rather than shown literally.
+        let mut done = s.clone();
+        if let Some(m) = done.messages.iter_mut().find(|m| m.id == "m1") {
+            m.completed = Some(1);
+        }
+        let finished = cache_text(&done);
+        assert!(finished.contains("bold"), "the reply renders whole: {finished}");
+        assert!(
+            !finished.contains("**bold**"),
+            "and its markdown is interpreted once complete: {finished}"
+        );
     }
 
     #[test]

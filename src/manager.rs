@@ -198,7 +198,12 @@ impl Manager {
                     .map(|(name, description)| crate::models::AgentInfo { name, description })
                     .collect(),
             });
-            let report = crate::ai::discovery::discover_models_report(&cfg, false).await;
+            // Forced. The cached list was already emitted above, so this costs
+            // nothing in boot time — but it is the only way a model a provider
+            // added since the last run ever shows up without waiting out the
+            // cache TTL. The TTL still guards against re-fetching repeatedly
+            // within a session.
+            let report = crate::ai::discovery::discover_models_report(&cfg, true).await;
             m.emit(AppEvent::ProvidersListed {
                 dir: dir_c,
                 providers: report.entries,

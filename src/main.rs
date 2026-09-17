@@ -339,6 +339,14 @@ async fn run(
     let mut tick = tokio::time::interval(Duration::from_millis(40));
 
     loop {
+        if app.needs_clear {
+            // A resize can leave cells from the previous, wider layout behind.
+            // Clearing the physical screen (ratatui only re-draws changed
+            // cells) prevents those patches appearing over the text.
+            terminal.clear()?;
+            app.needs_clear = false;
+            app.dirty = true;
+        }
         if app.dirty {
             terminal.draw(|f| ui::render(f, app))?;
             app.dirty = false;
