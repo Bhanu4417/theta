@@ -251,10 +251,13 @@ fn render_message(
                         rendered_any = true;
                         animating = true;
                     }
-                    // A missing or zero start means "unknown": subtracting it
-                    // would display the whole Unix epoch as the elapsed time.
+                    // Only a plausible start is used. A missing, zero, future
+                    // or absurdly old value is treated as unknown: subtracting a
+                    // sentinel like 1 from now would display the whole Unix
+                    // epoch as the elapsed time.
+                    const MAX_PLAUSIBLE: i64 = 24 * 60 * 60 * 1000;
                     let elapsed = start
-                        .filter(|s| *s > 0 && *s <= now_ms)
+                        .filter(|s| *s > 0 && *s <= now_ms && now_ms - *s <= MAX_PLAUSIBLE)
                         .map(|s| (now_ms - s) as f64 / 1000.0)
                         .unwrap_or(0.0);
                     let spin_style = Style::default().fg(theme::spin_rgb(tick));
@@ -434,16 +437,32 @@ pub fn build_cache(sess: &SessionState, width: u16, tick: u64) -> Cache {
 /// change. Streaming a reply touches one message; everything before it is
 /// already rendered, so a long transcript stays cheap to update.
 pub fn rebuild(prev: Option<&Cache>, sess: &SessionState, width: u16, tick: u64) -> Cache {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    rebuild_at(prev, sess, width, tick, now_ms)
+}
+
+/// Rebuild with an explicit clock.
+///
+/// Output depends on the current time — a running timer, the animation frame —
+/// so reading the clock inside made two renders of identical state differ. That
+/// is untestable, and it made an equality assertion fail intermittently: the
+/// two rebuilds in a comparison straddled a tenth of a second.
+pub fn rebuild_at(
+    prev: Option<&Cache>,
+    sess: &SessionState,
+    width: u16,
+    tick: u64,
+    now_ms: i64,
+) -> Cache {
     let w = width.max(12) as usize;
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut blocks: Vec<BlockSpan> = Vec::new();
     let mut animating = false;
     let mut renders: HashMap<String, RenderedMessage> = HashMap::new();
 
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
     let busy = sess.status.is_busy();
     if busy {
         animating = true;
@@ -1363,6 +1382,90 @@ mod transcript_boundary_tests {
         assert!(!text.contains("@@"), "no hunk header without a diff: {text}");
     }
 
+#[test]
+    fn the_thinking_timer_ignores_an_implausible_start() {
+        // Seen in CI output: a start of 1 rendered as "1789710193.8s", the whole
+        // Unix epoch. Only a plausible start is used now.
+        const NOW: i64 = 1_700_000_000_000;
+        let mut s = SessionState::new(1, "s".into(), std::path::PathBuf::from("/tmp"));
+        s.status = crate::session::SessStatus::Working;
+        for (label, start) in [
+            ("a sentinel", Some(1i64)),
+            ("zero", Some(0)),
+            ("the future", Some(NOW + 60_000)),
+            ("a day-old start", Some(NOW - 25 * 60 * 60 * 1000)),
+            ("nothing", None),
+        ] {
+            let mut sess = s.clone();
+            let part = Part {
+                id: "p".into(),
+                message_id: "m".into(),
+                kind: PartKind::Reasoning {
+                    text: "hmm".into(),
+                    running: true,
+                    start,
+                    end: None,
+                },
+            };
+            let meta = Message {
+                id: "m".into(),
+                role: Role::Assistant,
+                error: None,
+                completed: None,
+                created: None,
+                cost: None,
+                tokens: None,
+                parts: vec![part.clone()],
+            };
+            sess.upsert_part(&meta, part);
+            let cache = rebuild_at(None, &sess, 80, 0, NOW);
+            let text: String = cache
+                .lines
+                .iter()
+                .map(|l| l.spans.iter().map(|sp| sp.content.as_ref()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("Thinking"), "{label}: the spinner still shows: {text}");
+            assert!(
+                text.contains("0.0s"),
+                "{label}: an implausible start shows 0.0s, got: {}",
+                text.lines().find(|l| l.contains("Thinking")).unwrap_or("")
+            );
+        }
+
+        // A start inside the window is shown, so the timer still works.
+        let mut sess = s.clone();
+        let part = Part {
+            id: "p".into(),
+            message_id: "m".into(),
+            kind: PartKind::Reasoning {
+                text: "hmm".into(),
+                running: true,
+                start: Some(NOW - 4_200),
+                end: None,
+            },
+        };
+        let meta = Message {
+            id: "m".into(),
+            role: Role::Assistant,
+            error: None,
+            completed: None,
+            created: None,
+            cost: None,
+            tokens: None,
+            parts: vec![part.clone()],
+        };
+        sess.upsert_part(&meta, part);
+        let cache = rebuild_at(None, &sess, 80, 0, NOW);
+        let text: String = cache
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|sp| sp.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("4.2s"), "a real elapsed time is shown: {text}");
+    }
+
     #[test]
     fn tool_states_render_from_neutral_model() {
         let mut s = SessionState::new(1, "s".into(), std::path::PathBuf::from("/tmp"));
@@ -1536,9 +1639,13 @@ mod tests {
 
         // At every step, the incremental result must equal a full rebuild of
         // the same state at the same width.
+        // A pinned clock: the render depends on the current time (a running
+        // timer, the animation frame), so comparing two rebuilds that each read
+        // the clock was a flake — they straddled a tenth of a second.
+        const NOW: i64 = 1_700_000_000_000;
         let check = |s: &SessionState, prev: &Cache, width: u16, tick: u64| -> Cache {
-            let inc = rebuild(Some(prev), s, width, tick);
-            let full = rebuild(None, s, width, tick);
+            let inc = rebuild_at(Some(prev), s, width, tick, NOW);
+            let full = rebuild_at(None, s, width, tick, NOW);
             assert_eq!(plain(&inc), plain(&full), "width={width} tick={tick}");
             assert_eq!(inc.blocks.len(), full.blocks.len(), "block count at tick={tick}");
             for (a, b) in inc.blocks.iter().zip(full.blocks.iter()) {
@@ -1547,7 +1654,7 @@ mod tests {
             inc
         };
 
-        let mut cache = check(&s, &rebuild(None, &s, 80, 0), 80, 0);
+        let mut cache = check(&s, &rebuild_at(None, &s, 80, 0, NOW), 80, 0);
 
         // Appending a part to the last message.
         let last = s.messages.last().unwrap().id.clone();
