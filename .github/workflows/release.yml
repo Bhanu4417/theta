@@ -12,6 +12,11 @@ on:
 permissions:
   contents: write
 
+# Two releases for the same tag would race on the upload.
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
   BIN: theta
@@ -131,25 +136,91 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      # Everything below reports what it sees. A previous run failed here and
+      # its log was unavailable from GitHub, which left the cause unknowable;
+      # the summary is written to the run page so a failure is diagnosable even
+      # when the log blob is not.
+      - name: Inspect the artifacts
+        run: |
+          set -euo pipefail
+          {
+            echo "## Release artifacts"
+            echo
+            echo '```'
+            find artifacts -type f | sort
+            echo '```'
+            echo
+            echo "gh: $(gh --version | head -1)"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::group::artifact tree"
+          find artifacts -type f | sort
+          echo "::endgroup::"
+          count=$(find artifacts -type f -name 'theta-*' ! -name '*.sha256' | wc -l)
+          echo "platforms: $count"
+          if [ "$count" -eq 0 ]; then
+            echo "::error::no artifacts were downloaded; the build jobs produced nothing"
+            exit 1
+          fi
+
       - name: Checksums file
         run: |
           set -euo pipefail
           cd artifacts
-          # Combined manifest, so an installer can fetch one file.
-          cat *.sha256 | sort -k2 > ../SHA256SUMS
-          ls -l
+          # Combined manifest, so an installer can fetch one file. Normalize the
+          # hash separator: some tools emit `hash *name`.
+          cat *.sha256 | sed 's/[*]/ /' | sort -k2 > ../SHA256SUMS
+          echo "::group::SHA256SUMS"
+          cat ../SHA256SUMS
+          echo "::endgroup::"
 
       - name: Resolve the tag
         id: tag
-        run: echo "tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "publishing $tag"
 
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -euo pipefail
-          tag="${{ steps.tag.outputs.tag }}"
-          if ! gh release view "$tag" >/dev/null 2>&1; then
-            gh release create "$tag" --title "$tag" --generate-notes
+          # `gh` verbs are retried: a release upload is a network operation
+          # against GitHub and a transient 5xx should not fail a build that
+          # succeeded on all five platforms.
+          retry() {
+            local n=1
+            until "$@"; do
+              if [ "$n" -ge 4 ]; then
+                echo "::error::$* failed after $n attempts"
+                return 1
+              fi
+              local back=$((n * 5))
+              echo "attempt $n failed; retrying in ${back}s: $*"
+              sleep "$back"
+              n=$((n + 1))
+            done
+          }
+
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "creating release $TAG"
+            retry gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" \
+              --generate-notes
+          else
+            echo "release $TAG already exists; uploading to it"
           fi
-          gh release upload "$tag" artifacts/* SHA256SUMS --clobber
+
+          # --clobber makes this idempotent, so a re-run repairs a partial upload
+          # instead of failing on an asset that is already there.
+          retry gh release upload "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            artifacts/* SHA256SUMS --clobber
+
+          echo "### Published $TAG" >> "$GITHUB_STEP_SUMMARY"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[] | "\(.name)  \(.size) bytes"' \
+            >> "$GITHUB_STEP_SUMMARY"
