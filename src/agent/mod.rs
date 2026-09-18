@@ -85,6 +85,12 @@ impl AgentLoop {
         self
     }
 
+    /// The installed policy. Exposed so a test can assert which gate was
+    /// actually wired, rather than inferring it from behaviour.
+    pub fn permission(&self) -> &dyn PermissionGate {
+        self.permission.as_ref()
+    }
+
     pub fn with_permission(mut self, gate: Box<dyn PermissionGate>) -> Self {
         self.permission = gate;
         self

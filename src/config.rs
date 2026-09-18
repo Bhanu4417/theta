@@ -135,7 +135,12 @@ impl Default for Behavior {
             history_limit: 200,
             confirm_quit: true,
             notify: true,
-            local_permissions: "allow".into(),
+            // Scoped by default: the session's own folder is pre-approved and
+            // anything outside it asks. Running several sessions at once is the
+            // point of the app, and that only works if working inside your own
+            // folder never interrupts you. `allow` never asks; `ask` is an alias
+            // for this; `read-only` and `deny` are the strict options.
+            local_permissions: "scoped".into(),
         }
     }
 }
@@ -251,7 +256,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn permissions_default_to_permissive_like_opencode() {
-        assert_eq!(Behavior::default().local_permissions, "allow");
+    fn permissions_default_to_scoped() {
+        assert_eq!(Behavior::default().local_permissions, "scoped");
     }
 }

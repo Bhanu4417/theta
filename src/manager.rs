@@ -636,14 +636,12 @@ fn build_agent_with(
     } else {
         cfg.behavior.local_permissions.as_str()
     };
-    let ask = interactive && mode == "ask" && gates.is_some();
-    agent = agent.with_permission(if ask {
-        Box::new(crate::agent::tools::AskGate)
-    } else if interactive || gates.is_some() {
-        gate_for(mode, interactive)
-    } else {
-        Box::new(crate::agent::tools::AllowAll)
-    });
+    // The policy is applied in every case. A headless run has nobody to ask, so
+    // `gate_for` returns the variant that refuses rather than the variant that
+    // asks — but it must still be consulted. Bypassing it here meant a headless
+    // run used AllowAll and silently ignored the configured policy entirely,
+    // which is how a write outside the session folder succeeded under `scoped`.
+    agent = agent.with_permission(gate_for(mode, interactive || gates.is_some()));
     if let Some(g) = &gates {
         agent = agent
             .with_broker(g.permissions.clone())
@@ -659,14 +657,28 @@ fn build_agent_with(
     Ok(agent)
 }
 
+/// The permission policy for a session.
+///
+/// `scoped` is the default: the session's own folder is pre-approved, anything
+/// outside it asks. That is what makes several sessions at once workable — each
+/// one is opened somewhere and never interrupts you inside its own project,
+/// while a reach into a different folder still asks, because that is where a
+/// mistake stops being yours alone.
+///
+/// With no one to ask (headless), `scoped` and `ask` deny anything outside the
+/// folder rather than silently allowing it. Silently widening the permission a
+/// user chose is worse than a clear refusal.
 fn gate_for(mode: &str, interactive: bool) -> Box<dyn crate::agent::tools::PermissionGate> {
-    use crate::agent::tools::{AllowAll, AskGate, DenyAll, ReadOnly};
+    use crate::agent::tools::{AllowAll, DenyAll, ReadOnly, ScopedGate};
     match mode {
         "allow" => Box::new(AllowAll),
         "deny" => Box::new(DenyAll),
         "read-only" | "readonly" => Box::new(ReadOnly),
-        "ask" if interactive => Box::new(AskGate),
-        _ => Box::new(AllowAll),
+        "scoped" | "ask" if interactive => Box::new(ScopedGate),
+        "scoped" | "ask" => Box::new(crate::agent::tools::ScopedStrict),
+        // An unrecognized mode falls back to the default policy rather than
+        // failing open to `allow`.
+        _ => Box::new(ScopedGate),
     }
 }
 
@@ -724,7 +736,7 @@ mod tests {
 
     #[test]
     fn interactive_sessions_always_wire_a_question_broker() {
-        for mode in ["allow", "ask", "read-only", "deny"] {
+        for mode in ["scoped", "allow", "ask", "read-only", "deny"] {
             let mut cfg = Config::default();
             cfg.behavior.local_permissions = mode.into();
             assert!(
@@ -864,6 +876,66 @@ mod tests {
         let err = m.set_reasoning_effort("very".into()).unwrap_err();
         assert!(err.contains("very"), "the bad value is named: {err}");
         assert!(err.contains("minimal"), "and the valid ones are listed: {err}");
+    }
+
+
+    #[test]
+    fn the_permission_modes_map_to_the_right_gate() {
+        use crate::agent::tools::PermissionDecision as D;
+        let cwd = std::path::Path::new("/proj");
+        let inside = serde_json::json!({"path": "src/a.rs"});
+        let outside = serde_json::json!({"path": "/etc/passwd"});
+
+        // Scoped: the session folder is pre-approved, outside asks.
+        let g = gate_for("scoped", true);
+        assert_eq!(g.check("write", &inside, cwd), D::Allow);
+        assert_eq!(g.check("write", &outside, cwd), D::Ask);
+
+        // Headless cannot ask, so it refuses rather than widening the policy.
+        let g = gate_for("scoped", false);
+        assert_eq!(g.check("write", &inside, cwd), D::Allow);
+        assert_eq!(g.check("write", &outside, cwd), D::Deny);
+
+        //  is the same policy, and an unknown mode falls back to it rather
+        // than failing open to allow.
+        assert_eq!(gate_for("ask", true).check("write", &outside, cwd), D::Ask);
+        assert_eq!(gate_for("typo", true).check("write", &outside, cwd), D::Ask);
+
+        // Allow never asks; deny never allows.
+        assert_eq!(gate_for("allow", true).check("write", &outside, cwd), D::Allow);
+        assert_eq!(gate_for("deny", true).check("write", &inside, cwd), D::Deny);
+
+        // read-only permits reading, refuses writing — inside the folder too.
+        let ro = gate_for("read-only", true);
+        assert_eq!(ro.check("read", &inside, cwd), D::Allow);
+        assert_eq!(ro.check("write", &inside, cwd), D::Deny);
+    }
+
+
+    #[tokio::test]
+    async fn a_headless_agent_still_honours_the_configured_policy() {
+        // Regression: the headless branch returned AllowAll without consulting
+        // the mode at all, so a write outside the session folder succeeded under
+        // `scoped` — the policy was configured and silently ignored.
+        use crate::agent::tools::PermissionDecision as D;
+        let mut cfg = Config::default();
+        cfg.ai.base_url = "http://127.0.0.1:1/v1".into();
+        cfg.behavior.local_permissions = "scoped".into();
+
+        let (agent, _) = build_agent(&cfg, false).expect("builds without a key via base_url");
+        let gate = agent.permission();
+        let cwd = std::path::Path::new("/proj");
+
+        assert_eq!(
+            gate.check("write", &serde_json::json!({"path": "inside.rs"}), cwd),
+            D::Allow,
+            "inside the folder is pre-approved"
+        );
+        assert_eq!(
+            gate.check("write", &serde_json::json!({"path": "/outside/x"}), cwd),
+            D::Deny,
+            "headless cannot ask, so outside must be refused, not allowed"
+        );
     }
 
 }

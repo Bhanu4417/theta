@@ -12,7 +12,7 @@ no server to start, no daemon to babysit, no wrapper around somebody else's CLI.
 [![CI](https://github.com/Bhanu4417/theta/actions/workflows/ci.yml/badge.svg)](https://github.com/Bhanu4417/theta/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-e0dbce.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-e0dbce.svg)](https://www.rust-lang.org)
-[![Tests](https://img.shields.io/badge/tests-271%20passing-e0dbce.svg)](#testing)
+[![Tests](https://img.shields.io/badge/tests-278%20passing-e0dbce.svg)](#testing)
 
 </div>
 
@@ -372,7 +372,7 @@ history_limit = 200
 auto_approve_permissions = false
 confirm_quit = true
 notify = true                   # bell + desktop notification when a run ends
-local_permissions = "allow"     # allow | ask | deny | read-only
+local_permissions = "scoped"    # scoped | allow | ask | read-only | deny
 ```
 
 Per-model overrides, when one model needs different budgets:

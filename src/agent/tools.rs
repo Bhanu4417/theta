@@ -130,13 +130,41 @@ impl PermissionGate for AllowAll {
     }
 }
 
-pub struct AskGate;
-impl PermissionGate for AskGate {
+/// Allows anything that stays inside the session's own folder, and asks for
+/// anything else.
+///
+/// This is what makes several sessions usable at once: each one is opened in a
+/// folder and has that folder pre-approved, so working in your own project never
+/// interrupts you. Reaching into another folder — someone else's session, a
+/// config directory, a path outside the project — asks, because that is the
+/// point where a mistake becomes someone else's problem.
+///
+/// A shell command cannot be judged by its arguments, so it always asks: the
+/// path check has nothing to inspect, and a command can touch anything the user
+/// can.
+pub struct ScopedGate;
+impl PermissionGate for ScopedGate {
     fn check(&self, tool: &str, input: &Value, cwd: &Path) -> PermissionDecision {
-        if read_within(tool, input, cwd) {
+        if tool_acts_within(tool, input, cwd) {
             PermissionDecision::Allow
         } else {
             PermissionDecision::Ask
+        }
+    }
+}
+
+/// The scoped policy when there is no one to ask: inside the folder is allowed,
+/// outside is refused.
+///
+/// Used headless. Silently allowing instead would widen the permission the user
+/// chose without telling them; a refusal at least appears in the output.
+pub struct ScopedStrict;
+impl PermissionGate for ScopedStrict {
+    fn check(&self, tool: &str, input: &Value, cwd: &Path) -> PermissionDecision {
+        if tool_acts_within(tool, input, cwd) {
+            PermissionDecision::Allow
+        } else {
+            PermissionDecision::Deny
         }
     }
 }
@@ -158,23 +186,121 @@ impl PermissionGate for ReadOnly {
     }
 }
 
-fn read_within(tool: &str, input: &Value, cwd: &Path) -> bool {
+/// The path arguments a tool operates on, if any.
+///
+/// Multi-edit carries one path per edit, and every one of them has to be inside
+/// the folder for the call to be pre-approved — approving on the first would let
+/// the rest write anywhere.
+fn target_paths<'a>(tool: &str, input: &'a Value) -> Vec<&'a str> {
+    let single = |keys: &[&str]| -> Vec<&'a str> {
+        keys.iter()
+            .find_map(|k| input.get(*k).and_then(Value::as_str))
+            .filter(|p| !p.trim().is_empty())
+            .into_iter()
+            .collect()
+    };
     match tool {
-        "read" | "grep" | "glob" => {
-            let arg = input
-                .get("path")
-                .and_then(Value::as_str)
-                .or_else(|| input.get("file_path").and_then(Value::as_str))
-                .or_else(|| input.get("filePath").and_then(Value::as_str))
-                .or_else(|| input.get("dir").and_then(Value::as_str));
-            match arg {
-                Some(p) if !p.trim().is_empty() => resolve(cwd, p).starts_with(cwd),
-                _ => true,
+        "read" | "grep" | "glob" | "write" => single(&[
+            "path",
+            "file_path",
+            "filePath",
+            "dir",
+        ]),
+        "edit" => single(&["path", "file_path", "filePath"]),
+        "multiedit" => input
+            .get("edits")
+            .and_then(Value::as_array)
+            .map(|edits| {
+                edits
+                    .iter()
+                    .filter_map(|e| {
+                        ["path", "file_path", "filePath"]
+                            .iter()
+                            .find_map(|k| e.get(*k).and_then(Value::as_str))
+                    })
+                    .filter(|p| !p.trim().is_empty())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether a tool acts only inside the session folder.
+///
+/// A tool with no path argument that still touches the filesystem is not
+/// pre-approved: `bash` can do anything, so there is nothing to check and the
+/// safe answer is to ask.
+fn tool_acts_within(tool: &str, input: &Value, cwd: &Path) -> bool {
+    match tool {
+        // Asking the user a question, or reading the network, touches no folder.
+        "webfetch" | "ask" => true,
+        "read" | "grep" | "glob" | "write" | "edit" | "multiedit" => {
+            let paths = target_paths(tool, input);
+            if paths.is_empty() {
+                // A read with no path defaults to the folder; a write with no
+                // path is malformed and the tool will reject it.
+                return matches!(tool, "read" | "grep" | "glob");
             }
+            paths.iter().all(|p| path_within(cwd, p))
         }
-        "webfetch" => true,
+        // `task` delegates, and the sub-agent inherits this same gate.
+        "task" => true,
+        // `bash` and anything unknown: nothing to inspect, so ask.
         _ => false,
     }
+}
+
+/// Whether `p`, interpreted relative to `cwd`, stays inside `cwd`.
+///
+/// Resolved in two steps, because either alone is wrong:
+///
+/// - `canonicalize` follows symlinks, which lexical normalisation cannot, but it
+///   fails for a path that does not exist yet — the common case for a file about
+///   to be written.
+/// - Lexical normalisation always works, and is what stops `..` escaping.
+///
+/// A plain `starts_with` on the un-normalised join is not enough: the string
+/// `/work/proj/../sibling` starts with `/work/proj` while pointing outside it, so
+/// a `..` would have been pre-approved.
+fn path_within(cwd: &Path, p: &str) -> bool {
+    let base = normalize_lexically(&cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf()));
+    let joined = resolve(cwd, p);
+
+    // A path that exists can be fully resolved, following symlinks.
+    if let Ok(real) = joined.canonicalize() {
+        return real.starts_with(&base);
+    }
+
+    // Otherwise judge the directory it would land in, so a symlinked parent is
+    // still followed, then normalise the leaf lexically.
+    let leaf = joined.file_name().map(|n| n.to_owned());
+    let parent = joined.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+    let resolved_parent = parent.canonicalize().unwrap_or(parent);
+    let mut target = normalize_lexically(&resolved_parent);
+    if let Some(leaf) = leaf {
+        target.push(leaf);
+    }
+    normalize_lexically(&target).starts_with(&base)
+}
+
+/// Resolve `.` and `..` without touching the filesystem.
+fn normalize_lexically(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // Popping past the root is a no-op, as the OS treats it.
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 
@@ -920,22 +1046,83 @@ mod tests {
     }
 
     #[test]
-    fn ask_gate_allows_reads_in_scope_only() {
+    fn the_scoped_gate_allows_the_whole_session_folder() {
+        // The contract changed: a write inside the session's own folder used to
+        // ask. That made several concurrent sessions unusable — every edit
+        // interrupted its own pane — so the folder is now pre-approved and only
+        // a reach outside it asks.
+        let cwd = Path::new("/work/proj");
+        for (tool, input) in [
+            ("read", json!({"path": "src/main.rs"})),
+            ("grep", json!({"path": "src"})),
+            ("glob", json!({})),
+            ("webfetch", json!({"url": "https://x"})),
+            ("ask", json!({"question": "which?"})),
+            ("task", json!({"prompt": "go"})),
+            // Writes inside the folder: allowed.
+            ("write", json!({"path": "a"})),
+            ("write", json!({"path": "src/deep/new.rs"})),
+            ("edit", json!({"path": "a"})),
+            ("multiedit", json!({"edits": [{"path": "a"}, {"path": "b"}]})),
+        ] {
+            assert_eq!(
+                ScopedGate.check(tool, &input, cwd),
+                PermissionDecision::Allow,
+                "{tool} inside the folder should be pre-approved: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_scoped_gate_asks_outside_the_session_folder() {
+        let cwd = Path::new("/work/proj");
+        for (tool, input) in [
+            ("read", json!({"path": "/etc/passwd"})),
+            ("write", json!({"path": "/tmp/elsewhere"})),
+            ("edit", json!({"path": "../sibling/file"})),
+            // A multi-edit with one path outside is not pre-approved, even
+            // though the other path is inside.
+            (
+                "multiedit",
+                json!({"edits": [{"path": "inside"}, {"path": "/etc/outside"}]}),
+            ),
+            // A shell command cannot be judged by its arguments.
+            ("bash", json!({"command": "ls"})),
+        ] {
+            assert_eq!(
+                ScopedGate.check(tool, &input, cwd),
+                PermissionDecision::Ask,
+                "{tool} outside the folder should ask: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn walking_out_with_dot_dot_is_not_pre_approved() {
+        // A path that merely *looks* relative must not slip through.
+        let cwd = Path::new("/work/proj");
+        for p in ["../secret", "sub/../../secret", "./../secret"] {
+            assert_eq!(
+                ScopedGate.check("write", &json!({"path": p}), cwd),
+                PermissionDecision::Ask,
+                "{p} escapes the folder and must ask"
+            );
+        }
+    }
+
+    #[test]
+    fn the_strict_gate_refuses_instead_of_asking() {
+        // Headless: there is nobody to ask, so outside-the-folder is refused
+        // rather than silently allowed.
         let cwd = Path::new("/work/proj");
         assert_eq!(
-            AskGate.check("read", &json!({"path": "src/main.rs"}), cwd),
+            ScopedStrict.check("write", &json!({"path": "inside"}), cwd),
             PermissionDecision::Allow
         );
-        assert_eq!(AskGate.check("grep", &json!({"path": "src"}), cwd), PermissionDecision::Allow);
-        assert_eq!(AskGate.check("glob", &json!({}), cwd), PermissionDecision::Allow);
-        assert_eq!(AskGate.check("webfetch", &json!({"url": "https://x"}), cwd), PermissionDecision::Allow);
         assert_eq!(
-            AskGate.check("read", &json!({"path": "/etc/passwd"}), cwd),
-            PermissionDecision::Ask
+            ScopedStrict.check("write", &json!({"path": "/etc/outside"}), cwd),
+            PermissionDecision::Deny
         );
-        assert_eq!(AskGate.check("write", &json!({"path": "a"}), cwd), PermissionDecision::Ask);
-        assert_eq!(AskGate.check("edit", &json!({"path": "a"}), cwd), PermissionDecision::Ask);
-        assert_eq!(AskGate.check("bash", &json!({"command": "ls"}), cwd), PermissionDecision::Ask);
     }
 
     #[test]

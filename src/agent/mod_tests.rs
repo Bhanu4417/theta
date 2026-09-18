@@ -59,11 +59,19 @@ async fn ask_gate_waits_for_broker_then_runs() {
     let dir = std::env::temp_dir().join(format!("theta-perm-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    // The write targets a file *outside* the session folder, because that is
+    // what the scoped policy asks about. A write inside would be pre-approved
+    // and no question would ever arrive, which is the whole point of the change.
+    let outside = std::env::temp_dir().join(format!("theta-perm-out-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&outside);
+    std::fs::create_dir_all(&outside).unwrap();
+    let target = outside.join("p.txt");
+    let args = serde_json::json!({"path": target.to_string_lossy(), "content": "ok"}).to_string();
 
     let provider = Box::new(ScriptedProvider::new(vec![
         AssistantTurn {
             text: String::new(),
-            tool_calls: vec![call("c1", "write", r#"{"path":"p.txt","content":"ok"}"#)],
+            tool_calls: vec![call("c1", "write", &args)],
             finish: Some(FinishReason::ToolCalls),
         },
         AssistantTurn { text: "done".into(), tool_calls: vec![], finish: Some(FinishReason::Stop) },
@@ -71,7 +79,7 @@ async fn ask_gate_waits_for_broker_then_runs() {
 
     let broker = std::sync::Arc::new(crate::agent::permissions::Broker::new());
     let agent = AgentLoop::new(provider, "test")
-        .with_permission(Box::new(crate::agent::tools::AskGate))
+        .with_permission(Box::new(crate::agent::tools::ScopedGate))
         .with_broker(broker.clone());
 
     let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
@@ -94,7 +102,58 @@ async fn ask_gate_waits_for_broker_then_runs() {
 
     let result = handle.await.unwrap();
     assert!(result.is_ok());
-    assert_eq!(std::fs::read_to_string(dir.join("p.txt")).unwrap(), "ok");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "ok");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[tokio::test]
+async fn a_write_inside_the_session_folder_never_asks() {
+    // The point of the scoped policy: several sessions at once are only
+    // workable if working inside your own folder never interrupts you.
+    let dir = std::env::temp_dir().join(format!("theta-permown-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let provider = Box::new(ScriptedProvider::new(vec![
+        AssistantTurn {
+            text: String::new(),
+            tool_calls: vec![call("c1", "write", r#"{"path":"own.txt","content":"ok"}"#)],
+            finish: Some(FinishReason::ToolCalls),
+        },
+        AssistantTurn { text: "done".into(), tool_calls: vec![], finish: Some(FinishReason::Stop) },
+    ]));
+    let broker = std::sync::Arc::new(crate::agent::permissions::Broker::new());
+    let agent = AgentLoop::new(provider, "test")
+        .with_permission(Box::new(crate::agent::tools::ScopedGate))
+        .with_broker(broker);
+
+    let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
+    let run_dir = dir.clone();
+    let handle = tokio::spawn(async move {
+        let mut history = Vec::new();
+        let mut emit = move |e: HarnessEvent| {
+            let _ = etx.send(e);
+        };
+        agent.run_turn(&mut history, "go", &run_dir, &mut emit).await
+    });
+
+    // Drain events; a permission question must not appear.
+    let mut asked = false;
+    while let Ok(Some(ev)) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        erx.recv(),
+    )
+    .await
+    {
+        if matches!(ev, HarnessEvent::PermissionAsked { .. }) {
+            asked = true;
+        }
+    }
+    let result = handle.await.unwrap();
+    assert!(result.is_ok());
+    assert!(!asked, "a write inside the session folder must not ask");
+    assert_eq!(std::fs::read_to_string(dir.join("own.txt")).unwrap(), "ok");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

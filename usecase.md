@@ -430,13 +430,38 @@ restore = true                  # reopen your last workspace
 [behavior]
 auto_approve_permissions = false
 notify = true                   # bell + desktop notification when a run ends
-local_permissions = "allow"     # allow | ask | deny | read-only
+local_permissions = "scoped"    # scoped | allow | ask | read-only | deny
 ```
 
-**`local_permissions`, honestly:** `allow` means it never asks. That's fast and
-it's the default. `ask` prompts before anything that writes or runs. `read-only`
-is a hard guarantee nothing is touched. If you're working in a repo you care
-about, `ask` is worth the small interruption.
+**`local_permissions`, and why the default is `scoped`:**
+
+| Value | Behaviour |
+|---|---|
+| `scoped` (default) | **Inside the session's folder: no questions.** Outside it: ask |
+| `allow` | Never asks, anywhere |
+| `ask` | Same as `scoped` |
+| `read-only` | Reads only; nothing is ever written |
+| `deny` | Nothing runs |
+
+`scoped` exists because running several sessions at once is the whole point, and
+that only works if working inside your own folder never interrupts you. Each pane
+is opened somewhere and has *that* folder pre-approved — so four panes on four
+projects stay out of each other's way.
+
+What still asks: **anything outside the session's folder** (another project, a
+config directory, a path that walks out with `..`), and **every shell command** —
+a command's arguments don't reveal what it will touch, so it can't be judged by
+path.
+
+Switching to a different folder mid-session is the moment it asks, which is
+exactly when you'd want it to.
+
+**Headless is different.** `theta --print` has nobody to answer a question, so
+`scoped` *refuses* rather than asking — and a shell command counts as outside,
+because its arguments don't say what it will touch. That means an automated run
+can write files in the project but not run commands. If you want `--print` to run
+builds or tests, set `local_permissions = "allow"` for that work and accept that
+nothing is checked.
 
 ---
 
