@@ -17,10 +17,17 @@ fn run(cmd: &mut Command) -> Option<String> {
 }
 
 fn main() {
-    // Re-run on source changes so the stamp advances after each update.
-    println!("cargo:rerun-if-changed=src");
-    println!("cargo:rerun-if-changed=Cargo.toml");
-    println!("cargo:rerun-if-changed=build.rs");
+    // Deliberately no `rerun-if-changed`.
+    //
+    // It was `cargo:rerun-if-changed=src`, which watches the *directory*: cargo
+    // compares the mtime of that path, and editing a file inside a directory
+    // does not change the directory's own mtime. Only adding or removing a file
+    // does. So the script did not re-run after an ordinary edit, and the stamp
+    // stayed on an older commit — a binary built after commit 2e53d7b reported
+    // 7125c87, the commit before it.
+    //
+    // Declaring no rerun-if-changed makes cargo use its default and re-run when
+    // any file in the package changes, which is what a build stamp needs.
 
     let hash = run(Command::new("git").args(["rev-parse", "--short", "HEAD"]))
         .unwrap_or_else(|| "nogit".into());

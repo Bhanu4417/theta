@@ -1,6 +1,6 @@
 [package]
 name = "theta"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2021"
 # Floor imposed by dependencies (darling/icu via syntect declare 1.88).
 rust-version = "1.88"
