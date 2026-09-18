@@ -39,6 +39,10 @@ no server to start, no daemon to babysit, no wrapper around somebody else's CLI.
  1 session · 1 working ⣾   main ↑2 · +125 −8      Ctrl+K Commands  Ctrl+N New  Ctrl+Q Quit
 ```
 
+**New here?** [`usecase.md`](usecase.md) explains every command by *what you are
+trying to do* — which command when, and which habits actually help. The rest of
+this file is the reference.
+
 ## Why Theta
 
 **It's not a wrapper — it's the harness.** The agent loop, tool execution,
