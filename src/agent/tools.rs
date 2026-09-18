@@ -14,15 +14,93 @@ pub const MAX_TOOL_BYTES: usize = 100 * 1024;
 pub struct ToolOutcome {
     pub ok: bool,
     pub output: String,
+    /// Extra fields for the UI. Used to carry a diff for an edit, which is what
+    /// lets the transcript show what changed rather than only which file did.
+    pub metadata: Value,
 }
 
 impl ToolOutcome {
     pub fn ok(output: impl Into<String>) -> Self {
-        Self { ok: true, output: output.into() }
+        Self { ok: true, output: output.into(), metadata: json!({}) }
     }
     pub fn err(message: impl Into<String>) -> Self {
-        Self { ok: false, output: message.into() }
+        Self { ok: false, output: message.into(), metadata: json!({}) }
     }
+
+    /// Attach a unified diff, so the UI can render the change.
+    pub fn with_diff(mut self, diff: impl Into<String>) -> Self {
+        let diff = diff.into();
+        if !diff.trim().is_empty() {
+            self.metadata["diff"] = Value::String(diff);
+        }
+        self
+    }
+}
+
+/// A compact unified diff between two versions of a file's text.
+///
+/// Trims the shared prefix and suffix so the result is one hunk covering only
+/// the region that changed. A general diff algorithm is not needed: every tool
+/// here replaces one contiguous region and knows it.
+///
+/// Returns `None` when nothing changed, so a caller does not report an empty
+/// diff as a change.
+pub fn unified_diff(path: &str, before: &str, after: &str) -> Option<String> {
+    let a: Vec<&str> = before.lines().collect();
+    let b: Vec<&str> = after.lines().collect();
+
+    let mut pre = 0usize;
+    while pre < a.len() && pre < b.len() && a[pre] == b[pre] {
+        pre += 1;
+    }
+    let mut suf = 0usize;
+    while suf < a.len().saturating_sub(pre)
+        && suf < b.len().saturating_sub(pre)
+        && a[a.len() - 1 - suf] == b[b.len() - 1 - suf]
+    {
+        suf += 1;
+    }
+    if pre == a.len() && pre == b.len() {
+        return None;
+    }
+
+    const CTX: usize = 3;
+    let ctx_start = pre.saturating_sub(CTX);
+    let trailing = suf.min(CTX);
+    let old_mid = a.len().saturating_sub(suf) - pre;
+    let new_mid = b.len().saturating_sub(suf) - pre;
+
+    let mut out = String::new();
+    out.push_str(&format!("--- a/{path}\n+++ b/{path}\n"));
+    let lead = pre - ctx_start;
+    out.push_str(&format!(
+        "@@ -{},{} +{},{} @@\n",
+        ctx_start + 1,
+        lead + old_mid + trailing,
+        ctx_start + 1,
+        lead + new_mid + trailing
+    ));
+    for l in &a[ctx_start..pre] {
+        out.push(' ');
+        out.push_str(l);
+        out.push('\n');
+    }
+    for l in &a[pre..a.len() - suf] {
+        out.push('-');
+        out.push_str(l);
+        out.push('\n');
+    }
+    for l in &b[pre..b.len() - suf] {
+        out.push('+');
+        out.push_str(l);
+        out.push('\n');
+    }
+    for l in &a[a.len() - suf..a.len() - suf + trailing] {
+        out.push(' ');
+        out.push_str(l);
+        out.push('\n');
+    }
+    Some(out)
 }
 
 pub trait Tool: Send + Sync {
@@ -195,8 +273,18 @@ impl Tool for WriteTool {
                     return ToolOutcome::err(format!("mkdir {}: {e}", parent.display()));
                 }
             }
+            // What the file held before, when it existed, so overwriting shows
+            // what was lost rather than only that something was written.
+            let before = tokio::fs::read_to_string(&full).await.unwrap_or_default();
             match tokio::fs::write(&full, content.as_bytes()).await {
-                Ok(()) => ToolOutcome::ok(format!("wrote {} ({} bytes)", full.display(), content.len())),
+                Ok(()) => {
+                    let outcome =
+                        ToolOutcome::ok(format!("wrote {} ({} bytes)", full.display(), content.len()));
+                    match unified_diff(&path, &before, &content) {
+                        Some(d) => outcome.with_diff(d),
+                        None => outcome,
+                    }
+                }
                 Err(e) => ToolOutcome::err(format!("write {path}: {e}")),
             }
         })
@@ -243,7 +331,15 @@ impl Tool for EditTool {
             updated.push_str(&new);
             updated.push_str(&text[pos + old.len()..]);
             match tokio::fs::write(&full, updated.as_bytes()).await {
-                Ok(()) => ToolOutcome::ok(format!("edited {path}")),
+                Ok(()) => {
+                    // Carry the change itself, not just the file name: the
+                    // transcript shows the diff, so the reader sees what moved.
+                    let outcome = ToolOutcome::ok(format!("edited {path}"));
+                    match unified_diff(&path, &text, &updated) {
+                        Some(d) => outcome.with_diff(d),
+                        None => outcome,
+                    }
+                }
                 Err(e) => ToolOutcome::err(format!("edit {path}: {e}")),
             }
         })
@@ -285,6 +381,7 @@ impl Tool for MultiEditTool {
                 return ToolOutcome::err("edits is empty");
             }
             let mut applied = 0usize;
+            let mut diffs: Vec<String> = Vec::new();
             for e in edits {
                 let Some(path) = str_arg(e, &["path", "file_path", "filePath"]) else {
                     return ToolOutcome::err("each edit needs a path");
@@ -306,9 +403,19 @@ impl Tool for MultiEditTool {
                 if let Err(err) = tokio::fs::write(&full, updated.as_bytes()).await {
                     return ToolOutcome::err(format!("multiedit {path}: {err}"));
                 }
+                // Keep each file's change, so the transcript shows all of them
+                // rather than a bare count.
+                if let Some(d) = unified_diff(&path, &text, &updated) {
+                    diffs.push(d);
+                }
                 applied += 1;
             }
-            ToolOutcome::ok(format!("applied {applied} edit(s)"))
+            let outcome = ToolOutcome::ok(format!("applied {applied} edit(s)"));
+            if diffs.is_empty() {
+                outcome
+            } else {
+                outcome.with_diff(diffs.join(""))
+            }
         })
     }
 }
@@ -838,5 +945,134 @@ mod tests {
             assert!(!s.name.is_empty());
             assert_eq!(s.parameters["type"], "object", "{}", s.name);
         }
+    }
+}
+
+#[cfg(test)]
+mod diff_tests {
+    use super::*;
+
+    #[test]
+    fn unified_diff_shows_only_the_changed_region() {
+        let before = "fn main() {\n    let x = 1;\n    println!(\"{x}\");\n}\n";
+        let after = "fn main() {\n    let x = 42;\n    println!(\"{x}\");\n}\n";
+        let d = unified_diff("src/main.rs", before, after).expect("a change");
+
+        // The changed line appears both ways, and only once each.
+        assert!(d.contains("-    let x = 1;"), "{d}");
+        assert!(d.contains("+    let x = 42;"), "{d}");
+        assert_eq!(d.matches("-    let x = 1;").count(), 1, "one removal: {d}");
+        assert!(!d.contains("-fn main"), "unchanged lines are context, not removals: {d}");
+        // Git-style headers, which the diff viewer keys off.
+        assert!(d.starts_with("--- a/src/main.rs"), "{d}");
+        assert!(d.contains("+++ b/src/main.rs"), "{d}");
+        assert!(d.contains("@@"), "a hunk header is required to render: {d}");
+    }
+
+    #[test]
+    fn unified_diff_is_none_when_nothing_changed() {
+        let text = "same\n";
+        assert!(unified_diff("f", text, text).is_none());
+        // The write tool relies on this: rewriting a file with identical content
+        // must not claim a change.
+    }
+
+    #[test]
+    fn unified_diff_handles_a_new_file() {
+        let d = unified_diff("new.rs", "", "one\ntwo\n").expect("a change");
+        assert!(d.contains("+one"), "{d}");
+        assert!(d.contains("+two"), "{d}");
+        // A hunk header with an empty original side. `-1,0` and `-0,0` are both
+        // valid unified-diff spellings, so match the shape, not one form.
+        let header = d.lines().find(|l| l.starts_with("@@")).expect("a hunk header");
+        assert!(header.contains(",0 "), "no original lines: {header}");
+        assert!(header.contains("+1,2"), "two added lines from line 1: {header}");
+        // No removal lines, ignoring the `--- a/...` file header.
+        let removals = d
+            .lines()
+            .filter(|l| l.starts_with('-') && !l.starts_with("---"))
+            .count();
+        assert_eq!(removals, 0, "nothing was removed: {d}");
+    }
+
+    #[test]
+    fn unified_diff_handles_deletions() {
+        let d = unified_diff("f.rs", "a\nb\nc\n", "a\nc\n").expect("a change");
+        assert!(d.contains("-b"), "{d}");
+        assert!(!d.contains("+b"), "b was not re-added: {d}");
+    }
+
+    #[test]
+    fn an_edit_tool_outcome_carries_a_usable_diff() {
+        // The whole point: the transcript renders `metadata["diff"]`, so the
+        // tool has to put it there.
+        let out = ToolOutcome::ok("edited src/a.rs")
+            .with_diff("--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-old\n+new\n");
+        assert!(out.ok);
+        assert_eq!(
+            out.metadata.get("diff").and_then(|d| d.as_str()),
+            Some("--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-old\n+new\n")
+        );
+
+        // An empty diff is not attached, so a no-op does not render as a change.
+        let plain = ToolOutcome::ok("x").with_diff("");
+        assert!(plain.metadata.get("diff").is_none());
+    }
+}
+
+#[cfg(test)]
+mod edit_diff_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn the_edit_tool_reports_what_it_changed() {
+        // End to end through the tool: a real file, a real edit, and a diff on
+        // the outcome that the transcript can render.
+        let dir = std::env::temp_dir().join(format!("theta-edit-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("a.rs");
+        std::fs::write(&file, "fn main() {\n    let x = 1;\n}\n").unwrap();
+
+        let input = json!({
+            "path": "a.rs",
+            "old": "let x = 1;",
+            "new": "let x = 42;",
+        });
+        let out = EditTool.run(&input, &dir).await;
+        assert!(out.ok, "{:?}", out.output);
+
+        let diff = out
+            .metadata
+            .get("diff")
+            .and_then(|d| d.as_str())
+            .expect("the outcome must carry a diff for the UI");
+        assert!(diff.contains("-    let x = 1;"), "{diff}");
+        assert!(diff.contains("+    let x = 42;"), "{diff}");
+        assert!(diff.contains("@@"), "a hunk header, which the viewer needs: {diff}");
+
+        // And the file really changed.
+        let after = std::fs::read_to_string(&file).unwrap();
+        assert!(after.contains("let x = 42;"));
+
+        // A failing edit reports an error and no diff.
+        let miss = EditTool.run(&json!({"path": "a.rs", "old": "nope", "new": "x"}), &dir).await;
+        assert!(!miss.ok);
+        assert!(miss.metadata.get("diff").is_none(), "no diff for a failed edit");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_write_tool_reports_a_new_file_as_added_lines() {
+        let dir = std::env::temp_dir().join(format!("theta-write-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let out = WriteTool
+            .run(&json!({"path": "new.txt", "content": "one\ntwo\n"}), &dir)
+            .await;
+        assert!(out.ok, "{:?}", out.output);
+        let diff = out.metadata.get("diff").and_then(|d| d.as_str()).expect("a diff");
+        assert!(diff.contains("+one"), "{diff}");
+        assert!(diff.contains("+two"), "{diff}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

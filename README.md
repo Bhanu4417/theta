@@ -12,7 +12,7 @@ no server to start, no daemon to babysit, no wrapper around somebody else's CLI.
 [![CI](https://github.com/Bhanu4417/theta/actions/workflows/ci.yml/badge.svg)](https://github.com/Bhanu4417/theta/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-e0dbce.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-e0dbce.svg)](https://www.rust-lang.org)
-[![Tests](https://img.shields.io/badge/tests-259%20passing-e0dbce.svg)](#testing)
+[![Tests](https://img.shields.io/badge/tests-268%20passing-e0dbce.svg)](#testing)
 
 </div>
 
@@ -194,6 +194,24 @@ Type `/` in any session for the menu (filter by typing, `↑↓` to choose).
 | `/reasoning` | How hard the model thinks: `none`…`max`. Lower is faster and
   avoids an empty reply when reasoning eats the answer budget |
 | `/login` `/help` `/quit` | Providers · keys · exit |
+
+## What an edit shows
+
+An edit renders the lines it changed, with `-` and `+` markers, so the
+transcript says *what* moved rather than only which file was touched:
+
+```
+ ✓ Editing src/app.rs
+     @@ -12,3 +12,3 @@
+      let cfg = Config::default();
+     -    let retries = 3;
+     +    let retries = 6;
+      let client = build(cfg);
+```
+
+A few lines are shown inline; `Enter` expands to the full change, and `d` opens
+the diff for the selected entry. New files appear as added lines, and a no-op
+reports nothing rather than an empty change.
 
 ## When a reply comes back empty
 

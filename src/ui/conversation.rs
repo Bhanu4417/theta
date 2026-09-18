@@ -1283,6 +1283,86 @@ mod transcript_boundary_tests {
         );
     }
 
+#[test]
+    fn an_edit_tool_renders_the_lines_it_changed() {
+        // Reported: an edit showed only "Editing <file>" with no indication of
+        // what changed. The diff renderer already existed; nothing populated
+        // `metadata["diff"]`, so there was never anything to draw.
+        let mut s = SessionState::new(1, "s".into(), std::path::PathBuf::from("/tmp"));
+        let diff = "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,2 +1,2 @@\n fn main() {\n-    let x = 1;\n+    let x = 42;\n }\n";
+        let part = Part {
+            id: "t1".into(),
+            message_id: "m1".into(),
+            kind: PartKind::Tool(ToolInfo {
+                tool: "edit".into(),
+                call_id: "c1".into(),
+                status: ToolStatus::Completed,
+                title: None,
+                input: serde_json::json!({ "path": "src/a.rs" }),
+                output: Some("edited src/a.rs".into()),
+                error: None,
+                metadata: serde_json::json!({ "diff": diff }),
+                start_ms: None,
+            }),
+        };
+        let meta = Message {
+            id: "m1".into(),
+            role: Role::Assistant,
+            error: None,
+            completed: Some(1),
+            created: None,
+            cost: None,
+            tokens: None,
+            parts: vec![part.clone()],
+        };
+        s.upsert_part(&meta, part);
+
+        let text = cache_text(&s);
+        assert!(text.contains("Editing src/a.rs"), "the title still shows: {text}");
+        // Both changed lines appear, marked the way a diff marks them.
+        assert!(text.contains("let x = 1;"), "the removed line is shown: {text}");
+        assert!(text.contains("let x = 42;"), "the added line is shown: {text}");
+        assert!(
+            text.contains("-") && text.contains("+"),
+            "with diff markers, so it reads as a change: {text}"
+        );
+    }
+
+    #[test]
+    fn a_tool_without_a_diff_does_not_invent_one() {
+        // A read or a search has no diff; it must render exactly as before.
+        let mut s = SessionState::new(1, "s".into(), std::path::PathBuf::from("/tmp"));
+        let part = Part {
+            id: "t1".into(),
+            message_id: "m1".into(),
+            kind: PartKind::Tool(ToolInfo {
+                tool: "read".into(),
+                call_id: "c1".into(),
+                status: ToolStatus::Completed,
+                title: None,
+                input: serde_json::json!({ "path": "src/a.rs" }),
+                output: Some("contents here".into()),
+                error: None,
+                metadata: serde_json::json!({}),
+                start_ms: None,
+            }),
+        };
+        let meta = Message {
+            id: "m1".into(),
+            role: Role::Assistant,
+            error: None,
+            completed: Some(1),
+            created: None,
+            cost: None,
+            tokens: None,
+            parts: vec![part.clone()],
+        };
+        s.upsert_part(&meta, part);
+        let text = cache_text(&s);
+        assert!(text.contains("Reading src/a.rs"), "{text}");
+        assert!(!text.contains("@@"), "no hunk header without a diff: {text}");
+    }
+
     #[test]
     fn tool_states_render_from_neutral_model() {
         let mut s = SessionState::new(1, "s".into(), std::path::PathBuf::from("/tmp"));

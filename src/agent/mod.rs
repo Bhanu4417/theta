@@ -637,6 +637,7 @@ impl AgentLoop {
                             input: serde_json::from_str(&pending.arguments).unwrap_or(json!({})),
                             output: Some("interrupted by user".into()),
                             error: Some("interrupted by user".into()),
+                            // No tool ran, so there is nothing to report.
                             metadata: json!({}),
                             start_ms: None,
                         };
@@ -1027,7 +1028,7 @@ impl AgentLoop {
             input: input.clone(),
             output: Some(outcome.output.clone()),
             error: if outcome.ok { None } else { Some(outcome.output.clone()) },
-            metadata: json!({}),
+            metadata: outcome.metadata.clone(),
             start_ms: None,
         };
         emit(HarnessEvent::Transcript(TranscriptUpdate::Part(Part {
