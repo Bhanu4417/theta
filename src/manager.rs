@@ -631,8 +631,15 @@ fn build_agent_with(
     if let Some((provider, model)) = compactor {
         agent = agent.with_compaction_model(provider, model);
     }
+    // `auto_approve_permissions` means exactly that: never ask. It is applied
+    // here, at the gate, so an inherited policy never even produces an Ask to
+    // auto-reply to. An agent with its own explicit policy (plan/review are
+    // `read-only`) keeps it — auto-approval widens the session default, it does
+    // not silently turn a read-only agent into a writer.
     let mode = if def.permission != "inherit" {
         def.permission
+    } else if cfg.behavior.auto_approve_permissions {
+        "allow"
     } else {
         cfg.behavior.local_permissions.as_str()
     };
@@ -938,4 +945,37 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn auto_approve_widens_the_default_policy_but_keeps_read_only_agents() {
+        // `auto_approve_permissions` must take effect at the gate, not only by
+        // auto-replying to an Ask: otherwise every call still round-trips
+        // through PermissionAsked and flashes the pane into `permission`.
+        use crate::agent::tools::PermissionDecision as D;
+        let mut cfg = Config::default();
+        cfg.ai.base_url = "http://127.0.0.1:1/v1".into();
+        cfg.behavior.local_permissions = "scoped".into();
+        cfg.behavior.auto_approve_permissions = true;
+
+        let (agent, _) = build_agent(&cfg, false).expect("builds via base_url");
+        let gate = agent.permission();
+        let cwd = std::path::Path::new("/proj");
+        assert_eq!(
+            gate.check("bash", &serde_json::json!({"command": "cargo test"}), cwd),
+            D::Allow,
+            "auto-approve must pre-approve shell commands"
+        );
+        assert_eq!(
+            gate.check("write", &serde_json::json!({"path": "/outside/x"}), cwd),
+            D::Allow,
+            "auto-approve must pre-approve paths outside the folder too"
+        );
+
+        let readonly =
+            build_agent_with(&cfg, false, None, false, "plan", &[]).expect("plan builds");
+        assert_eq!(
+            readonly.permission().check("write", &serde_json::json!({"path": "a.rs"}), cwd),
+            D::Deny,
+            "a read-only agent stays read-only under auto-approve"
+        );
+    }
 }

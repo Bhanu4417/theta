@@ -135,12 +135,14 @@ impl Default for Behavior {
             history_limit: 200,
             confirm_quit: true,
             notify: true,
-            // Scoped by default: the session's own folder is pre-approved and
-            // anything outside it asks. Running several sessions at once is the
-            // point of the app, and that only works if working inside your own
-            // folder never interrupts you. `allow` never asks; `ask` is an alias
-            // for this; `read-only` and `deny` are the strict options.
-            local_permissions: "scoped".into(),
+            // Allow everything by default. This is a multi-workspace tool: a
+            // session can be opened in any project, and the built-in agents
+            // reach across folders (they read a shared crate, run tests from a
+            // workspace root, or fix a sibling package). Interrupting every one
+            // of those turns the workspace into a prompt queue. `scoped` keeps
+            // the folder-local safety net for anyone who wants it; `read-only`
+            // and `deny` are the strict options.
+            local_permissions: "allow".into(),
         }
     }
 }
@@ -256,7 +258,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn permissions_default_to_scoped() {
-        assert_eq!(Behavior::default().local_permissions, "scoped");
+    fn permissions_default_to_allow_for_multi_workspace_use() {
+        assert_eq!(Behavior::default().local_permissions, "allow");
     }
 }
