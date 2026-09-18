@@ -1039,10 +1039,15 @@ impl AgentLoop {
         emit(HarnessEvent::ToolFinished { tool: call.name.clone(), ok: outcome.ok });
 
         let ok = outcome.ok;
-        let result_msg = ChatMessage::tool_result(
+        let mut result_msg = ChatMessage::tool_result(
             call.id.clone(),
             if outcome.output.is_empty() { "(no output)".into() } else { outcome.output },
         );
+        // Ride along into the journal, and from there into the session tree, so
+        // a restored session can still render the diff an edit produced.
+        if outcome.metadata.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
+            result_msg.tool_metadata = Some(outcome.metadata.clone());
+        }
         history.push(result_msg.clone());
         journal.push(result_msg);
         ok

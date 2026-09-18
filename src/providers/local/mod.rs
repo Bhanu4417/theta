@@ -853,6 +853,7 @@ mod tests {
             tokens: None,
             images: vec![],
             cost: None,
+            tool_metadata: None,
         });
         local.replay("theta-old-1", &tree);
 

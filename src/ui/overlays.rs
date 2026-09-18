@@ -1187,10 +1187,20 @@ pub fn render_diff(f: &mut ratatui::Frame, area: Rect, d: &crate::app::DiffState
     );
     let w = inner.width as usize;
     let h = inner.height as usize;
-    let max_scroll = d.lines.len().saturating_sub(h);
+    // Laid out here, where the width is known, so the two-column form is used
+    // whenever it fits. Building the rows when the overlay opened baked in a
+    // width and the split could never appear.
+    // A patch is laid out for the current width so the two-column form is used
+    // whenever it fits; anything pre-rendered (a commit log) is shown as is.
+    let rows = if d.patch.trim().is_empty() {
+        d.lines.clone()
+    } else {
+        crate::highlight::diff_view(&d.patch, &d.file, w, w >= 100)
+    };
+    let max_scroll = rows.len().saturating_sub(h);
     let scroll = d.scroll.min(max_scroll);
     let mut lines: Vec<Line<'static>> = Vec::new();
-    for row in d.lines.iter().skip(scroll) {
+    for row in rows.iter().skip(scroll) {
         if lines.len() >= h {
             break;
         }
@@ -1562,4 +1572,43 @@ pub fn render_logs(f: &mut ratatui::Frame, app: &App, screen: Rect) {
     )));
     lines.truncate(rows);
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+#[cfg(test)]
+mod diff_overlay_tests {
+    use crate::highlight::diff_view;
+
+    const PATCH: &str = "--- a/a.rs\n+++ b/a.rs\n@@ -1,2 +1,2 @@\n fn main() {\n-    let x = 1;\n+    let x = 42;\n }\n";
+
+    #[test]
+    fn a_wide_diff_lays_out_as_two_columns() {
+        // The overlay built its rows when it opened, before the width was known,
+        // so it could only ever show the single-column form.
+        let wide = diff_view(PATCH, "a.rs", 120, true);
+        let narrow = diff_view(PATCH, "a.rs", 60, false);
+        assert!(!wide.is_empty() && !narrow.is_empty());
+
+        // Two columns places the old and new sides on one row: the row carrying
+        // the removal also carries its replacement.
+        let paired = wide.iter().any(|l| {
+            let t: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+            t.contains("let x = 1;") && t.contains("let x = 42;")
+        });
+        assert!(paired, "a split row should show both sides:\n{}", render(&wide));
+
+        // The single-column form cannot, by construction.
+        let single_paired = narrow.iter().any(|l| {
+            let t: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+            t.contains("let x = 1;") && t.contains("let x = 42;")
+        });
+        assert!(!single_paired, "unified output keeps them on separate rows");
+    }
+
+    fn render(lines: &[ratatui::text::Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }

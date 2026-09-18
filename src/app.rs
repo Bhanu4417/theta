@@ -299,6 +299,14 @@ pub struct ViewerState {
 
 pub struct DiffState {
     pub title: String,
+    /// The unified patch, kept raw so the view can be laid out at draw time.
+    /// Rendering it when the state was created baked in a width that was not
+    /// yet known, so the overlay could never show the two-column form.
+    pub patch: String,
+    /// The file the patch belongs to, used to pick a syntax mode.
+    pub file: String,
+    /// Pre-rendered rows for content that is not a patch, such as a commit log.
+    /// A patch goes through `patch` instead, so it can be laid out to fit.
     pub lines: Vec<Line<'static>>,
     pub scroll: usize,
 }
@@ -1658,7 +1666,9 @@ impl App {
         if let Some(diff) = inline_diff {
             self.diff = Some(DiffState {
                 title: format!("diff — {}", file.clone().unwrap_or_else(|| "file".into())),
-                lines: crate::highlight::diff_lines(&diff),
+                patch: diff,
+                file: file.clone().unwrap_or_default(),
+                lines: Vec::new(),
                 scroll: 0,
             });
             self.dirty = true;
@@ -1672,7 +1682,9 @@ impl App {
             }
             self.diff = Some(DiffState {
                 title: format!("diff — {file}"),
-                lines: crate::highlight::diff_lines(&diff),
+                patch: diff,
+                file: file.clone(),
+                lines: Vec::new(),
                 scroll: 0,
             });
             self.dirty = true;
@@ -1693,7 +1705,9 @@ impl App {
         }
         self.diff = Some(DiffState {
             title: "git diff — workspace".into(),
-            lines: crate::highlight::diff_lines(&diff),
+            patch: diff,
+            file: String::new(),
+            lines: Vec::new(),
             scroll: 0,
         });
         self.dirty = true;
@@ -1724,6 +1738,9 @@ impl App {
             .collect();
         self.diff = Some(DiffState {
             title: "git log".into(),
+            // Not a patch: pre-rendered rows.
+            patch: String::new(),
+            file: String::new(),
             lines,
             scroll: 0,
         });

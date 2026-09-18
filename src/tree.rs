@@ -38,6 +38,11 @@ pub struct Entry {
     pub tokens: Option<crate::harness::transcript::TokenUsage>,
     #[serde(default)]
     pub cost: Option<f64>,
+    /// UI data attached to a tool result, chiefly the diff an edit produced.
+    /// Persisted so a restored session still shows what changed rather than only
+    /// which file was touched.
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
 }
 
 impl Entry {
@@ -58,11 +63,16 @@ impl Entry {
                 tokens: self.tokens,
                 images: Vec::new(),
                 cost: self.cost,
+                tool_metadata: self.metadata.clone(),
             },
-            EntryKind::Tool => ChatMessage::tool_result(
-                self.tool_call_id.clone().unwrap_or_default(),
-                self.text.clone(),
-            ),
+            EntryKind::Tool => {
+                let mut m = ChatMessage::tool_result(
+                    self.tool_call_id.clone().unwrap_or_default(),
+                    self.text.clone(),
+                );
+                m.tool_metadata = self.metadata.clone();
+                m
+            }
             EntryKind::System => ChatMessage::system(self.text.clone()),
         }
     }
@@ -201,6 +211,9 @@ impl SessionTree {
             snapshots: Vec::new(),
             tokens: message.tokens,
             cost: message.cost,
+            // Only a tool result carries UI data; persisting it is what lets a
+            // restored session show an edit's diff.
+            metadata: message.tool_metadata.clone(),
         })
     }
 
@@ -219,6 +232,8 @@ impl SessionTree {
             snapshots: Vec::new(),
             tokens: None,
             cost: None,
+            // A compaction has no tool data.
+            metadata: None,
         })
     }
 
@@ -238,6 +253,7 @@ impl SessionTree {
             snapshots: Vec::new(),
             tokens: None,
             cost: None,
+            metadata: None,
         })
     }
 
@@ -340,15 +356,18 @@ impl SessionTree {
                 });
             }
             for (ci, call) in entry.tool_calls.iter().enumerate() {
-                let output = self
-                    .entries
-                    .iter()
-                    .find(|e| {
-                        e.kind == EntryKind::Tool
-                            && e.tool_call_id.as_deref() == Some(call.id.as_str())
-                    })
-                    .map(|e| e.text.clone())
-                    .unwrap_or_default();
+                // The tool entry holds both the output and any UI data attached
+                // to it, such as the diff an edit produced. Carrying the
+                // metadata through is what lets a reopened session still show
+                // what changed rather than only which file was touched.
+                let tool_entry = self.entries.iter().find(|e| {
+                    e.kind == EntryKind::Tool
+                        && e.tool_call_id.as_deref() == Some(call.id.as_str())
+                });
+                let output = tool_entry.map(|e| e.text.clone()).unwrap_or_default();
+                let metadata = tool_entry
+                    .and_then(|e| e.metadata.clone())
+                    .unwrap_or_else(|| serde_json::json!({}));
                 parts.push(Part {
                     id: format!("{message_id}-call-{ci}"),
                     message_id: message_id.clone(),
@@ -361,7 +380,7 @@ impl SessionTree {
                             .unwrap_or(serde_json::json!({})),
                         output: Some(output),
                         error: None,
-                        metadata: serde_json::json!({}),
+                        metadata,
                         start_ms: None,
                     }),
                 });
@@ -841,6 +860,77 @@ mod tests {
 
         std::env::remove_var("THETA_SESSION_DIR");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
+    #[test]
+    fn a_tools_diff_survives_a_save_and_reload() {
+        // Reported: an edit showed what changed only until the session was
+        // reopened, because the tool's UI data was never persisted.
+        let mut tree = SessionTree::new();
+        let call = crate::ai::ToolCall {
+            id: "c1".into(),
+            name: "edit".into(),
+            arguments: r#"{"path":"src/a.rs"}"#.into(),
+        };
+        tree.append(&ChatMessage::assistant("editing", vec![call.clone()]));
+
+        let mut result = ChatMessage::tool_result("c1", "edited src/a.rs");
+        result.tool_metadata = Some(serde_json::json!({
+            "diff": "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-old\n+new\n"
+        }));
+        tree.append(&result);
+
+        // Round trip through the on-disk form.
+        let jsonl = tree.to_jsonl();
+        let dir = std::env::temp_dir().join(format!("theta-diff-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ses_diff.jsonl");
+        std::fs::write(&path, &jsonl).unwrap();
+        let reloaded = SessionTree::load(&path).expect("reload");
+
+        // The transcript rebuilt from it still carries the diff.
+        let msgs = reloaded.to_messages("ses_diff");
+        let diff = msgs
+            .iter()
+            .flat_map(|m| &m.parts)
+            .find_map(|p| match &p.kind {
+                PartKind::Tool(t) => t.metadata.get("diff").and_then(|d| d.as_str()),
+                _ => None,
+            });
+        let diff = diff.expect("the diff must survive the reload");
+        assert!(diff.contains("-old"), "{diff}");
+        assert!(diff.contains("+new"), "{diff}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_tool_without_metadata_reloads_with_an_empty_object() {
+        // The UI reads `metadata` as an object, so a read or a search must not
+        // come back as null.
+        let mut tree = SessionTree::new();
+        tree.append(&ChatMessage::assistant(
+            "reading",
+            vec![crate::ai::ToolCall {
+                id: "c1".into(),
+                name: "read".into(),
+                arguments: r#"{"path":"src/a.rs"}"#.into(),
+            }],
+        ));
+        tree.append(&ChatMessage::tool_result("c1", "file contents"));
+
+        let msgs = tree.to_messages("s");
+        let meta = msgs
+            .iter()
+            .flat_map(|m| &m.parts)
+            .find_map(|p| match &p.kind {
+                PartKind::Tool(t) => Some(t.metadata.clone()),
+                _ => None,
+            })
+            .expect("a tool part");
+        assert!(meta.is_object(), "expected an object, got {meta}");
+        assert_eq!(meta.as_object().map(|o| o.len()), Some(0));
     }
 
 }

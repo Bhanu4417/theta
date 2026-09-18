@@ -41,14 +41,18 @@ pub struct ChatMessage {
     pub images: Vec<ImagePart>,
     #[serde(default)]
     pub cost: Option<f64>,
+    /// Extra data for the UI attached to a tool result, chiefly the diff an edit
+    /// produced. Persisted so a restored session can still show what changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_metadata: Option<serde_json::Value>,
 }
 
 impl ChatMessage {
     pub fn system(text: impl Into<String>) -> Self {
-        Self { role: Role::System, text: text.into(), tool_calls: Vec::new(), tool_call_id: None, tokens: None, images: Vec::new(), cost: None }
+        Self { role: Role::System, text: text.into(), tool_calls: Vec::new(), tool_call_id: None, tokens: None, images: Vec::new(), cost: None, tool_metadata: None }
     }
     pub fn user(text: impl Into<String>) -> Self {
-        Self { role: Role::User, text: text.into(), tool_calls: Vec::new(), tool_call_id: None, tokens: None, images: Vec::new(), cost: None }
+        Self { role: Role::User, text: text.into(), tool_calls: Vec::new(), tool_call_id: None, tokens: None, images: Vec::new(), cost: None, tool_metadata: None }
     }
     pub fn user_with_images(text: impl Into<String>, images: Vec<ImagePart>) -> Self {
         let mut m = Self::user(text);
@@ -56,7 +60,7 @@ impl ChatMessage {
         m
     }
     pub fn assistant(text: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
-        Self { role: Role::Assistant, text: text.into(), tool_calls, tool_call_id: None, tokens: None, images: Vec::new(), cost: None }
+        Self { role: Role::Assistant, text: text.into(), tool_calls, tool_call_id: None, tokens: None, images: Vec::new(), cost: None, tool_metadata: None }
     }
     pub fn tool_result(call_id: impl Into<String>, text: impl Into<String>) -> Self {
         Self {
@@ -67,6 +71,7 @@ impl ChatMessage {
             tokens: None,
             images: Vec::new(),
             cost: None,
+            tool_metadata: None,
         }
     }
 }
