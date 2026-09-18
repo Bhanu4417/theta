@@ -44,16 +44,45 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Runs before anything that can fail, and writes to the run summary, so
+      # the values are visible even when the job log is not retrievable from
+      # GitHub — which is what made an earlier failure here undiagnosable.
+      - name: Diagnose
+        shell: bash
+        run: |
+          set -uo pipefail
+          {
+            echo "### ${{ matrix.target }}"
+            echo
+            echo "| value | result |"
+            echo "| --- | --- |"
+            echo "| event | ${{ github.event_name }} |"
+            echo "| ref | ${{ github.ref }} |"
+            echo "| ref_name | ${{ github.ref_name }} |"
+            echo "| inputs.tag | ${{ github.event.inputs.tag }} |"
+            echo "| sha | ${{ github.sha }} |"
+            echo "| manifest | $(grep -m1 '^version' Cargo.toml 2>/dev/null || echo MISSING) |"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Resolve the tag
         id: tag
         shell: bash
         run: |
           set -euo pipefail
           tag="${{ github.event.inputs.tag || github.ref_name }}"
+          # A dispatch with no tag input falls back to the branch name, which is
+          # not a version; fail with that stated rather than a confusing
+          # mismatch two steps later.
+          case "$tag" in
+            v[0-9]*) ;;
+            *) echo "::error::not a version tag: '$tag' (pass tag=vX.Y.Z)"; exit 1 ;;
+          esac
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           # The version baked into the binary must match the tag, so the
           # installers and `--version` can never disagree.
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "resolved tag=$tag version=${tag#v}"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -69,8 +98,16 @@ jobs:
         run: |
           set -euo pipefail
           manifest=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
-          if [ "$manifest" != "${{ steps.tag.outputs.version }}" ]; then
-            echo "::error::tag ${{ steps.tag.outputs.version }} != Cargo.toml $manifest"
+          tag_version="${{ steps.tag.outputs.version }}"
+          echo "tag=${{ steps.tag.outputs.tag }} version=$tag_version manifest=$manifest"
+          echo "| tag version | \`$tag_version\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| manifest | \`$manifest\` |" >> "$GITHUB_STEP_SUMMARY"
+          if [ -z "$tag_version" ]; then
+            echo "::error::the tag step produced no version; check its output"
+            exit 1
+          fi
+          if [ "$manifest" != "$tag_version" ]; then
+            echo "::error::tag says $tag_version but Cargo.toml says $manifest"
             exit 1
           fi
 
