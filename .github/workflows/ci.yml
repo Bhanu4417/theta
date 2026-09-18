@@ -12,21 +12,22 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    name: build · test · lint
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+  # Everything on Linux, always. On a private repository Actions minutes are
+  # billed with a multiplier per runner: Linux 1x, Windows 2x, macOS 10x. A
+  # full cross-platform matrix on every push cost 26x a single Linux job and
+  # exhausted the monthly allowance, which then blocked releases too. The tests
+  # are platform-neutral, so Linux catches what matters and the platform matrix
+  # below runs when it is actually needed.
+  check:
+    name: check
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-
       - uses: Swatinem/rust-cache@v2
 
       - name: Build
@@ -36,33 +37,35 @@ jobs:
         run: cargo test --locked
 
       - name: Clippy
-        run: cargo clippy --all-targets
+        run: cargo clippy --all-targets --locked
 
-  installer-unix:
-    name: install.sh
+      # The installers are the first thing a user runs, so they are exercised
+      # rather than trusted. Both run here: install.ps1 under pwsh, which the
+      # runner already has, so the Windows installer needs no Windows runner.
+      - name: Installer harnesses
+        run: |
+          python3 packaging/installer-tests/run.py --installer sh
+          python3 packaging/installer-tests/run.py --installer ps1
+
+  # macOS and Windows, where a platform-specific failure would show. Gated: on a
+  # tag, because that is when a release depends on them, and on demand.
+  platforms:
+    name: ${{ matrix.os }}
+    if: >-
+      startsWith(github.ref, 'refs/tags/')
+      || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [macos-latest, windows-latest]
+    env:
+      RUSTFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --locked
-      # Serves a release from an in-process server and runs the real installer
-      # against it: happy path, tampered checksum, missing release, corrupt
-      # archive, flags, re-install.
-      - name: Test install.sh
-        run: python3 packaging/installer-tests/run.py --installer sh
-
-  installer-windows:
-    name: install.ps1
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --locked
-      - name: Test install.ps1
-        run: python packaging/installer-tests/run.py --installer ps1
+      - name: Build
+        run: cargo build --release --locked
+      - name: Test
+        run: cargo test --locked
